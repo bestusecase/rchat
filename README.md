@@ -1,7 +1,7 @@
 # rchat
 
 A fast, offline-first chat client for [Reticulum](https://reticulum.network), on
-desktop and Android. Discord-style interface, peer-to-peer messaging, no central
+desktop and Android. Modern interface, peer-to-peer messaging, no central
 server.
 
 **Status:** text works end to end over real Reticulum links — announce-based peer
