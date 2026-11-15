@@ -32,6 +32,7 @@ const upload = process.argv.includes("--upload");
 const pages = process.argv.includes("--pages");
 const skipBuild = process.argv.includes("--no-build");
 const notesFile = valueFor("--notes");
+const pagesOnly = process.argv.includes("--pages-only");
 
 const conf = JSON.parse(fs.readFileSync(path.join(tauriDir, "tauri.conf.json"), "utf8"));
 const version = conf.version;
@@ -48,6 +49,11 @@ function valueFor(flag) {
 
 function log(message) {
   console.log(`release: ${message}`);
+}
+
+if (pagesOnly) {
+  publishPages(path.join(distDir, "repo"));
+  process.exit(0);
 }
 
 function fail(message) {
@@ -266,45 +272,47 @@ if (pages) {
 }
 
 function publishPages(sourceDir) {
-  const worktree = path.join(distDir, "pages-worktree");
-  if (fs.existsSync(worktree)) {
-    execFileSync("git", ["worktree", "remove", "--force", worktree], { cwd: repoRoot });
-  }
-  const hasBranch = spawnQuiet("git", ["show-ref", "--verify", "refs/heads/gh-pages"], repoRoot);
-  if (hasBranch) {
-    execFileSync("git", ["worktree", "add", worktree, "gh-pages"], { cwd: repoRoot, stdio: "inherit" });
-    execFileSync("git", ["rm", "-rq", "--ignore-unmatch", "."], { cwd: worktree });
-  } else {
-    execFileSync("git", ["worktree", "add", "--detach", worktree, "HEAD"], {
-      cwd: repoRoot,
-      stdio: "inherit",
-    });
-    execFileSync("git", ["checkout", "--orphan", "gh-pages"], { cwd: worktree, stdio: "inherit" });
-    execFileSync("git", ["rm", "-rq", "--ignore-unmatch", "."], { cwd: worktree });
-  }
-
-  fs.cpSync(sourceDir, path.join(worktree, "deb"), { recursive: true });
-  execFileSync("git", ["add", "-A"], { cwd: worktree, stdio: "inherit" });
-  execFileSync(
-    "git",
-    ["-c", "user.name=rchat", "-c", "user.email=dev@localhost", "commit", "-m", `apt repo ${tag}`],
-    { cwd: worktree, stdio: "inherit" },
-  );
-  // Keep the token out of argv (visible in ps): git asks this helper instead.
+  if (!fs.existsSync(sourceDir)) fail(`no apt repo to publish at ${sourceDir}`);
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "rchat-pages-"));
+  const tokenValue = token();
   const askpass = askpassScript();
   try {
-    execFileSync("git", ["push", "origin", "gh-pages"], {
-      cwd: worktree,
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        GIT_ASKPASS: askpass,
-        GIT_TERMINAL_PROMPT: "0",
-        GITHUB_TOKEN: auth,
+    execFileSync("git", ["init", "-q", "-b", "gh-pages"], { cwd: work });
+    fs.cpSync(sourceDir, path.join(work, "deb"), { recursive: true });
+    execFileSync("git", ["add", "-A"], { cwd: work });
+    execFileSync(
+      "git",
+      [
+        "-c",
+        "user.name=rchat",
+        "-c",
+        "user.email=dev@localhost",
+        "commit",
+        "-q",
+        "-m",
+        `apt repo ${tag}`,
+      ],
+      { cwd: work },
+    );
+    // The branch is owned by this script; a force push keeps history linear and
+    // lets a fresh machine publish without cloning first.
+    execFileSync(
+      "git",
+      ["push", "--force", `https://github.com/${owner}/${repo}.git`, "gh-pages"],
+      {
+        cwd: work,
+        stdio: "inherit",
+        env: {
+          ...process.env,
+          GIT_ASKPASS: askpass,
+          GIT_TERMINAL_PROMPT: "0",
+          GITHUB_TOKEN: tokenValue,
+        },
       },
-    });
+    );
   } finally {
     fs.rmSync(askpass, { force: true });
+    fs.rmSync(work, { recursive: true, force: true });
   }
   log("pushed gh-pages");
 }
