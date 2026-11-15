@@ -1,35 +1,39 @@
 # rchat
 
-A fast, offline-first desktop chat client for [Reticulum](https://reticulum.network).
-Discord-style interface, peer-to-peer messaging, no central server.
+A fast, offline-first chat client for [Reticulum](https://reticulum.network), on
+desktop and Android. Discord-style interface, peer-to-peer messaging, no central
+server.
 
 **Status:** text works end to end over real Reticulum links — announce-based peer
-discovery, encrypted delivery, receipts, search, and an offline queue. Voice is
-designed for but not built yet.
+discovery, encrypted delivery, receipts, search, and an offline queue. The desktop
+app is packaged for Linux, and a standalone Android app runs the engine in-process
+and notifies for new messages while backgrounded. Voice is designed for but not
+built yet.
 
 ## Architecture
 
-Two pieces, on purpose:
+The pieces, on purpose:
 
 ```
-  desktop UI (Svelte 5)  ──local WebSocket + token──►  rchatd (Rust)
-                                                         │
-                                              stdio JSON │  supervised child
-                                                         ▼
-                                                   bridge.py (RNS + LXMF)
-                                                         │
-                                          LoRa / radio / TCP / LAN
+  desktop:  Svelte UI ──WS + token──► rchatd ──stdio─────► bridge.py
+  Android:  Svelte UI ──WS + token──► rchatd ──Chaquopy──► bridge.py
+                                       (linked in-process)
+
+  bridge.py ──► LoRa / radio / TCP / LAN
 ```
 
 - **`rchatd`** owns identity, storage, routing policy, and the API. It is the
-  product; the window is a view. This is what makes a small always-on node or a
-  future mobile client possible without rewriting the engine.
+  product; the window is a view. Being a library is what let the Android client
+  reuse the engine unchanged.
 - **`sidecar/bridge.py`** runs the reference Reticulum stack. Reticulum's
   protocol behaviour and crypto are years of work; reimplementing them would be
-  a multi-month compatibility risk. A supervised child process keeps the stack
-  intact and the daemon native.
+  a multi-month compatibility risk. A supervised child process on desktop — and
+  Chaquopy on Android — keeps the stack intact and the daemon native.
 - **`apps/desktop`** is a thin, dependency-light interface (about 70 KB of JS
   after a production build).
+- **`apps/mobile`** is the Android shell: the same Svelte interface, `rchatd`
+  linked in-process, and the Python bridge under Chaquopy, so the APK is
+  self-contained.
 
 Messages are addressed with LXMF, so interop with Sideband and Nomad Network is
 available through the same stack.
@@ -114,8 +118,29 @@ The shell bundles a private Python 3.12 interpreter plus RNS 1.6 and LXMF 1.3,
 so it never touches the system Python. Staging happens automatically in
 `apps/desktop/scripts/prepare-bundle.mjs` before every desktop build.
 
-Platform scope for this milestone: Linux x86_64. Windows, macOS and Flatpak are
-not packaged yet.
+Platform scope: Linux x86_64 desktop and Android arm64. Windows, macOS, Flatpak
+and iOS are not packaged yet.
+
+## Android app
+
+`apps/mobile` is a Tauri 2 app. It links `rchatd` as a library, so the engine runs
+in the app's own process and survives the activity going to the background, and it
+runs `bridge.py` under Chaquopy, so the APK needs no external Python.
+
+New-message notifications are posted from Rust, not from the page: a backgrounded
+WebView has its JavaScript suspended, so the engine's event stream is the only
+reliable trigger. Posting is gated on the activity being visible, the display
+interactive and the keyguard unlocked, so nothing appears while you are reading
+the conversation. The notification carries a count, never message content.
+
+```bash
+cd apps/mobile
+cargo tauri android build --debug --target aarch64 --apk
+```
+
+Needs the Android SDK, NDK and a JDK alongside the Tauri Android tooling. The
+generated native project in `src-tauri/gen/android` is checked in because the
+Kotlin service, activity and notification code live there.
 
 ## Talk to yourself over a real Reticulum link
 
@@ -157,12 +182,16 @@ explicitly (or set `RCHAT_RNS_RESET_CONFIG=1` to regenerate it).
 - Offline queue that flushes when the mesh comes back
 - Display-name changes propagate to peers
 - Reconnects automatically if the engine restarts
+- On Android, notifications while backgrounded, gated on the screen being off or
+  the app not being in front
 
 ## Not built yet
 
 - Group conversations exist in the protocol and store, but there is no UI for them
 - Attachments, voice notes, live voice
-- Mobile clients and background push (the hard problem: Reticulum has no push)
+- iOS, and notifications without a running engine (Reticulum has no push, so
+  Android keeps a foreground service alive instead)
+- Tapping a notification opens the app, not the conversation that caused it
 - Multi-device sync
 
 ## Voice plan (so the current design does not block it)
@@ -188,8 +217,12 @@ crates/rchatd/      daemon: HTTP/WebSocket API, routing, delivery policy
 sidecar/bridge.py   Reticulum + LXMF bridge
 apps/desktop/       Svelte 5 interface
 apps/desktop/src-tauri/  Tauri shell: window, tray, engine supervisor, packaging
+apps/mobile/        Android app: same interface, rchatd in-process, Chaquopy bridge
+apps/mobile/src-tauri/gen/android/  Kotlin service, activity and notifications
 scripts/            smoke tests and the two-peer dev runner
 ```
 
-Tests: `cargo test --workspace`. Smoke tests: `node scripts/smoke-offline.mjs`
-and `node scripts/smoke-rns.mjs` (see the script headers for arguments).
+Tests: `cargo test --workspace`. The mobile app is a separate workspace, so its
+tests run with `cd apps/mobile/src-tauri && cargo test --lib`. Smoke tests:
+`node scripts/smoke-offline.mjs` and `node scripts/smoke-rns.mjs` (see the script
+headers for arguments).

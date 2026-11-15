@@ -1,7 +1,12 @@
 # rchat
 
-A fast, offline-first desktop chat client for [Reticulum](https://reticulum.network).
-Discord-style interface, peer-to-peer messaging, no central server.
+A fast, offline-first chat client for [Reticulum](https://reticulum.network), on
+desktop and Android. Discord-style interface, peer-to-peer messaging, no central
+server.
+
+Layout: `crates/rchatd` is the engine (also linked into the Android app),
+`sidecar/bridge.py` is the Reticulum stack, `apps/desktop` and `apps/mobile` are
+the shells. The mobile app is a separate Cargo workspace.
 
 ## Agent skills
 
