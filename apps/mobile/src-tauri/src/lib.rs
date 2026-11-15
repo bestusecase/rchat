@@ -89,9 +89,7 @@ pub fn start_engine(data_dir: PathBuf) -> Result<u16, String> {
 pub fn stop_engine() {
     let running = RUNNING.lock().unwrap().take();
     let Some(Running {
-        engine,
-        runtime,
-        ..
+        engine, runtime, ..
     }) = running
     else {
         return;

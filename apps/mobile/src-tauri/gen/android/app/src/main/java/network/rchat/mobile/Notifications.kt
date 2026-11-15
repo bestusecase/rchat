@@ -19,12 +19,13 @@ import org.json.JSONObject
  * Two channels with different purposes: the foreground-service channel is quiet
  * and ongoing, while the messages channel is allowed to alert without making a
  * sound. A message notification is a conversation thread: one child per
- * conversation that has unseen messages, grouped under a summary that counts
+ * conversation that has unread messages, grouped under a summary that counts
  * them. The content is private, so a locked screen shows only the count.
  *
  * Everything rendered here comes from the snapshot Rust sends; the only state
- * kept on this side is which child ids are currently posted, so a conversation
- * that disappears from the snapshot can be cancelled.
+ * kept on this side is the set of child ids currently posted and the id
+ * allocated to each conversation, so a conversation that disappears from the
+ * snapshot can be cancelled.
  */
 object Notifications {
   const val SERVICE_CHANNEL = "rchat-service"
@@ -37,15 +38,22 @@ object Notifications {
   private const val MESSAGE_GROUP = "rchat-messages"
   private const val SUMMARY_LINES = 5
 
-  /**
-   * Child ids start above the reserved service and summary ids and are derived
-   * from the conversation id, so they stay stable across posts and restarts.
-   */
+  /** Child ids start above the reserved service and summary ids. */
   private const val CHILD_ID_BASE = 3
-  private const val CHILD_ID_MASK = 0x3FFF_FFFF
 
   /** Child notifications in the shade right now; cancelled when they go stale. */
   private val postedChildren = mutableSetOf<Int>()
+
+  /**
+   * The child id allocated to each conversation for the life of the process.
+   *
+   * Allocating the lowest free id instead of hashing the conversation id makes
+   * the ids unique by construction, so no conversation can overwrite another.
+   * Cleared with [postedChildren] whenever the shade is cleared; a new process
+   * starts empty because the service cancels everything before it promotes
+   * itself.
+   */
+  private val childIds = mutableMapOf<String, Int>()
 
   fun createChannels(context: Context) {
     val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -103,7 +111,7 @@ object Notifications {
     val snapshot = JSONObject(payload)
     val conversations = snapshot.getJSONArray("conversations")
     val conversationCount = snapshot.getInt("conversationCount")
-    val messageCount = snapshot.getInt("messageCount")
+    val unreadCount = snapshot.getInt("unreadCount")
     if (conversationCount == 0 || conversations.length() == 0) {
       clearMessages(context)
       return
@@ -117,7 +125,7 @@ object Notifications {
       val conversation = conversations.getJSONObject(index)
       val id = conversation.getString("id")
       val title = conversation.getString("title")
-      val unseen = conversation.getInt("unseen")
+      val unread = conversation.getInt("unread")
       val messages = conversation.getJSONArray("messages")
 
       val style = NotificationCompat.MessagingStyle(self(context))
@@ -133,13 +141,15 @@ object Notifications {
       val latest =
         if (messages.length() == 0) ""
         else messages.getJSONObject(messages.length() - 1).getString("body")
-      if (live.size < SUMMARY_LINES) summaryLines.addLine("$title — $latest")
+      // One line per conversation, counted by position in the snapshot: a
+      // shared child id must not be able to sneak in a sixth line.
+      if (index < SUMMARY_LINES) summaryLines.addLine("$title — $latest")
 
       val childId = childId(id)
       live += childId
       manager.notify(
         childId,
-        threadNotification(context, title, unseen, style, countOnly(context, unseen)),
+        threadNotification(context, title, unread, style, countOnly(context, unread)),
       )
     }
 
@@ -150,19 +160,19 @@ object Notifications {
     postedChildren.addAll(live)
 
     val summaryText =
-      "${plural(conversationCount, "conversation")} · ${plural(messageCount, "new message")}"
+      "${plural(conversationCount, "conversation")} · ${plural(unreadCount, "new message")}"
     manager.notify(
       SUMMARY_ID,
-      summaryNotification(context, summaryText, messageCount, summaryLines),
+      summaryNotification(context, summaryText, unreadCount, summaryLines),
     )
   }
 
   /**
    * Drop the summary and every thread.
    *
-   * Called when the user can see the app again, when the service stops, and
-   * while it starts so a sticky restart cannot leave threads behind that the
-   * new process cannot explain.
+   * Called when the user can see the app again and when the service is
+   * destroyed. Starting the service calls [cancelAll] instead, because a sticky
+   * restart must not leave threads behind that the new process cannot explain.
    */
   @Synchronized
   fun clearMessages(context: Context) {
@@ -170,6 +180,7 @@ object Notifications {
     manager.cancel(SUMMARY_ID)
     for (id in postedChildren) manager.cancel(id)
     postedChildren.clear()
+    childIds.clear()
   }
 
   /** Android 13+ gates notifications behind a runtime permission. */
@@ -191,14 +202,21 @@ object Notifications {
     val manager = context.getSystemService(NotificationManager::class.java) ?: return
     manager.cancelAll()
     postedChildren.clear()
+    childIds.clear()
   }
 
   /**
-   * Stable across posts and process restarts, and never [SERVICE_ID] or
-   * [SUMMARY_ID].
+   * The lowest free id at or above [CHILD_ID_BASE], so a conversation never
+   * shares an id with another and never collides with [SERVICE_ID] or
+   * [SUMMARY_ID]. The allocation lasts for the process, not across restarts.
    */
-  private fun childId(conversationId: String): Int =
-    CHILD_ID_BASE + (conversationId.hashCode() and CHILD_ID_MASK)
+  private fun childId(conversationId: String): Int {
+    childIds[conversationId]?.let { return it }
+    var id = CHILD_ID_BASE
+    while (id in childIds.values) id++
+    childIds[conversationId] = id
+    return id
+  }
 
   private fun plural(count: Int, singular: String): String =
     if (count == 1) "1 $singular" else "$count ${singular}s"
@@ -228,27 +246,30 @@ object Notifications {
   private fun threadNotification(
     context: Context,
     title: String,
-    unseen: Int,
+    unread: Int,
     style: NotificationCompat.MessagingStyle,
     publicVersion: Notification,
   ): Notification =
     chrome(context, publicVersion)
       .setContentTitle(title)
       .setStyle(style)
-      .setNumber(unseen)
+      .setNumber(unread)
       .setGroup(MESSAGE_GROUP)
       .build()
 
   private fun summaryNotification(
     context: Context,
     text: String,
-    messageCount: Int,
+    unreadCount: Int,
     lines: NotificationCompat.InboxStyle,
   ): Notification =
-    chrome(context, countOnly(context, messageCount))
+    chrome(context, countOnly(context, unreadCount))
       .setContentTitle(context.getString(R.string.app_name))
       .setContentText(text)
       .setStyle(lines)
+      // The total, not one conversation's count: it is what the launcher badge
+      // reads, and the summary spans every conversation.
+      .setNumber(unreadCount)
       .setGroup(MESSAGE_GROUP)
       .setGroupSummary(true)
       .build()

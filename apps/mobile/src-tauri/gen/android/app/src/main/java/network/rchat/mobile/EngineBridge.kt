@@ -73,11 +73,17 @@ object EngineBridge {
     context.startActivity(intent)
   }
 
-  /** Post one notification per conversation with unseen messages. */
+  /** Post one notification per conversation with unread messages. */
   @JvmStatic
   fun notifyThreads(payload: String) {
     val context = appContext ?: return
-    if (userCanSeeApp()) return
+    if (userCanSeeApp()) {
+      // The snapshot was taken while nobody was looking, so it is stale the
+      // moment the user is back. Forgetting it as well as declining is what
+      // stops the next background message from posting text already read.
+      nativeForgetThreads()
+      return
+    }
     Notifications.postThreads(context, payload)
   }
 
@@ -94,7 +100,7 @@ object EngineBridge {
   /**
    * One definition of "the user can see the app".
    *
-   * Rust asks before it records an incoming message and Kotlin asks before it
+   * Rust asks before it commits an incoming message and Kotlin asks before it
    * posts, so neither can drift from the other.
    */
   @JvmStatic

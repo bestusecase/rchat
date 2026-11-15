@@ -7,10 +7,10 @@
 //! JNI.
 //!
 //! What is posted is a conversation thread per conversation, not a bare count.
-//! [`Threads`] is the whole state machine: an engine event and a statement about
-//! who can see the app go in, and the snapshot Kotlin should render comes out.
-//! Keeping the decisions here, away from the platform, is what makes them
-//! testable without a device.
+//! [`Threads`] is the whole state machine: an engine event, whether output is
+//! muted, and a way to ask who can see the app go in, and the snapshot Kotlin
+//! should render comes out. Keeping the decisions here, away from the platform,
+//! is what makes them testable without a device.
 
 use crate::android;
 use crate::Running;
@@ -21,27 +21,11 @@ use tokio::sync::broadcast;
 
 /// How many incoming messages one conversation keeps.
 ///
-/// Eight is more than the expanded shade renders, so trimming never hides
-/// something the platform would have displayed. The conversation's unseen count
-/// is tracked separately and stays truthful past this bound.
+/// Eight caps shade bloat and process memory; it is not a claim about what the
+/// expanded shade can render, so trimming can hide text the platform could have
+/// displayed. The conversation's unread count is tracked separately and stays
+/// truthful past this bound.
 const MESSAGES_KEPT: usize = 8;
-
-/// Who could see the app when the event arrived.
-///
-/// Both inputs suppress the same way but for different reasons: muting is a
-/// request to say nothing, while a visible app means the user is already
-/// reading, so the message is not news.
-#[derive(Debug, Clone, Copy)]
-pub struct Audience {
-    pub muted: bool,
-    pub visible: bool,
-}
-
-impl Audience {
-    fn can_notify(self) -> bool {
-        !self.muted && !self.visible
-    }
-}
 
 /// Follow engine events until the engine stops.
 ///
@@ -66,14 +50,17 @@ pub fn spawn(running: &Running) {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            let audience = Audience {
-                muted: crate::muted(),
-                visible: android::user_can_see_app(),
-            };
-            let snapshot = THREADS
-                .lock()
-                .unwrap()
-                .observe(&text, &identity, &store, audience);
+            // Visibility is a provider, not a sample: the accumulator asks it
+            // at the moment it would append, while holding the lock the
+            // foreground clear needs, so a resume cannot slip between the
+            // answer and the commit.
+            let snapshot = THREADS.lock().unwrap().observe(
+                &text,
+                &identity,
+                &store,
+                crate::muted(),
+                android::user_can_see_app,
+            );
             if let Some(snapshot) = snapshot {
                 post(&snapshot);
             }
@@ -127,20 +114,29 @@ impl Threads {
 
     /// Feed one engine event; returns the snapshot to post, if any.
     ///
-    /// Nothing is appended when the user can see the app, so a message read in
-    /// the app can never resurface in a later notification after it is
-    /// backgrounded again.
+    /// `visible` is asked here, while the lock is held, immediately before the
+    /// append is committed. The foreground path flips its flag before it takes
+    /// that same lock to clear, so the two can only interleave two safe ways:
+    /// if the clear wins, this sample sees a visible app and declines; if the
+    /// append wins, the clear that follows discards it. A message read in the
+    /// app can therefore never resurface in a later notification.
     pub fn observe(
         &mut self,
         event: &str,
         identity: &str,
         store: &Store,
-        audience: Audience,
+        muted: bool,
+        visible: impl Fn() -> bool,
     ) -> Option<Snapshot> {
-        if !audience.can_notify() {
+        if muted {
             return None;
         }
         let incoming = Incoming::parse(event, identity)?;
+        // Commit-time sample: everything above ran while the app was away, but
+        // the user may have come back in the meantime.
+        if visible() {
+            return None;
+        }
         let title = title_for(store, &incoming.conversation_id);
         let entry = MessageView {
             sender_id: incoming.author_id.clone(),
@@ -177,10 +173,10 @@ impl Threads {
                 .map(Thread::view)
                 .collect::<Vec<_>>(),
             conversation_count: self.conversations.len() as u32,
-            message_count: self
+            unread_count: self
                 .conversations
                 .iter()
-                .map(|thread| thread.unseen)
+                .map(|thread| thread.unread)
                 .sum::<u32>(),
         }
     }
@@ -192,7 +188,7 @@ struct Thread {
     title: String,
     /// Every message that arrived while nobody was looking, not just the ones
     /// still listed in `messages`.
-    unseen: u32,
+    unread: u32,
     latest_ts: i64,
     /// Oldest first, at most [`MESSAGES_KEPT`] entries.
     messages: Vec<MessageView>,
@@ -203,7 +199,7 @@ impl Thread {
         Self {
             id,
             title,
-            unseen: 1,
+            unread: 1,
             latest_ts: entry.ts,
             messages: vec![entry],
         }
@@ -211,7 +207,7 @@ impl Thread {
 
     fn push(&mut self, title: String, entry: MessageView) {
         self.title = title;
-        self.unseen = self.unseen.saturating_add(1);
+        self.unread = self.unread.saturating_add(1);
         self.latest_ts = self.latest_ts.max(entry.ts);
         self.messages.push(entry);
         // Arrival order is not send order: every message travels its own link,
@@ -228,7 +224,7 @@ impl Thread {
         ThreadView {
             id: self.id.clone(),
             title: self.title.clone(),
-            unseen: self.unseen,
+            unread: self.unread,
             messages: self.messages.clone(),
         }
     }
@@ -266,7 +262,10 @@ impl Incoming {
                 .and_then(|body| body.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            ts: message.get("ts").and_then(|ts| ts.as_i64()).unwrap_or(0),
+            // A missing clock would sort the message to the head of its thread
+            // and get it trimmed first while still counted, so treat it like
+            // any other malformed event and ignore it.
+            ts: message.get("ts")?.as_i64()?,
         })
     }
 }
@@ -278,7 +277,9 @@ impl Incoming {
 pub struct Snapshot {
     pub conversations: Vec<ThreadView>,
     pub conversation_count: u32,
-    pub message_count: u32,
+    /// The sum of every conversation's unread count, which is what the summary
+    /// carries as its number and the launcher badge reads.
+    pub unread_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -286,7 +287,9 @@ pub struct Snapshot {
 pub struct ThreadView {
     pub id: String,
     pub title: String,
-    pub unseen: u32,
+    /// Every message that arrived while nobody was looking, including ones the
+    /// bound has already trimmed from `messages`.
+    pub unread: u32,
     /// Oldest first, so the platform's stack renders the newest at the bottom.
     pub messages: Vec<MessageView>,
 }
@@ -339,16 +342,9 @@ fn short_id(id: &str) -> String {
 mod tests {
     use super::*;
     use rchat_ipc::{Caps, PeerInfo};
+    use std::cell::Cell;
 
     const IDENTITY: &str = "self";
-
-    /// Nobody is watching and nothing is muted: the ordinary background case.
-    fn heard() -> Audience {
-        Audience {
-            muted: false,
-            visible: false,
-        }
-    }
 
     struct Case {
         store: Store,
@@ -389,22 +385,41 @@ mod tests {
             body: &str,
             ts: i64,
         ) -> Option<Snapshot> {
-            self.observe_as(conversation, author, body, ts, heard())
+            self.observe_while(conversation, author, body, ts, || false)
         }
 
-        fn observe_as(
+        /// Observe one message while the caller decides, at any moment it
+        /// likes, whether the user can see the app.
+        fn observe_while(
             &mut self,
             conversation: &str,
             author: &str,
             body: &str,
             ts: i64,
-            audience: Audience,
+            visible: impl Fn() -> bool,
         ) -> Option<Snapshot> {
             self.threads.observe(
                 &event(conversation, author, body, ts),
                 IDENTITY,
                 &self.store,
-                audience,
+                false,
+                visible,
+            )
+        }
+
+        fn observe_muted(
+            &mut self,
+            conversation: &str,
+            author: &str,
+            body: &str,
+            ts: i64,
+        ) -> Option<Snapshot> {
+            self.threads.observe(
+                &event(conversation, author, body, ts),
+                IDENTITY,
+                &self.store,
+                true,
+                || false,
             )
         }
     }
@@ -447,10 +462,10 @@ mod tests {
             .expect("a background message deserves a notification");
 
         assert_eq!(snapshot.conversation_count, 1);
-        assert_eq!(snapshot.message_count, 1);
+        assert_eq!(snapshot.unread_count, 1);
         let thread = &snapshot.conversations[0];
         assert_eq!(thread.title, "Alice");
-        assert_eq!(thread.unseen, 1);
+        assert_eq!(thread.unread, 1);
         assert_eq!(
             thread.messages,
             [MessageView {
@@ -473,7 +488,7 @@ mod tests {
         let snapshot = case.observe(&chat, "alice", "third", 3_000).unwrap();
 
         assert_eq!(bodies(&snapshot, 0), ["first", "second", "third"]);
-        assert_eq!(snapshot.message_count, 3);
+        assert_eq!(snapshot.unread_count, 3);
     }
 
     #[test]
@@ -507,7 +522,62 @@ mod tests {
         ] {
             assert!(case
                 .threads
-                .observe(event, IDENTITY, &case.store, heard())
+                .observe(event, IDENTITY, &case.store, false, || false)
+                .is_none());
+        }
+        assert_eq!(case.threads.snapshot().conversations, []);
+    }
+
+    #[test]
+    fn an_event_without_an_integer_timestamp_is_ignored() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+
+        let without_ts = serde_json::json!({
+            "type": "event",
+            "name": "message.new",
+            "data": { "message": {
+                "conversation_id": chat,
+                "author_id": "alice",
+                "body": "no clock",
+            }},
+        });
+        let string_ts = serde_json::json!({
+            "type": "event",
+            "name": "message.new",
+            "data": { "message": {
+                "conversation_id": chat,
+                "author_id": "alice",
+                "body": "no clock",
+                "ts": "1000",
+            }},
+        });
+        let float_ts = serde_json::json!({
+            "type": "event",
+            "name": "message.new",
+            "data": { "message": {
+                "conversation_id": chat,
+                "author_id": "alice",
+                "body": "no clock",
+                "ts": 1000.5,
+            }},
+        });
+        let null_ts = serde_json::json!({
+            "type": "event",
+            "name": "message.new",
+            "data": { "message": {
+                "conversation_id": chat,
+                "author_id": "alice",
+                "body": "no clock",
+                "ts": null,
+            }},
+        });
+
+        for event in [without_ts, string_ts, float_ts, null_ts] {
+            assert!(case
+                .threads
+                .observe(&event.to_string(), IDENTITY, &case.store, false, || false)
                 .is_none());
         }
         assert_eq!(case.threads.snapshot().conversations, []);
@@ -518,13 +588,9 @@ mod tests {
         let mut case = Case::new();
         case.peer("alice", Some("Alice"), None);
         let chat = case.direct("alice");
-        let muted = Audience {
-            muted: true,
-            visible: false,
-        };
 
         assert!(case
-            .observe_as(&chat, "alice", "unmuted-yet?", 1_000, muted)
+            .observe_muted(&chat, "alice", "unmuted-yet?", 1_000)
             .is_none());
 
         // The count starts at the unmute, not at the first arrival.
@@ -532,7 +598,7 @@ mod tests {
             .observe(&chat, "alice", "now you see me", 2_000)
             .unwrap();
         assert_eq!(bodies(&snapshot, 0), ["now you see me"]);
-        assert_eq!(snapshot.message_count, 1);
+        assert_eq!(snapshot.unread_count, 1);
     }
 
     #[test]
@@ -540,20 +606,61 @@ mod tests {
         let mut case = Case::new();
         case.peer("alice", Some("Alice"), None);
         let chat = case.direct("alice");
-        let visible = Audience {
-            muted: false,
-            visible: true,
-        };
 
         assert!(case
-            .observe_as(&chat, "alice", "already read", 1_000, visible)
+            .observe_while(&chat, "alice", "already read", 1_000, || true)
             .is_none());
 
         let snapshot = case
             .observe(&chat, "alice", "arrived later", 2_000)
             .unwrap();
         assert_eq!(bodies(&snapshot, 0), ["arrived later"]);
-        assert_eq!(snapshot.message_count, 1);
+        assert_eq!(snapshot.unread_count, 1);
+    }
+
+    #[test]
+    fn a_resume_before_the_append_commits_leaves_nothing_accumulated() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let visible = Cell::new(false);
+
+        // The event is read while nobody is looking, then the user taps the
+        // icon before the append is committed. The provider is asked at commit
+        // time, so it sees the resume and the message is not accumulated.
+        let snapshot = case.observe_while(&chat, "alice", "already read", 1_000, || {
+            visible.set(true);
+            visible.get()
+        });
+
+        assert!(snapshot.is_none());
+        assert_eq!(case.threads.snapshot().conversations, []);
+    }
+
+    #[test]
+    fn a_resume_after_the_append_discards_what_was_accumulated() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+
+        // The append wins the lock first: the message is accumulated and a
+        // notification is posted.
+        let snapshot = case
+            .observe_while(&chat, "alice", "read it", 1_000, || false)
+            .unwrap();
+        assert_eq!(bodies(&snapshot, 0), ["read it"]);
+
+        // The resume follows, flipping its flag before the foreground clear
+        // takes the lock. The clear discards what the append committed.
+        case.threads.clear();
+        assert_eq!(case.threads.snapshot().conversations, []);
+
+        // Once the phone is pocketed again, only what arrived after the resume
+        // can surface.
+        let snapshot = case
+            .observe_while(&chat, "alice", "arrived later", 2_000, || false)
+            .unwrap();
+        assert_eq!(bodies(&snapshot, 0), ["arrived later"]);
     }
 
     #[test]
@@ -581,8 +688,8 @@ mod tests {
                 "message 9",
             ]
         );
-        assert_eq!(snapshot.conversations[0].unseen, 10);
-        assert_eq!(snapshot.message_count, 10);
+        assert_eq!(snapshot.conversations[0].unread, 10);
+        assert_eq!(snapshot.unread_count, 10);
     }
 
     #[test]
@@ -598,7 +705,7 @@ mod tests {
         let snapshot = case.observe(&chat, "alice", "second", 2_000).unwrap();
 
         assert_eq!(bodies(&snapshot, 0), ["first", "second", "third"]);
-        assert_eq!(snapshot.message_count, 3);
+        assert_eq!(snapshot.unread_count, 3);
     }
 
     #[test]
@@ -632,6 +739,59 @@ mod tests {
     }
 
     #[test]
+    fn equal_timestamps_keep_arrival_order_through_trimming() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+
+        // Ten messages sent within the same millisecond, so only arrival order
+        // distinguishes them. Trimming must drop the earliest arrivals and
+        // leave the rest in that order.
+        let mut snapshot = None;
+        for index in 0..10 {
+            snapshot = case.observe(&chat, "alice", &format!("message {index}"), 5_000);
+        }
+        let snapshot = snapshot.unwrap();
+
+        assert_eq!(
+            bodies(&snapshot, 0),
+            [
+                "message 2",
+                "message 3",
+                "message 4",
+                "message 5",
+                "message 6",
+                "message 7",
+                "message 8",
+                "message 9",
+            ]
+        );
+        assert_eq!(snapshot.conversations[0].unread, 10);
+    }
+
+    #[test]
+    fn the_total_unread_is_the_sum_of_each_conversation() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        case.peer("bob", Some("Bob"), None);
+        let alice = case.direct("alice");
+        let bob = case.direct("bob");
+
+        case.observe(&alice, "alice", "one", 1_000);
+        case.observe(&alice, "alice", "two", 2_000);
+        case.observe(&bob, "bob", "one", 3_000);
+        case.observe(&bob, "bob", "two", 4_000);
+        let snapshot = case.observe(&bob, "bob", "three", 5_000).unwrap();
+
+        // Newest conversation first: Bob, then Alice.
+        assert_eq!(snapshot.conversations[0].title, "Bob");
+        assert_eq!(snapshot.conversations[0].unread, 3);
+        assert_eq!(snapshot.conversations[1].title, "Alice");
+        assert_eq!(snapshot.conversations[1].unread, 2);
+        assert_eq!(snapshot.unread_count, 5);
+    }
+
+    #[test]
     fn a_second_conversation_gets_its_own_thread_newest_first() {
         let mut case = Case::new();
         case.peer("alice", Some("Alice"), None);
@@ -644,7 +804,7 @@ mod tests {
         let snapshot = case.observe(&alice, "alice", "alice again", 3_000).unwrap();
 
         assert_eq!(snapshot.conversation_count, 2);
-        assert_eq!(snapshot.message_count, 3);
+        assert_eq!(snapshot.unread_count, 3);
         assert_eq!(snapshot.conversations[0].title, "Alice");
         assert_eq!(snapshot.conversations[1].title, "Bob");
         assert_eq!(bodies(&snapshot, 0), ["from alice", "alice again"]);
@@ -667,7 +827,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.conversation_count, 2);
-        assert_eq!(snapshot.message_count, 3);
+        assert_eq!(snapshot.unread_count, 3);
         assert_eq!(bodies(&snapshot, 0), ["from alice", "after the gap"]);
         assert_eq!(bodies(&snapshot, 1), ["from bob"]);
     }
@@ -684,7 +844,7 @@ mod tests {
         assert_eq!(case.threads.snapshot().conversations, []);
         let snapshot = case.observe(&chat, "alice", "fresh news", 2_000).unwrap();
         assert_eq!(bodies(&snapshot, 0), ["fresh news"]);
-        assert_eq!(snapshot.message_count, 1);
+        assert_eq!(snapshot.unread_count, 1);
     }
 
     #[test]
@@ -763,8 +923,8 @@ mod tests {
         let value = serde_json::to_value(&snapshot).unwrap();
 
         assert_eq!(value["conversationCount"], 1);
-        assert_eq!(value["messageCount"], 1);
-        assert_eq!(value["conversations"][0]["unseen"], 1);
+        assert_eq!(value["unreadCount"], 1);
+        assert_eq!(value["conversations"][0]["unread"], 1);
         assert_eq!(
             value["conversations"][0]["messages"][0]["senderLabel"],
             "Alice"

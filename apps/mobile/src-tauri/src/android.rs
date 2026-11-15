@@ -123,18 +123,37 @@ pub fn notify_threads(payload: &str) -> Result<(), String> {
 /// Kotlin owns the definition — one activity resumed, display interactive,
 /// keyguard unlocked — and both call sites ask it here rather than re-deriving
 /// it, so the notification policy cannot drift.
+///
+/// Fails closed: off Android nothing is posted, so nothing should accumulate,
+/// and on Android a bridge that cannot answer is treated as visible. Message
+/// text is never posted on a guess; the next event asks again.
 pub fn user_can_see_app() -> bool {
-    with_engine_bridge(|env, class| {
-        match env.call_static_method(class, "userCanSeeApp", "()Z", &[]) {
-            Ok(jni::objects::JValueGen::Bool(visible)) => Ok(visible != 0),
-            Ok(_) => Ok(false),
+    #[cfg(not(target_os = "android"))]
+    {
+        true
+    }
+    #[cfg(target_os = "android")]
+    {
+        let asked = with_engine_bridge(|env, class| {
+            match env.call_static_method(class, "userCanSeeApp", "()Z", &[]) {
+                Ok(jni::objects::JValueGen::Bool(visible)) => Ok(visible != 0),
+                Ok(_) => Err("userCanSeeApp did not return a boolean".to_string()),
+                Err(err) => {
+                    let _ = env.exception_clear();
+                    Err(err.to_string())
+                }
+            }
+        });
+        match asked {
+            Ok(visible) => visible,
             Err(err) => {
-                let _ = env.exception_clear();
-                Err(err.to_string())
+                log_error(&format!(
+                    "could not ask whether the user can see the app: {err}"
+                ));
+                true
             }
         }
-    })
-    .unwrap_or(false)
+    }
 }
 
 pub fn clear_activity() -> Result<(), String> {
