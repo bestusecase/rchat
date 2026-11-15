@@ -18,7 +18,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "appimage"],
-    "category": "Network",
+    "category": "SocialNetworking",
     "shortDescription": "Messaging over Reticulum",
     "longDescription": "rchat is a fast, offline-first messenger for Reticulum. Direct messages, delivery receipts, search and an offline queue, with no central server.",
     "icon": [

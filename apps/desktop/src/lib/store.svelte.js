@@ -32,6 +32,7 @@ class ChatStore {
   retryTimer = null;
   desktopWired = false;
   activityCount = 0;
+  restartGraceUntil = 0;
 
   get transportLabel() {
     return transportLabel(this.transport);
@@ -188,6 +189,7 @@ class ChatStore {
     localStorage.setItem(TOKEN_KEY, this.token);
     this.status = "connected";
     this.desktopError = null;
+    this.restartGraceUntil = 0;
 
     try {
       const snapshot = await this.call({ cmd: "snapshot" });
@@ -215,6 +217,7 @@ class ChatStore {
   async retryEngine() {
     if (!this.desktop) return false;
     this.desktopError = null;
+    this.restartGraceUntil = Date.now() + 15000;
     this.status = "starting";
     try {
       const result = await invoke("restart_engine");
@@ -240,6 +243,7 @@ class ChatStore {
 
   async saveNetwork(autoDiscovery, tcpRelay) {
     if (!this.desktop) return;
+    this.restartGraceUntil = Date.now() + 15000;
     const result = await invoke("save_network_settings", {
       autoDiscovery,
       tcpRelay,
@@ -289,8 +293,15 @@ class ChatStore {
     if (this.desktop) {
       // A shell-started engine may still be coming up. Keep trying instead of
       // parking the user on an error screen.
-      this.desktopError = message;
       this.status = "starting";
+      if (Date.now() < this.restartGraceUntil) {
+        // Applying network settings restarts the engine on purpose. The socket
+        // is expected to drop for a few seconds; stay on the calm "Starting
+        // rchat" screen instead of reporting a failure.
+        this.scheduleReconnect(500);
+        return;
+      }
+      this.desktopError = message;
       this.scheduleReconnect(1200);
     } else {
       this.status = "error";

@@ -296,21 +296,33 @@ fn toggle_window(app: &AppHandle) {
     let focused = window.is_focused().unwrap_or(false);
     if visible && focused {
         let _ = window.hide();
+        emit_window_state(app);
     } else {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+        show_window(app);
     }
-    emit_window_state(app);
 }
 
 fn show_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        let _ = window.request_user_attention(None);
-    }
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    // Clear a pending needs-attention hint before asking for focus, otherwise
+    // some X11 window managers keep the focus request pending.
+    let _ = window.request_user_attention(None);
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+
+    // A focus request sent while the window is still being mapped is dropped
+    // by Cinnamon/Muffin. Once it is viewable, the same request is honoured.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Some(window) = handle.get_webview_window("main") {
+            let _ = window.set_focus();
+            let _ = window.request_user_attention(None);
+        }
+    });
     emit_window_state(app);
 }
 

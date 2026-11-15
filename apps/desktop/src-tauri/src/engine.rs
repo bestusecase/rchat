@@ -146,6 +146,10 @@ impl Engine {
         let log_err = log.try_clone().map_err(|err| err.to_string())?;
 
         let port_arg = preferred_port.unwrap_or(0).to_string();
+        // AppImage runtimes export PYTHONHOME/PYTHONPATH for the system Python,
+        // which would point our private interpreter at a stdlib that is not
+        // there. Pin both to the bundled runtime.
+        let python_home = self.python.parent().and_then(|dir| dir.parent());
         let mut command = Command::new(&self.rchatd);
         command
             .arg("--data-dir")
@@ -161,6 +165,10 @@ impl Engine {
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
+
+        if let Some(home) = python_home {
+            command.env("PYTHONHOME", home);
+        }
 
         let relay = settings.tcp_relay.trim();
         if !relay.is_empty() {
