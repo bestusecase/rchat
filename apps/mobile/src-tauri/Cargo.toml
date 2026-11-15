@@ -29,6 +29,11 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
+[dev-dependencies]
+# The notification tests seed a real in-memory store with peers and
+# conversations, so they need the protocol types the store speaks.
+rchat-ipc = { path = "../../../crates/rchat-ipc" }
+
 [profile.release]
 codegen-units = 1
 lto = true

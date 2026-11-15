@@ -99,10 +99,11 @@ What the shell does:
   stops the engine and its Python bridge cleanly.
 - **Tray.** Closing the window hides it; the tray stays resident. Left-click
   toggles the window; the menu has Open, Mute sounds, Start at login, Quit.
-- **Notifications.** No banners and no message previews. A message in a
-  conversation that is not on screen plays one coalesced chime. A tray dot and
-  launcher badge (or a Cinnamon taskbar needs-attention hint) appear only while
-  the window is hidden or unfocused. Nothing happens for the open conversation.
+- **Notifications.** Desktop alerts stay quiet about content: no banners and no
+  message previews. A message in a conversation that is not on screen plays one
+  coalesced chime. A tray dot and launcher badge (or a Cinnamon taskbar
+  needs-attention hint) appear only while the window is hidden or unfocused.
+  Nothing happens for the open conversation.
 - **Network.** The settings panel has LAN discovery and one TCP relay. Applying
   them restarts the engine in place.
 - **Updates.** AppImage installs check GitHub releases for a signed manifest and
@@ -129,9 +130,36 @@ runs `bridge.py` under Chaquopy, so the APK needs no external Python.
 
 New-message notifications are posted from Rust, not from the page: a backgrounded
 WebView has its JavaScript suspended, so the engine's event stream is the only
-reliable trigger. Posting is gated on the activity being visible, the display
-interactive and the keyguard unlocked, so nothing appears while you are reading
-the conversation. The notification carries a count, never message content.
+reliable trigger. Each conversation with unseen messages gets its own
+notification, titled with the conversation — the peer's name for a direct chat —
+showing a messaging-style thread of what arrived while you were away, newest at
+the bottom. A summary groups them and reads `<n> conversations · <m> new
+messages`, with a line per conversation, up to five. Posting is gated on the
+activity being visible, the display interactive and the keyguard unlocked, so
+nothing appears for a message you are already looking at, and the accumulated
+threads are forgotten at the same moment.
+
+Message text is private: a locked screen shows the count only, and Android's own
+"hide sensitive content" setting can hide even that. The notification decisions —
+which conversations appear, in what order, what is suppressed — are unit-tested
+in `src-tauri/src/notify.rs`; the rendering itself is verified by hand on a
+device, since the app has no Android test harness.
+
+Last hand pass: a Pixel 8 (`39061FDJH0080U`), two desktop daemons on the same LAN
+dialling the phone's Reticulum TCP interface. Confirmed on the shade: a burst
+stacks in send order with the newest last and the collapsed card ellipsizes; a
+second peer adds a second child under the same summary, which reads
+`2 conversations · 4 new messages` and lists one line per conversation; a
+1 400-character body stays whole and expands to wrapped text; eleven messages
+leave eight in the thread with `11` as the number; opening the app leaves only
+the ongoing service entry; force-stopping and restarting leaves no stale thread.
+Bodies are `VISIBILITY_PRIVATE` with a count-only public version, checked in
+`dumpsys notification`; that device had no secure lock screen configured, so the
+locked-screen rendering itself was not exercised.
+
+Two messages sent within the same millisecond can carry equal LXMF timestamps and
+arrive out of order; the thread orders by timestamp with arrival order breaking
+ties, which is the same order the conversation view shows.
 
 ```bash
 cd apps/mobile
@@ -182,8 +210,9 @@ explicitly (or set `RCHAT_RNS_RESET_CONFIG=1` to regenerate it).
 - Offline queue that flushes when the mesh comes back
 - Display-name changes propagate to peers
 - Reconnects automatically if the engine restarts
-- On Android, notifications while backgrounded, gated on the screen being off or
-  the app not being in front
+- On Android, per-conversation notification threads while backgrounded, each
+  titled with the peer or conversation and grouped under a summary, gated on the
+  screen being off or the app not being in front
 
 ## Not built yet
 
@@ -191,7 +220,7 @@ explicitly (or set `RCHAT_RNS_RESET_CONFIG=1` to regenerate it).
 - Attachments, voice notes, live voice
 - iOS, and notifications without a running engine (Reticulum has no push, so
   Android keeps a foreground service alive instead)
-- Tapping a notification opens the app, not the conversation that caused it
+- Tapping a conversation's notification opens the app, not that conversation
 - Multi-device sync
 
 ## Voice plan (so the current design does not block it)

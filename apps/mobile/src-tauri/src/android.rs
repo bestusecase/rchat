@@ -6,7 +6,8 @@
 //! cross the boundary are small and deliberately one-directional per concern:
 //!
 //! * Kotlin → Rust: engine start/stop, display name.
-//! * Rust → Kotlin: logging, message notifications, the battery settings page.
+//! * Rust → Kotlin: logging, message notifications, the visibility check, the
+//!   battery settings page.
 //!
 //! App classes cannot be looked up with `FindClass` from an attached native
 //! thread (it only sees the boot class path), so `JNI_OnLoad` caches a global
@@ -83,15 +84,57 @@ pub extern "system" fn Java_network_rchat_mobile_EngineBridge_nativeDisplayName<
     }
 }
 
+/// The user can see the app again, so nothing accumulated is worth a
+/// notification. Cancelling what is already in the shade happens in Kotlin.
+#[no_mangle]
+pub extern "system" fn Java_network_rchat_mobile_EngineBridge_nativeForgetThreads<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    crate::notify::clear();
+}
+
 // ---- Rust -> Kotlin -------------------------------------------------------
 
-/// Post or refresh the silent "new messages" notification.
-pub fn notify_messages(count: u32) -> Result<(), String> {
-    call_engine_bridge(
-        "notifyMessages",
-        "(I)V",
-        &[JValue::Int(count as jni::sys::jint)],
-    )
+/// Post the conversation threads, replacing whatever is in the shade.
+///
+/// One call per event: the payload is the whole snapshot, so Kotlin renders it
+/// without holding state of its own beyond the ids it has already posted.
+pub fn notify_threads(payload: &str) -> Result<(), String> {
+    with_engine_bridge(|env, class| {
+        let payload = env.new_string(payload).map_err(|err| err.to_string())?;
+        match env.call_static_method(
+            class,
+            "notifyThreads",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(payload.as_ref())],
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let _ = env.exception_clear();
+                Err(err.to_string())
+            }
+        }
+    })
+}
+
+/// Whether the user can actually see the app right now.
+///
+/// Kotlin owns the definition — one activity resumed, display interactive,
+/// keyguard unlocked — and both call sites ask it here rather than re-deriving
+/// it, so the notification policy cannot drift.
+pub fn user_can_see_app() -> bool {
+    with_engine_bridge(|env, class| {
+        match env.call_static_method(class, "userCanSeeApp", "()Z", &[]) {
+            Ok(jni::objects::JValueGen::Bool(visible)) => Ok(visible != 0),
+            Ok(_) => Ok(false),
+            Err(err) => {
+                let _ = env.exception_clear();
+                Err(err.to_string())
+            }
+        }
+    })
+    .unwrap_or(false)
 }
 
 pub fn clear_activity() -> Result<(), String> {
@@ -102,7 +145,9 @@ pub fn open_background_settings() -> Result<(), String> {
     call_engine_bridge("openBackgroundSettings", "()V", &[])
 }
 
-fn call_engine_bridge(method: &str, signature: &str, args: &[JValue]) -> Result<(), String> {
+fn with_engine_bridge<T>(
+    call: impl FnOnce(&mut JNIEnv, &GlobalRef) -> Result<T, String>,
+) -> Result<T, String> {
     let vm = JAVA_VM.get().ok_or("the JVM is not available")?;
     let mut env = vm
         .attach_current_thread()
@@ -110,14 +155,20 @@ fn call_engine_bridge(method: &str, signature: &str, args: &[JValue]) -> Result<
     let class = ENGINE_BRIDGE
         .get()
         .ok_or("EngineBridge has not been loaded")?;
-    match env.call_static_method(class, method, signature, args) {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            // Leave no pending exception behind on this thread.
-            let _ = env.exception_clear();
-            Err(err.to_string())
-        }
-    }
+    call(&mut env, class)
+}
+
+fn call_engine_bridge(method: &str, signature: &str, args: &[JValue]) -> Result<(), String> {
+    with_engine_bridge(
+        |env, class| match env.call_static_method(class, method, signature, args) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                // Leave no pending exception behind on this thread.
+                let _ = env.exception_clear();
+                Err(err.to_string())
+            }
+        },
+    )
 }
 
 // ---- logging --------------------------------------------------------------

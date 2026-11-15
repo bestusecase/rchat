@@ -43,7 +43,7 @@ class MainActivity : TauriActivity() {
   override fun onResume() {
     super.onResume()
     // Rust posts message notifications while no activity is on screen; coming
-    // back means the user can see them, so the shade summary is spent.
+    // back means the user can see them, so the whole thread set is spent.
     EngineBridge.setActivityVisible(true)
     EngineBridge.clearActivity()
   }

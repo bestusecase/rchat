@@ -101,6 +101,9 @@ pub fn stop_engine() {
         android::log_error(&format!("engine shutdown: {err:#}"));
     }
     runtime.shutdown_timeout(Duration::from_secs(2));
+    // Nothing a dead engine accumulated is worth keeping: a restarted process
+    // must not inherit threads it cannot account for.
+    notify::clear();
 }
 
 pub fn display_name() -> String {
@@ -244,12 +247,14 @@ fn muted() -> bool {
     Settings::load(dir.as_ref()).muted
 }
 
-/// Drop the "new messages" notification once the user is back in the app.
+/// Drop every message notification once the user is back in the app.
 ///
-/// Posting lives in `notify`, not here: only the engine sees a message while
-/// the webview is suspended.
+/// The accumulator is cleared here too, not just the shade: the user can now
+/// see these messages, so nothing may bring them back on the next background
+/// message.
 #[tauri::command]
 fn clear_activity() {
+    notify::clear();
     let _ = android::clear_activity();
 }
 

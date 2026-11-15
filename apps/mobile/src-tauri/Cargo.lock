@@ -2703,6 +2703,7 @@ dependencies = [
  "jni",
  "log",
  "rchat-core",
+ "rchat-ipc",
  "rchatd",
  "serde",
  "serde_json",

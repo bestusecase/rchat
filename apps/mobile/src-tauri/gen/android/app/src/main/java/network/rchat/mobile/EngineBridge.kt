@@ -24,8 +24,8 @@ object EngineBridge {
    * Whether one of our activities is resumed.
    *
    * Not the same as visible: the screen can be off, or the keyguard can cover
-   * the activity without pausing it. [notifyMessages] therefore pairs this with
-   * the display state instead of trusting it alone.
+   * the activity without pausing it. [userCanSeeApp] pairs this with the
+   * display state instead of trusting it alone.
    */
   @Volatile private var activityVisible = false
 
@@ -59,6 +59,9 @@ object EngineBridge {
   /** The LXMF display name the bridge should announce. */
   @JvmStatic external fun nativeDisplayName(): String
 
+  /** Forget the accumulated notification threads. Called on coming back. */
+  @JvmStatic external fun nativeForgetThreads()
+
   /** Open the system page where the user can allow background battery use. */
   @JvmStatic
   fun openBackgroundSettings() {
@@ -70,26 +73,37 @@ object EngineBridge {
     context.startActivity(intent)
   }
 
-  /** Silent, content-free summary of unread messages. */
+  /** Post one notification per conversation with unseen messages. */
   @JvmStatic
-  fun notifyMessages(count: Int) {
+  fun notifyThreads(payload: String) {
     val context = appContext ?: return
-    // Resumed is not the same as visible: an activity can be resumed while the
-    // screen is off or the keyguard covers it. Stay quiet only when the user
-    // can actually see the app.
-    if (activityVisible && userCanSeeApp(context)) return
-    Notifications.postMessages(context, count)
-  }
-
-  private fun userCanSeeApp(context: Context): Boolean {
-    val power = context.getSystemService(PowerManager::class.java)
-    val keyguard = context.getSystemService(KeyguardManager::class.java)
-    return power?.isInteractive == true && keyguard?.isKeyguardLocked != true
+    if (userCanSeeApp()) return
+    Notifications.postThreads(context, payload)
   }
 
   @JvmStatic
   fun clearActivity() {
+    // Drop what the engine accumulated as well as what is in the shade: the
+    // user is reading these messages now, so they must not come back in the
+    // next background notification.
+    nativeForgetThreads()
     val context = appContext ?: return
     Notifications.clearMessages(context)
+  }
+
+  /**
+   * One definition of "the user can see the app".
+   *
+   * Rust asks before it records an incoming message and Kotlin asks before it
+   * posts, so neither can drift from the other.
+   */
+  @JvmStatic
+  fun userCanSeeApp(): Boolean {
+    val context = appContext ?: return false
+    val power = context.getSystemService(PowerManager::class.java)
+    val keyguard = context.getSystemService(KeyguardManager::class.java)
+    return activityVisible &&
+      power?.isInteractive == true &&
+      keyguard?.isKeyguardLocked != true
   }
 }

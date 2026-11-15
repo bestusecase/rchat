@@ -27,6 +27,9 @@ class RchatService : Service() {
     super.onCreate()
     EngineBridge.init(this)
     Notifications.createChannels(this)
+    // Before the service notification exists: a sticky restart must not inherit
+    // threads the previous process left in the shade.
+    Notifications.cancelAll(this)
     startInForeground()
 
     val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -102,6 +105,9 @@ class RchatService : Service() {
   override fun onDestroy() {
     bridgeThread = null
     EngineBridge.nativeStop()
+    // The threads the engine accumulated are gone with it, so nothing may stay
+    // in the shade claiming otherwise.
+    Notifications.clearMessages(this)
     multicastLock?.release()
     wifiLock?.release()
     multicastLock = null
