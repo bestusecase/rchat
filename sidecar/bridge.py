@@ -2,13 +2,24 @@
 """Reticulum bridge for rchat.
 
 Owns the Reticulum instance and the LXMF router, and speaks newline-delimited
-JSON to the Rust daemon over stdio.
+JSON to the Rust daemon.
 
 Why a separate process: the reference Reticulum stack is Python and carries a
 lot of hard-won protocol behaviour (path discovery, announce handling, link
 management, propagation). Reimplementing it would be months of work and a
 compatibility risk. A supervised child process keeps that stack intact while
 the daemon stays native and fast.
+
+Transport to the daemon
+-----------------------
+stdio (default)
+    The daemon starts this script as a child and reads stdout.
+
+socket
+    The daemon listens on loopback and this module dials in. Used on Android,
+    where Chaquopy runs Python in the app process: there are no inherited pipes,
+    so ``main(port, data_dir, display_name)`` connects instead. The protocol is
+    the same line-delimited JSON in both directions.
 
 Modes
 -----
@@ -32,15 +43,69 @@ to move between LAN, TCP relay and radio:
 
 import json
 import os
+import socket
 import sys
 import threading
 import time
 import traceback
 
+# AutoInterface joins its discovery group by interface index, and Reticulum
+# treats a failure here as fatal (RNS.panic() calls os._exit). Chaquopy's
+# Python is built without socket.if_nametoindex even though Bionic supports it,
+# and without the fcntl module, so borrow the libc call instead. Install this
+# before RNS imports socket.
+if not hasattr(socket, "if_nametoindex"):
+
+    def _if_nametoindex(ifname):
+        import ctypes
+
+        name = str(ifname).encode("utf-8")
+        # "libc.so" is the public NDK stub; None falls back to the global
+        # symbol table if the stub cannot be opened.
+        for library in ("libc.so", None):
+            try:
+                libc = ctypes.CDLL(library, use_errno=True)
+            except OSError:
+                continue
+            native = getattr(libc, "if_nametoindex", None)
+            if native is None:
+                continue
+            native.argtypes = [ctypes.c_char_p]
+            native.restype = ctypes.c_uint
+            index = int(native(name))
+            if index:
+                return index
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        raise OSError("if_nametoindex is unavailable on this platform")
+
+    socket.if_nametoindex = _if_nametoindex
+
+# RNS installs SIGINT/SIGTERM handlers in Reticulum.__init__. CPython only allows
+# that on the main thread, and inside the app the bridge runs on a worker thread
+# (the Android main thread cannot block for the bridge's lifetime). Android never
+# delivers those signals to the UI process, so ignore the install instead of
+# letting it abort startup. On the main thread this is a pass-through.
+import signal
+
+_native_signal = signal.signal
+
+
+def _signal(signum, handler):
+    try:
+        return _native_signal(signum, handler)
+    except ValueError:
+        return None
+
+
+signal.signal = _signal
+
 import LXMF
 import RNS
 
-_print_lock = threading.Lock()
+_write_lock = threading.Lock()
+# Set when the bridge was given a socket to dial instead of inheriting stdio.
+_socket = None
 
 
 def emit(payload):
@@ -49,9 +114,17 @@ def emit(payload):
         line = json.dumps(payload, separators=(",", ":"), default=str)
     except Exception:
         line = json.dumps({"ev": "error", "message": "bridge could not serialise an event"})
-    with _print_lock:
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+    with _write_lock:
+        if _socket is None:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+            return
+        try:
+            _socket.sendall((line + "\n").encode("utf-8"))
+        except OSError:
+            # The engine is gone. Events are best effort; the daemon sees the
+            # socket close and reports the transport offline.
+            pass
 
 
 def env_flag(name, default):
@@ -91,6 +164,29 @@ def split_hostport(spec, default_host="127.0.0.1"):
         return host, int(port)
     except ValueError:
         return default_host, None
+
+
+def open_socket(spec, timeout=10.0):
+    """Dial the daemon's bridge listener, retrying while it comes up.
+
+    The daemon binds before starting the interpreter, so the first attempt
+    normally wins; the retry covers an app restart racing the engine.
+    """
+    host, port = split_hostport(str(spec))
+    if port is None:
+        raise ValueError("invalid bridge socket spec: %r" % (spec,))
+    deadline = time.time() + timeout
+    while True:
+        try:
+            sock = socket.create_connection((host, port), timeout=5)
+            # Command lines have no upper bound we control, and the daemon only
+            # writes complete lines; block until one arrives.
+            sock.settimeout(None)
+            return sock
+        except OSError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.15)
 
 
 def write_config(config_dir):
@@ -355,7 +451,33 @@ def handle_command(line):
         raise SystemExit(0)
 
 
-def main():
+def main(socket_spec=None, data_dir=None, display_name=None):
+    """Start Reticulum and talk to the daemon until it goes away.
+
+    With no arguments this is the stdio bridge the desktop daemon spawns.
+    ``socket_spec`` (a port, or ``host:port``) dials the daemon's loopback
+    listener instead. ``data_dir`` and ``display_name`` override the
+    environment, which an embedded interpreter (Chaquopy) cannot always set.
+    ``data_dir`` is the bridge's own directory — identity, configurations and
+    LXMF storage — not the daemon's data directory.
+    """
+    global DATA_DIR, DISPLAY_NAME, CONFIG_DIR, _socket
+
+    if data_dir:
+        DATA_DIR = os.path.abspath(os.path.expanduser(str(data_dir)))
+    if display_name:
+        DISPLAY_NAME = str(display_name)
+    # Re-derive: the module-level value was computed before the override.
+    CONFIG_DIR = os.environ.get("RCHAT_RNS_CONFIGDIR") or DATA_DIR
+
+    if socket_spec is not None:
+        try:
+            _socket = open_socket(socket_spec)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("rchat bridge could not reach the engine: %s\n" % exc)
+            sys.stderr.flush()
+            return 1
+
     emit({"ev": "state", "state": "starting", "name": DISPLAY_NAME})
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -411,15 +533,22 @@ def main():
     do_announce()
     threading.Thread(target=announce_loop, daemon=True).start()
 
-    for line in sys.stdin:
+    # Commands arrive from the daemon, one JSON object per line. Over a socket
+    # the file object gives us the same line iterator stdio does.
+    if _socket is not None:
+        commands = _socket.makefile("r", encoding="utf-8", errors="replace")
+    else:
+        commands = sys.stdin
+    for line in commands:
         line = line.strip()
         if line:
             handle_command(line)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except SystemExit:
         raise
     except Exception:

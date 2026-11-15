@@ -2,9 +2,17 @@
 //!
 //! The reference Reticulum stack is Python. Rather than reimplementing a
 //! protocol with its own crypto and transport rules, the daemon runs a small
-//! Python bridge as a child process and speaks newline-delimited JSON to it.
-//! The bridge owns the Reticulum instance and LXMF router; the Rust side owns
-//! identity, storage, and routing policy.
+//! Python bridge and speaks newline-delimited JSON to it. The bridge owns the
+//! Reticulum instance and LXMF router; the Rust side owns identity, storage,
+//! and routing policy.
+//!
+//! Two ways to reach it, same protocol:
+//!
+//! * [`spawn`] runs the bridge as a child process over stdio. This is the
+//!   desktop path, where Python is a separate program.
+//! * [`attach`] listens on loopback and waits for the bridge to connect. This
+//!   is the Android path: Python is embedded in the app process by Chaquopy,
+//!   so there are no pipes to inherit and the bridge dials out instead.
 //!
 //! If the bridge cannot start (no Python, no script, broken install) the daemon
 //! keeps running with local history and reports `offline`. Chat should degrade,
@@ -15,8 +23,9 @@ use rchat_ipc::TransportState;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub enum BridgeEvent {
@@ -50,15 +59,22 @@ pub enum BridgeEvent {
 }
 
 pub struct Bridge {
-    child: Child,
+    child: Option<Child>,
     cmd_tx: mpsc::UnboundedSender<String>,
     pub events: mpsc::UnboundedReceiver<BridgeEvent>,
+    cancel: Option<oneshot::Sender<()>>,
 }
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        // Best effort. The bridge also exits when its stdin closes.
-        let _ = self.child.start_kill();
+        // Best effort. The process bridge also exits when its stdin closes;
+        // the socket bridge sees its listener disappear when the task stops.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
     }
 }
 
@@ -88,7 +104,7 @@ impl Bridge {
     }
 }
 
-/// Start the Python bridge.
+/// Start the Python bridge as a child process.
 ///
 /// `envs` are passed through to the child so the user can pick transport mode
 /// (embedded instance, TCP server, TCP client, AutoInterface) without changing
@@ -115,12 +131,13 @@ pub fn spawn(python: &str, script: &Path, envs: &[(&str, String)]) -> Result<Bri
     let stdout = child.stdout.take().context("bridge stdout unavailable")?;
     let stderr = child.stderr.take().context("bridge stderr unavailable")?;
 
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel::<BridgeEvent>();
 
     // Commands: Rust -> Python stdin.
     tokio::spawn(async move {
         let mut stdin = stdin;
+        let mut cmd_rx = cmd_rx;
         while let Some(line) = cmd_rx.recv().await {
             if stdin.write_all(line.as_bytes()).await.is_err() {
                 break;
@@ -138,29 +155,7 @@ pub fn spawn(python: &str, script: &Path, envs: &[(&str, String)]) -> Result<Bri
     // Events: Python stdout -> Rust.
     let evt_tx_out = evt_tx.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Some(event) = parse_event(&line) {
-                        if evt_tx_out.send(event).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        let _ = evt_tx_out.send(BridgeEvent::State {
-            state: TransportState::Offline,
-            address: None,
-            name: None,
-            detail: Some("bridge process exited".into()),
-        });
+        read_events(stdout, evt_tx_out).await;
     });
 
     // Diagnostics: Python stderr -> tracing.
@@ -181,10 +176,164 @@ pub fn spawn(python: &str, script: &Path, envs: &[(&str, String)]) -> Result<Bri
     });
 
     Ok(Bridge {
-        child,
+        child: Some(child),
         cmd_tx,
         events: evt_rx,
+        cancel: None,
     })
+}
+
+/// Wait for an embedded bridge to connect to `listener`.
+///
+/// The bridge may reconnect (a crashed Python side, an app restart racing the
+/// engine), so the listener stays open and every accepted connection resumes
+/// the protocol. Commands issued while nothing is connected are dropped: the
+/// daemon retries queued messages once transport is ready again.
+pub fn attach(listener: TcpListener) -> Bridge {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<String>();
+    let (evt_tx, evt_rx) = mpsc::unbounded_channel::<BridgeEvent>();
+    let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let mut cmd_rx = cmd_rx;
+        // Warn once if the embedded bridge never dials in: a broken Python
+        // install or a crashed interpreter would otherwise leave the transport
+        // at "starting" forever. The listener keeps waiting, so a late bridge
+        // is still accepted.
+        let mut awaiting_first = true;
+        loop {
+            let accepted = tokio::select! {
+                _ = &mut cancel_rx => return,
+                accepted = accept(&listener, awaiting_first) => accepted,
+            };
+            let (stream, peer) = match accepted {
+                Ok(pair) => pair,
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    let _ = evt_tx.send(BridgeEvent::State {
+                        state: TransportState::Offline,
+                        address: None,
+                        name: None,
+                        detail: Some("the reticulum bridge has not connected yet".into()),
+                    });
+                    awaiting_first = false;
+                    continue;
+                }
+                Err(err) => {
+                    let _ = evt_tx.send(BridgeEvent::State {
+                        state: TransportState::Offline,
+                        address: None,
+                        name: None,
+                        detail: Some(format!("bridge listener failed: {err}")),
+                    });
+                    return;
+                }
+            };
+            awaiting_first = false;
+            if !peer.ip().is_loopback() {
+                // Never expose the bridge protocol off-device.
+                continue;
+            }
+
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let offline = loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => return,
+                    line = lines.next_line() => {
+                        match line {
+                            Ok(Some(line)) => {
+                                if line.trim().is_empty() {
+                                    continue;
+                                }
+                                if let Some(event) = parse_event(&line) {
+                                    if evt_tx.send(event).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(None) => break "the bridge disconnected",
+                            Err(_) => break "the bridge connection failed",
+                        }
+                    }
+                    command = cmd_rx.recv() => {
+                        match command {
+                            Some(line) => {
+                                if write.write_all(line.as_bytes()).await.is_err()
+                                    || write.write_all(b"\n").await.is_err()
+                                    || write.flush().await.is_err()
+                                {
+                                    break "the bridge stopped accepting commands";
+                                }
+                            }
+                            None => return,
+                        }
+                    }
+                }
+            };
+
+            let _ = evt_tx.send(BridgeEvent::State {
+                state: TransportState::Offline,
+                address: None,
+                name: None,
+                detail: Some(offline.into()),
+            });
+        }
+    });
+
+    Bridge {
+        child: None,
+        cmd_tx,
+        events: evt_rx,
+        cancel: Some(cancel_tx),
+    }
+}
+
+/// Accept the next bridge connection. Before the first connection, give up
+/// after a while so a bridge that never starts is reported instead of silently
+/// leaving the transport at "starting".
+async fn accept(
+    listener: &TcpListener,
+    warn_if_slow: bool,
+) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    if !warn_if_slow {
+        return listener.accept().await;
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the bridge has not connected",
+        )),
+    }
+}
+
+async fn read_events<R>(stream: R, evt_tx: mpsc::UnboundedSender<BridgeEvent>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(stream).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(event) = parse_event(&line) {
+                    if evt_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let _ = evt_tx.send(BridgeEvent::State {
+        state: TransportState::Offline,
+        address: None,
+        name: None,
+        detail: Some("bridge process exited".into()),
+    });
 }
 
 fn parse_event(line: &str) -> Option<BridgeEvent> {

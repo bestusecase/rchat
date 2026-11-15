@@ -665,6 +665,7 @@ dependencies = [
  "axum",
  "futures-util",
  "getrandom 0.2.17",
+ "libc",
  "rchat-core",
  "rchat-ipc",
  "rchat-rns",
