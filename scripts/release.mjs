@@ -9,7 +9,10 @@
 // Environment:
 //   TAURI_SIGNING_PRIVATE_KEY(+_PASSWORD)  updater signing key (path or literal)
 //   RCHAT_APT_KEY                           archive key fingerprint for the apt repo
+//   GPG_PASSPHRASE                          archive key passphrase
 //   GITHUB_TOKEN                            token for --upload/--pages (or token file)
+//
+// Passphrases default to ~/.config/rchat/release/{updater,apt}.pass (mode 600).
 //
 // The two keys are independent: minisign proves the AppImage came from us, the
 // GPG key proves apt metadata came from us.
@@ -41,6 +44,18 @@ const tag = `v${version}`;
 const releaseKey =
   process.env.TAURI_SIGNING_PRIVATE_KEY ||
   path.join(os.homedir(), ".config/rchat/release/updater.key");
+
+// The keys are passphrase-protected. Keep the passphrases out of argv: read
+// them from the environment or from mode-600 files next to the keys.
+function secret(envName, fileName) {
+  const fromEnv = process.env[envName];
+  if (fromEnv) return fromEnv.trim();
+  const file = path.join(os.homedir(), ".config/rchat/release", fileName);
+  return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim() : "";
+}
+
+const updaterPassword = secret("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "updater.pass");
+const aptPassphrase = secret("GPG_PASSPHRASE", "apt.pass");
 
 function valueFor(flag) {
   const index = process.argv.indexOf(flag);
@@ -85,8 +100,7 @@ if (!skipBuild) {
     env: {
       ...process.env,
       TAURI_SIGNING_PRIVATE_KEY: releaseKey,
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD:
-        process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || "",
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: updaterPassword,
     },
   });
 }
@@ -139,7 +153,10 @@ execFileSync(
     "--out",
     repoDir,
   ],
-  { stdio: "inherit", env: process.env },
+  {
+    stdio: "inherit",
+    env: { ...process.env, GPG_PASSPHRASE: aptPassphrase },
+  },
 );
 
 // ------------------------------------------------------------- checksums

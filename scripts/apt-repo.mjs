@@ -45,6 +45,16 @@ const gnupg = process.env.GNUPGHOME || path.join(os.homedir(), ".config/rchat/re
 const keyId = process.env.RCHAT_APT_KEY || arg("key", null);
 if (!keyId) fail("set RCHAT_APT_KEY (or --key) to the archive key fingerprint");
 
+// The archive key is passphrase-protected. Prefer GPG_PASSPHRASE (set by
+// release.mjs from ~/.config/rchat/release/apt.pass) and feed it over stdin so
+// it never appears in argv. Without one, gpg falls back to its pinentry.
+const passphrase =
+  process.env.GPG_PASSPHRASE ??
+  process.env.RCHAT_APT_PASSPHRASE ??
+  "";
+const gpgPassArgs = passphrase ? ["--pinentry-mode", "loopback", "--passphrase-fd", "0"] : [];
+const gpgInput = passphrase ? `${passphrase}\n` : undefined;
+
 const pool = path.join(out, "pool/main/r/rchat");
 const dists = path.join(out, "dists/stable");
 const binaryDir = path.join(dists, "main/binary-amd64");
@@ -100,14 +110,15 @@ run(
 fs.renameSync(stagedRelease, releasePath);
 fs.rmSync(releaseConf);
 
-const gpg = ["--batch", "--yes", "--local-user", keyId];
+const gpg = ["--batch", "--yes", ...gpgPassArgs, "--local-user", keyId];
 run("gpg", [...gpg, "--clearsign", "-o", path.join(dists, "InRelease"), releasePath], {
   env: { ...process.env, GNUPGHOME: gnupg },
+  input: gpgInput,
 });
 run(
   "gpg",
   [...gpg, "--detach-sign", "--armor", "-o", path.join(dists, "Release.gpg"), releasePath],
-  { env: { ...process.env, GNUPGHOME: gnupg } },
+  { env: { ...process.env, GNUPGHOME: gnupg }, input: gpgInput },
 );
 
 fs.copyFileSync(

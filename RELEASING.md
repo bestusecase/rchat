@@ -10,32 +10,43 @@ Two update channels, two keys, one build:
 Never mix the keys up. Losing the updater key means existing AppImage installs
 can never accept another update; replacing it requires a manual reinstall.
 
-## One-time setup
+## Keys
+
+Both private keys live in `~/.config/rchat/release/` (mode 600) and are
+passphrase-protected. The passphrases are in `apt.pass` and `updater.pass` in
+the same directory (mode 600); `scripts/release.mjs` reads them automatically.
+For CI, pass them as `GPG_PASSPHRASE` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+instead of shipping the files. Back up both key files **and** both passphrases
+somewhere offline — losing either half means no further signed releases.
+
+Keep the release directory out of any backup that leaves the machine unless the
+backup is encrypted, since key and passphrase sit side by side.
+
+To recreate the keys from scratch (new fingerprint/new pubkey — see the warning
+below):
 
 ```bash
-# Updater signing key (minisign). Keep the private half offline or in CI secrets.
+# Updater signing key (minisign).
 cd apps/desktop
 cargo tauri signer generate -w ~/.config/rchat/release/updater.key
+# The public half goes verbatim into plugins.updater.pubkey in tauri.conf.json.
 
 # Apt archive key (GPG). Its public half is committed as a keyring.
 export GNUPGHOME=~/.config/rchat/release/gnupg
 mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
-gpg --batch --passphrase '' --quick-generate-key \
-  'rchat archive <archive@rchat.network>' rsa4096 sign 5y
+gpg --quick-generate-key 'rchat archive <archive@rchat.network>' rsa4096 sign 5y
 gpg --export > apps/desktop/src-tauri/packaging/deb/rchat-archive-keyring.gpg
 gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}'
 ```
 
-Put the fingerprint in `RCHAT_APT_KEY`. Both keys were generated without a
-passphrase during the first implementation — protect them before real use:
+Put the fingerprint in `RCHAT_APT_KEY`.
 
-```bash
-gpg --passwd <fingerprint>
-cargo tauri signer generate -w ~/.config/rchat/release/updater.key   # re-key once
-```
-
-Re-keying the updater means bumping to a version that users install manually;
-that is why it must happen before the first public update, not after.
+**Re-keying the updater is a breaking change.** Every existing AppImage carries
+the old public key and will reject the new signature, so each one must be
+replaced manually once. The current key was rotated at 0.1.3; AppImage 0.1.2
+installs cannot update themselves and must download 0.1.3 by hand. Debian
+installs are unaffected because the archive keypair itself did not change, only
+its passphrase.
 
 ## Cut a release
 
@@ -50,8 +61,10 @@ that is why it must happen before the first public update, not after.
    node scripts/release.mjs --notes notes.md
    ```
 
-   That produces `dist/latest.json`, `dist/SHA256SUMS`, and a signed apt tree in
-   `dist/repo` (pool + Packages + InRelease).
+   The script reads both passphrases from the `*.pass` files described above, so
+   the signing steps run unattended. That produces `dist/latest.json`,
+   `dist/SHA256SUMS`, and a signed apt tree in `dist/repo` (pool + Packages +
+   InRelease).
 
 3. Publish (GitHub release + `gh-pages` apt repo):
 
