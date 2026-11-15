@@ -1,0 +1,48 @@
+Package: rchat
+Architecture: amd64
+Version: 0.1.1
+Priority: optional
+Maintainer: rchat
+Installed-Size: 229826
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/r/rchat/rchat_0.1.1_amd64.deb
+Size: 84211152
+MD5sum: e24278b4f8c0b37cdf6426f8b29caebe
+SHA1: 5a4f8beb75ad24600885138563239457529ffd16
+SHA256: ffc3f878e55d67b609820e23b10c710dc35d5f6c588c5f17ceb30043b301e04c
+SHA512: 4d16a87cc6eee049d52c89fab9e2011b574c87609ba1b2a43b874563a954c201326241b309d60d7d83b2bde2f8db68784331616f0d1a6c513d5e5bae229e9e2e
+Description: Messaging over Reticulum
+ rchat is a fast, offline-first messenger for Reticulum. Direct messages, delivery receipts, search and an offline queue, with no central server.
+
+Package: rchat
+Architecture: amd64
+Version: 0.1.2
+Priority: optional
+Maintainer: rchat
+Installed-Size: 229826
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/r/rchat/rchat_0.1.2_amd64.deb
+Size: 84211342
+MD5sum: 8df770307b17c41cbc3d07c7846665a7
+SHA1: 9806ca58924712a4fb424ccd15d8185874437f7a
+SHA256: 6cd2ba650c6a18662f5b113d97afb37b4770f5aa711f039a1290374461eff562
+SHA512: 6ad33320a2a93e9647270fa675f4d1add334f7316a1f1b61949f88ae44939cd1e2a84b2947eff78550a1612111b69cc63115f495d91d322c9c4591f6b9a2c7dd
+Description: Messaging over Reticulum
+ rchat is a fast, offline-first messenger for Reticulum. Direct messages, delivery receipts, search and an offline queue, with no central server.
+
+Package: rchat
+Architecture: amd64
+Version: 0.1.3
+Priority: optional
+Maintainer: rchat
+Installed-Size: 229826
+Depends: libayatana-appindicator3-1, libwebkit2gtk-4.1-0, libgtk-3-0
+Filename: pool/main/r/rchat/rchat_0.1.3_amd64.deb
+Size: 84210974
+MD5sum: 7710c7ac88c4331970911d08ee7d8b39
+SHA1: 6fddc32a80cb19fc598b4149f6d875a976d68090
+SHA256: c87374429606b2003688281cd480d54409b4a023f446a8836ebc42b401c38fcc
+SHA512: 5b132298d59c3c91283a751813e508d1fe27ec8ee418af4400b4ae14270e67ff99be4440c8294e7eecf4380569072fc6b520f1b4223783f8174550dbad159b55
+Description: Messaging over Reticulum
+ rchat is a fast, offline-first messenger for Reticulum. Direct messages, delivery receipts, search and an offline queue, with no central server.
+

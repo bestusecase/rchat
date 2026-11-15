@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rchat apt repository</title>
+<h1>rchat apt repository</h1>
+<p>Add it once on Debian or Ubuntu:</p>
+<pre>curl -fsSL https://bestusecase.github.io/rchat/deb/rchat-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/rchat-archive-keyring.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/rchat-archive-keyring.gpg] https://bestusecase.github.io/rchat/deb stable main" \
+  | sudo tee /etc/apt/sources.list.d/rchat.list
+sudo apt update &amp;&amp; sudo apt install rchat</pre>
+<p>Installed packages upgrade automatically, or run <code>sudo apt upgrade rchat</code>.</p>

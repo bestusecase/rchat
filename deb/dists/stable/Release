@@ -1,0 +1,20 @@
+Architectures: amd64
+Codename: stable
+Components: main
+Date: Sun, 15 Nov 2026 15:45:55 +0000
+Description: rchat desktop packages
+Label: rchat
+Origin: rchat
+Suite: stable
+MD5Sum:
+ 421f17483ea08f2b8c9f0abbf67dc386             2181 main/binary-amd64/Packages
+ dbd545c1cc25979713ccd6f1a88f788e              893 main/binary-amd64/Packages.gz
+SHA1:
+ 2ea4802b334642c84fab78e8a153f4adf04a5ad1             2181 main/binary-amd64/Packages
+ 7201fa268d5eeb64324dbabce65bbe3c47efdbf7              893 main/binary-amd64/Packages.gz
+SHA256:
+ d45013de19ba12cf67d67c3832e60cc0ce4457d307085cb4a39f1592adc77312             2181 main/binary-amd64/Packages
+ 040f6e3c4f016ecbff76387bf9e10c6fb1c3edfaeffd9cf93c960c7082ec0348              893 main/binary-amd64/Packages.gz
+SHA512:
+ f3ce557194d8f3308a5fbdee3c637fee1fcba58570d3c073103a8c1ffd7a2f2eacf19000614ee1deb5d2da558bd2d802873a9b6fdc5ffe06836bc5cf6fc091c9             2181 main/binary-amd64/Packages
+ 58f33c5e412ac50e583c1d0e1cec7328ba28e2b36298baab4e04670cb0b050fd3ab29e40f588af48d0f82b890c1cf735b5b97d89fafd346eff2438bd506a194a              893 main/binary-amd64/Packages.gz
