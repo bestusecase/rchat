@@ -19,6 +19,11 @@
   let relayDraft = $state("");
   let mutedDraft = $state(false);
   let autostartDraft = $state(false);
+  let updatePercent = $derived(
+    chat.update.total
+      ? Math.min(100, Math.round((chat.update.downloaded / chat.update.total) * 100))
+      : 0,
+  );
 
   onMount(() => {
     chat.initDesktop();
@@ -363,6 +368,86 @@
             </span>
             <span class="switch" data-on={autostartDraft}></span>
           </button>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-title">Updates</div>
+          <div class="update-row">
+            <span class="toggle-text">
+              <strong>rchat {chat.update.current || chat.update.packageVersion || ""}</strong>
+              {#if chat.update.installKind === "appimage"}
+                {#if chat.update.status === "checking"}
+                  <small>Checking the release feed…</small>
+                {:else if chat.update.status === "available"}
+                  <small>Version {chat.update.latest} is available to download.</small>
+                {:else if chat.update.status === "downloading"}
+                  <small>Downloading {chat.update.latest}…</small>
+                {:else if chat.update.status === "ready"}
+                  <small>Version {chat.update.latest} is installed. Restart to use it.</small>
+                {:else if chat.update.status === "error"}
+                  <small>{chat.update.error}</small>
+                {:else if chat.update.status === "current"}
+                  <small>You're on the latest version.</small>
+                {:else}
+                  <small>Downloaded in the app, applied on restart.</small>
+                {/if}
+              {:else if chat.update.installKind === "deb"}
+                {#if chat.update.pendingRestart}
+                  <small>Version {chat.update.packageVersion} is installed. Restart to use it.</small>
+                {:else if chat.update.autoUpdates}
+                  <small>
+                    Automatic: a daily system job upgrades rchat from the signed rchat
+                    repository.
+                  </small>
+                {:else}
+                  <small>Add the rchat apt repository to get updates with your other packages.</small>
+                {/if}
+              {:else}
+                <small>Automatic updates are available in packaged builds.</small>
+              {/if}
+            </span>
+          </div>
+          {#if chat.update.status === "downloading"}
+            <div
+              class="update-progress"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={updatePercent}
+            >
+              <span style="width: {updatePercent}%"></span>
+            </div>
+          {/if}
+          {#if chat.update.notes && chat.update.status === "available"}
+            <p class="update-notes">{chat.update.notes}</p>
+          {/if}
+          <div class="update-actions">
+            {#if chat.update.installKind === "appimage"}
+              {#if chat.update.status === "available"}
+                <button class="btn primary" onclick={() => chat.installUpdate()}>
+                  Download {chat.update.latest}
+                </button>
+              {:else if chat.update.status === "downloading"}
+                <button class="btn ghost" disabled>{updatePercent}%</button>
+              {:else if chat.update.status === "ready"}
+                <button class="btn primary" onclick={() => chat.restartForUpdate()}>
+                  Restart to update
+                </button>
+              {:else}
+                <button
+                  class="btn ghost"
+                  onclick={() => chat.checkForUpdate(true)}
+                  disabled={chat.update.status === "checking"}
+                >
+                  {chat.update.status === "checking" ? "Checking…" : "Check now"}
+                </button>
+              {/if}
+            {:else if chat.update.installKind === "deb" && chat.update.pendingRestart}
+              <button class="btn primary" onclick={() => chat.restartForUpdate()}>
+                Restart to update
+              </button>
+            {/if}
+          </div>
         </div>
       {:else}
         <p class="hint">

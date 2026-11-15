@@ -1,0 +1,15 @@
+#!/bin/sh
+# Enable the daily upgrade timer for this install. Kept quiet: a machine without
+# systemd (containers, chroots) still installs and runs, it just updates by hand.
+set -e
+
+case "$1" in
+  configure)
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable --now rchat-update.timer >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0

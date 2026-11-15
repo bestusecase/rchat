@@ -25,11 +25,25 @@ class ChatStore {
   lastSeq = $state(0);
   windowFocused = $state(true);
   windowVisible = $state(true);
+  update = $state({
+    status: "idle", // idle | checking | current | available | downloading | ready | error
+    current: "",
+    latest: null,
+    notes: null,
+    downloaded: 0,
+    total: null,
+    installKind: null, // appimage | deb | other
+    autoUpdates: false,
+    pendingRestart: false,
+    packageVersion: null,
+    error: null,
+  });
 
   socket = null;
   nextId = 1;
   pending = new Map();
   retryTimer = null;
+  updateTimer = null;
   desktopWired = false;
   activityCount = 0;
   restartGraceUntil = 0;
@@ -94,10 +108,22 @@ class ChatStore {
       }
     });
 
+    listen("update-progress", (data) => {
+      if (this.update.status !== "downloading") return;
+      this.update.downloaded = data?.downloaded ?? 0;
+      this.update.total = data?.total ?? null;
+    });
+
+    listen("update-installed", () => {
+      this.update.pendingRestart = true;
+    });
+
     window.addEventListener("focus", () => this.handleBrowserFocus(true));
     window.addEventListener("blur", () => this.handleBrowserFocus(false));
 
     await this.loadDesktopSettings();
+    await this.loadUpdateState();
+    this.scheduleUpdateCheck();
   }
 
   handleBrowserFocus(focused) {
@@ -112,6 +138,87 @@ class ChatStore {
       this.desktopSettings = await invoke("get_desktop_settings");
     } catch {
       /* the shell may still be attaching */
+    }
+  }
+
+  async loadUpdateState() {
+    if (!this.desktop) return;
+    try {
+      const state = await invoke("update_state");
+      this.update.current = state?.runningVersion ?? "";
+      this.update.installKind = state?.installKind ?? null;
+      this.update.autoUpdates = Boolean(state?.autoUpdates);
+      this.update.pendingRestart = Boolean(state?.pendingRestart);
+      this.update.packageVersion = state?.packageVersion ?? null;
+      if (this.update.pendingRestart) this.update.status = "ready";
+    } catch {
+      /* older shell or the command is unavailable */
+    }
+  }
+
+  scheduleUpdateCheck() {
+    if (!this.desktop || this.updateTimer) return;
+    const tick = () => {
+      // Deb installs are updated by their apt timer, never by the app.
+      if (this.update.installKind === "appimage") this.checkForUpdate(false);
+    };
+    setTimeout(tick, 8000);
+    this.updateTimer = setInterval(tick, 6 * 60 * 60 * 1000);
+  }
+
+  async checkForUpdate(manual = false) {
+    if (!this.desktop || !this.update.installKind) return;
+    if (this.update.installKind !== "appimage") {
+      if (manual) this.toast("Debian installs update themselves from the rchat apt repository.");
+      return;
+    }
+    if (this.update.status === "checking" || this.update.status === "downloading") return;
+    this.update.status = "checking";
+    this.update.error = null;
+    try {
+      const result = await invoke("check_for_update");
+      if (result?.current) this.update.current = result.current;
+      if (result?.available) {
+        this.update.status = "available";
+        this.update.latest = result.latest;
+        this.update.notes = result.notes;
+      } else {
+        this.update.status = "current";
+        this.update.latest = null;
+        this.update.notes = null;
+        if (manual) this.toast("rchat is up to date.");
+      }
+    } catch (err) {
+      this.update.status = "error";
+      this.update.error = err?.message ?? String(err);
+      // A background check stays silent; a manual one explains itself.
+      if (manual) this.toast("Could not check for updates: " + this.update.error);
+    }
+  }
+
+  async installUpdate() {
+    if (!this.desktop || this.update.status !== "available") return;
+    this.update.status = "downloading";
+    this.update.downloaded = 0;
+    this.update.total = null;
+    try {
+      await invoke("install_update");
+      this.update.status = "ready";
+      this.update.pendingRestart = true;
+      this.toast(`rchat ${this.update.latest} is ready. Restart to finish.`);
+    } catch (err) {
+      this.update.status = "error";
+      this.update.error = err?.message ?? String(err);
+      this.toast("Update failed: " + this.update.error);
+    }
+  }
+
+  async restartForUpdate() {
+    if (!this.desktop) return;
+    try {
+      await invoke("restart_for_update");
+    } catch (err) {
+      this.toast(err?.message ?? String(err));
     }
   }
 

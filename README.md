@@ -101,6 +101,10 @@ What the shell does:
   the window is hidden or unfocused. Nothing happens for the open conversation.
 - **Network.** The settings panel has LAN discovery and one TCP relay. Applying
   them restarts the engine in place.
+- **Updates.** AppImage installs check GitHub releases for a signed manifest and
+  update on request with a restart; Debian installs ship a signed apt source and
+  a daily systemd timer, so they upgrade with the rest of the system. Details in
+  `RELEASING.md`.
 - **First run.** Asks for a display name, then opens the conversation list.
 
 Data lives in `~/.local/share/rchat` and survives uninstalling the app.

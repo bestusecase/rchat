@@ -1,0 +1,45 @@
+#!/bin/sh
+# Upgrade rchat from the project's own signed repository, and nothing else.
+#
+# The systemd timer calls this as root once a day. Every apt invocation is
+# pinned to /etc/apt/sources.list.d/rchat.list so a broken third-party source
+# elsewhere on the machine cannot make this unit fail, and every failure exits
+# 0 so an offline laptop does not collect a red unit every morning.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SOURCE=/etc/apt/sources.list.d/rchat.list
+[ -r "$SOURCE" ] || exit 0
+
+APT_SCOPE="-o Dir::Etc::sourcelist=$SOURCE -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# Refresh only our own index. Retry transient network errors, give up quietly.
+if ! apt-get update $APT_SCOPE -o Acquire::Retries=3; then
+  exit 0
+fi
+
+# apt considers a repository copy of the *same* version an upgrade when the
+# installed package came from a local .deb, which would re-download 84 MB every
+# day. Compare explicitly and stop when there is nothing newer.
+installed=$(dpkg-query -W -f='${Version}' rchat 2>/dev/null || true)
+candidate=$(LC_ALL=C apt-cache policy $APT_SCOPE rchat 2>/dev/null | sed -n 's/^ *Candidate: *//p')
+if [ -z "$installed" ] || [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+  exit 0
+fi
+if [ "$installed" = "$candidate" ]; then
+  exit 0
+fi
+
+# --only-upgrade keeps this from ever installing rchat on a machine where the
+# user removed it but left the repository behind.
+if ! apt-get install -y --only-upgrade $APT_SCOPE \
+      -o Dpkg::Options::=--force-confdef \
+      -o Dpkg::Options::=--force-confold \
+      rchat; then
+  exit 0
+fi
+
+exit 0

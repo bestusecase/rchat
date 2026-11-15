@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# On purge, drop the cached index entries so a later reinstall starts clean.
+if [ "$1" = purge ]; then
+  rm -f /var/lib/apt/lists/*rchat* 2>/dev/null || true
+fi
+
+exit 0

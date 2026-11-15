@@ -15,9 +15,22 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk0MUZENjBCNTI5OEUyMzMKUldRejRwaFNDOVlmbExaUkNPTVE5WTQycUtsVDVaT2lLdWtnSDZJMmI0dVcyM2YxQW0rYU9yY2gK",
+      "endpoints": [
+        "https://github.com/bestusecase/rchat/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
+  },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "deb",
+      "appimage"
+    ],
     "category": "SocialNetworking",
     "shortDescription": "Messaging over Reticulum",
     "longDescription": "rchat is a fast, offline-first messenger for Reticulum. Direct messages, delivery receipts, search and an offline queue, with no central server.",
@@ -35,11 +48,17 @@
     },
     "linux": {
       "deb": {
-        "depends": [
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0",
-          "libayatana-appindicator3-1"
-        ]
+        "depends": [],
+        "files": {
+          "/etc/apt/sources.list.d/rchat.list": "packaging/deb/rchat.list",
+          "/usr/lib/rchat/rchat-update": "packaging/deb/rchat-update",
+          "/usr/lib/systemd/system/rchat-update.service": "packaging/deb/rchat-update.service",
+          "/usr/lib/systemd/system/rchat-update.timer": "packaging/deb/rchat-update.timer",
+          "/usr/share/keyrings/rchat-archive-keyring.gpg": "packaging/deb/rchat-archive-keyring.gpg"
+        },
+        "postInstallScript": "packaging/deb/postinst",
+        "preRemoveScript": "packaging/deb/prerm",
+        "postRemoveScript": "packaging/deb/postrm"
       }
     }
   }

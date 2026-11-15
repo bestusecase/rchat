@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod updates;
 
 use engine::Engine;
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,7 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_window(app);
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_desktop_settings,
             save_network_settings,
@@ -109,6 +111,10 @@ fn main() {
             notify_activity,
             clear_activity,
             restart_engine,
+            updates::check_for_update,
+            updates::install_update,
+            updates::update_state,
+            updates::restart_for_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -541,7 +547,7 @@ fn set_tray_unread(app: &AppHandle, unread: bool) {
     }));
 }
 
-fn set_badge(count: u32) {
+pub(crate) fn set_badge(count: u32) {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP")
         .unwrap_or_default()
         .to_lowercase();

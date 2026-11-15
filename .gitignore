@@ -8,3 +8,4 @@ apps/desktop/src-tauri/runtime/
 apps/desktop/src-tauri/resources/
 *.AppImage
 *.deb
+dist/

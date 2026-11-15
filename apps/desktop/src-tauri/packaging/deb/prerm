@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stop the timer before the unit files disappear.
+set -e
+
+if [ "$1" = remove ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  systemctl disable --now rchat-update.timer >/dev/null 2>&1 || true
+fi
+
+exit 0

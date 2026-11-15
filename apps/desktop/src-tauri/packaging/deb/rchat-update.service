@@ -1,0 +1,12 @@
+[Unit]
+Description=Upgrade rchat from its signed package repository
+Documentation=https://github.com/bestusecase/rchat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/rchat/rchat-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
