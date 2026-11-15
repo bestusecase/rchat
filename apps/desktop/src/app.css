@@ -353,6 +353,16 @@ textarea {
   flex: 1;
 }
 
+.me-button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border-radius: 9px;
+}
+
 .me-name {
   font-size: 13px;
   font-weight: 600;
@@ -1260,4 +1270,183 @@ textarea {
   .rail {
     display: none;
   }
+}
+
+/* ---------- phone ---------- */
+
+/*
+ * `data-pane` is only rendered by the mobile shell: the list and a conversation
+ * share one column, and the conversation covers the list while it is open.
+ * Window insets arrive as native padding on the webview, so anything below the
+ * status bar and navigation handle is already inside the content area.
+ */
+.app.mobile {
+  grid-template-columns: minmax(0, 1fr);
+  padding-bottom: var(--kb-inset, 0px);
+}
+
+.app.mobile .shell-left {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.app.mobile .rail {
+  display: none;
+}
+
+.app.mobile .sidebar {
+  border-right: none;
+}
+
+.app.mobile[data-pane="chat"] .shell-left {
+  display: none;
+}
+
+.app.mobile .sidebar-head {
+  padding: 18px 16px 12px;
+}
+
+.app.mobile .sidebar-scroll {
+  padding: 8px 10px;
+}
+
+.app.mobile .conversation {
+  min-height: 64px;
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.app.mobile .conversation-name {
+  font-size: 15px;
+}
+
+.app.mobile .conversation-preview {
+  font-size: 12.5px;
+}
+
+.app.mobile .sidebar-foot {
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.app.mobile .me-button {
+  min-height: 44px;
+  padding: 2px 4px;
+}
+
+.app.mobile .icon-button {
+  width: 44px;
+  height: 44px;
+  border-radius: 11px;
+}
+
+.app.mobile .link-button {
+  padding: 10px 0;
+  text-align: left;
+}
+
+.app.mobile .chat-head {
+  height: 60px;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.app.mobile .back-button {
+  flex: none;
+}
+
+.app.mobile .chat-title-block {
+  flex: 1;
+  min-width: 0;
+  padding-left: 2px;
+}
+
+/* Voice and search are desktop placeholders; they only crowd a phone header. */
+.app.mobile .chat-actions .icon-button {
+  display: none;
+}
+
+.app.mobile .transport-pill {
+  margin-right: 0;
+  font-size: 11px;
+}
+
+.app.mobile .messages {
+  padding: 10px 0 4px;
+}
+
+.app.mobile .day-separator {
+  padding: 10px 14px;
+}
+
+.app.mobile .message {
+  gap: 10px;
+  padding: 3px 12px;
+}
+
+.app.mobile .message-time-hover {
+  width: 34px;
+}
+
+.app.mobile .composer {
+  margin: 0 8px;
+  padding: 4px 6px;
+  border-radius: 14px;
+}
+
+.app.mobile .composer textarea {
+  max-height: 132px;
+  padding: 8px 4px;
+  font-size: 16px;
+}
+
+.app.mobile .composer-add,
+.app.mobile .composer-send {
+  width: 44px;
+  height: 44px;
+  border-radius: 11px;
+}
+
+.app.mobile .composer-hint {
+  display: none;
+}
+
+.mobile .connect {
+  gap: 14px;
+  padding: 16px;
+}
+
+.mobile .overlay {
+  padding: 14px 14px calc(14px + var(--kb-inset, 0px));
+}
+
+.mobile .dialog {
+  max-width: none;
+  max-height: calc(100dvh - 28px - var(--kb-inset, 0px));
+  overflow-y: auto;
+  border-radius: 18px;
+}
+
+.mobile .toasts {
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  max-width: none;
+}
+
+.mobile .btn {
+  min-height: 44px;
+  padding: 11px 18px;
+}
+
+.mobile .field {
+  min-height: 44px;
+  font-size: 16px;
+}
+
+.mobile .toggle-row {
+  min-height: 44px;
+}
+
+.mobile .link-button {
+  padding: 10px 0;
 }

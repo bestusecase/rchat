@@ -4,7 +4,7 @@
   let showHelp = $state(false);
 </script>
 
-{#if chat.desktop}
+{#if chat.shell || !chat.booted}
   <div class="connect">
     <div class="connect-card boot-card">
       <div class="connect-brand"><span class="brand-mark big">r</span></div>

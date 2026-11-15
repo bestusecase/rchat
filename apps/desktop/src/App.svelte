@@ -25,13 +25,62 @@
       : 0,
   );
 
+  // Android back is delivered to the WebView as history navigation. Each pane
+  // or dialog that can be dismissed pushes one sentinel entry; popping it
+  // closes that layer instead of leaving the app.
+  let guardDepth = 0;
+  let ignorePops = 0;
+
+  function pushGuard() {
+    if (!chat.mobile) return;
+    history.pushState({ rchat: true }, "");
+    guardDepth += 1;
+  }
+
+  function releaseGuard() {
+    if (!chat.mobile || guardDepth === 0) return;
+    guardDepth -= 1;
+    ignorePops += 1;
+    history.back();
+  }
+
+  function handlePopState() {
+    if (!chat.mobile) return;
+    if (ignorePops > 0) {
+      ignorePops -= 1;
+      return;
+    }
+    if (guardDepth > 0) guardDepth -= 1;
+    if (dialog) {
+      dialog = null;
+      dialogError = "";
+      return;
+    }
+    if (chat.activeId) chat.backToList();
+  }
+
+  function dismissDialog() {
+    dialog = null;
+    releaseGuard();
+  }
+
+  function backFromConversation() {
+    chat.backToList();
+    releaseGuard();
+  }
+
   onMount(() => {
-    chat.initDesktop();
-    if (!chat.desktop || chat.token) chat.connect();
+    window.addEventListener("popstate", handlePopState);
+    void chat.bootShell().then(() => {
+      if (chat.token) chat.connect();
+    });
+    return () => window.removeEventListener("popstate", handlePopState);
   });
 
   $effect(() => {
-    if (!chat.desktop && chat.status === "idle" && chat.token) chat.connect();
+    if (chat.booted && !chat.desktop && chat.status === "idle" && chat.token) {
+      chat.connect();
+    }
   });
 
   function openPeer() {
@@ -39,6 +88,7 @@
     peerAddress = "";
     peerName = "";
     dialogError = "";
+    pushGuard();
   }
 
   function openProfile() {
@@ -46,6 +96,7 @@
     nameDraft = chat.identity?.display_name ?? "";
     dialogError = "";
     copied = false;
+    pushGuard();
   }
 
   function openSettings() {
@@ -56,11 +107,12 @@
     autostartDraft = settings?.autostart ?? false;
     dialogError = "";
     dialog = "settings";
+    pushGuard();
   }
 
   function close() {
     if (busy || chat.needsName) return;
-    dialog = null;
+    if (dialog) dismissDialog();
   }
 
   function handleKey(event) {
@@ -78,7 +130,7 @@
     busy = true;
     try {
       await chat.addPeer(address, peerName);
-      dialog = null;
+      dismissDialog();
     } catch (err) {
       dialogError = err.message;
     } finally {
@@ -95,7 +147,7 @@
     busy = true;
     try {
       await chat.setDisplayName(nameDraft.trim());
-      dialog = null;
+      dismissDialog();
     } catch (err) {
       dialogError = err.message;
     } finally {
@@ -108,7 +160,7 @@
     busy = true;
     try {
       await chat.saveNetwork(autoDiscovery, relayDraft.trim());
-      dialog = null;
+      dismissDialog();
     } catch (err) {
       dialogError = err?.message ?? String(err);
     } finally {
@@ -150,12 +202,21 @@
 {#if chat.status !== "connected"}
   <Connect />
 {:else}
-  <div class="app">
-    <Sidebar onAddPeer={openPeer} onProfile={openProfile} onSettings={openSettings} />
+  <div
+    class="app"
+    class:mobile={chat.mobile}
+    data-pane={chat.activeId ? "chat" : "list"}
+  >
+    <Sidebar
+      onAddPeer={openPeer}
+      onProfile={openProfile}
+      onSettings={openSettings}
+      onSelect={pushGuard}
+    />
 
     {#if chat.activeConversation}
-      <Chat />
-    {:else}
+      <Chat onBack={backFromConversation} />
+    {:else if !chat.mobile}
       <section class="chat placeholder">
         <div class="chat-empty-mark"><Icon name="wave" size={30} /></div>
         <h2>Pick up where you left off</h2>
@@ -167,7 +228,9 @@
       </section>
     {/if}
 
-    <Members />
+    {#if !chat.mobile}
+      <Members />
+    {/if}
   </div>
 {/if}
 
@@ -448,6 +511,29 @@
               </button>
             {/if}
           </div>
+        </div>
+      {:else if chat.mobile}
+        <div class="settings-section">
+          <div class="settings-title">Notifications</div>
+          <button
+            class="toggle-row"
+            type="button"
+            aria-pressed={mutedDraft}
+            onclick={toggleMute}
+          >
+            <span class="toggle-text">
+              <strong>Mute notifications</strong>
+              <small>Unread messages still appear in the list; nothing is announced.</small>
+            </span>
+            <span class="switch" data-on={mutedDraft}></span>
+          </button>
+          <button class="btn ghost" onclick={() => chat.openBackgroundSettings()}>
+            Battery and background settings
+          </button>
+          <p class="hint">
+            Android can pause the mesh to save power. Allow rchat to run in the
+            background so messages arrive while the screen is off.
+          </p>
         </div>
       {:else}
         <p class="hint">

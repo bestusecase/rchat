@@ -4,6 +4,7 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
+  let { onBack = null } = $props();
   let viewport = $state();
   let input = $state();
   let draft = $state("");
@@ -35,8 +36,10 @@
   $effect(() => {
     const id = chat.activeId;
     const count = chat.activeMessages.length;
+    const inset = chat.keyboardInset;
     if (!viewport || !id) return;
     void count;
+    void inset;
     requestAnimationFrame(() => {
       viewport.scrollTop = viewport.scrollHeight;
     });
@@ -103,6 +106,16 @@
 
 <section class="chat">
   <header class="chat-head">
+    {#if chat.mobile && onBack}
+      <button
+        class="icon-button back-button"
+        title="Back to conversations"
+        aria-label="Back to conversations"
+        onclick={onBack}
+      >
+        <Icon name="back" size={22} />
+      </button>
+    {/if}
     <div class="chat-title-block">
       <h1>{chat.conversationTitle(conversation)}</h1>
       <span class="chat-sub">

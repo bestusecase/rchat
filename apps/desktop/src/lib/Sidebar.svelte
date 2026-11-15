@@ -4,7 +4,7 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
-  let { onAddPeer, onProfile, onSettings } = $props();
+  let { onAddPeer, onProfile, onSettings, onSelect } = $props();
 </script>
 
 <div class="shell-left">
@@ -64,7 +64,10 @@
             <button
               class="conversation"
               class:active={conversation.id === chat.activeId}
-              onclick={() => chat.select(conversation.id)}
+              onclick={() => {
+                chat.select(conversation.id);
+                onSelect?.();
+              }}
             >
               <Avatar
                 id={conversation.peer_ids?.[0] ?? conversation.id}
@@ -87,16 +90,18 @@
     </div>
 
     <footer class="sidebar-foot">
-      <Avatar
-        id={chat.identity?.id}
-        label={chat.identity?.display_name || "you"}
-        size={34}
-        status={chat.transport === "ready" ? "online" : "offline"}
-      />
-      <div class="me-text">
-        <span class="me-name">{chat.identity?.display_name || "you"}</span>
-        <span class="me-address">{shortAddress(chat.identity?.address)}</span>
-      </div>
+      <button class="me-button" title="Your profile" onclick={onProfile}>
+        <Avatar
+          id={chat.identity?.id}
+          label={chat.identity?.display_name || "you"}
+          size={34}
+          status={chat.transport === "ready" ? "online" : "offline"}
+        />
+        <div class="me-text">
+          <span class="me-name">{chat.identity?.display_name || "you"}</span>
+          <span class="me-address">{shortAddress(chat.identity?.address)}</span>
+        </div>
+      </button>
       <button class="icon-button" title="Settings and network" onclick={onSettings}>
         <Icon name="gear" size={18} />
       </button>

@@ -1,5 +1,5 @@
 import { transportLabel } from "./util.js";
-import { boot, isDesktop, invoke, listen } from "./desktop.js";
+import { boot, hasTauri, isDesktop, invoke, listen, loadBoot } from "./desktop.js";
 
 const BASE_KEY = "rchat.base";
 const TOKEN_KEY = "rchat.token";
@@ -7,6 +7,10 @@ const TOKEN_KEY = "rchat.token";
 class ChatStore {
   status = $state(boot ? "starting" : "idle"); // idle | starting | connecting | connected | error
   error = $state(null);
+  // web | desktop | mobile. `desktop` stays a plain boolean: it gates features
+  // that only exist in the desktop shell, while `shell` means "native host".
+  platform = $state(isDesktop ? "desktop" : "web");
+  booted = $state(!hasTauri || isDesktop);
   desktop = isDesktop;
   desktopError = $state(boot?.error ?? null);
   desktopSettings = $state(null);
@@ -25,6 +29,7 @@ class ChatStore {
   lastSeq = $state(0);
   windowFocused = $state(true);
   windowVisible = $state(true);
+  keyboardInset = $state(0);
   update = $state({
     status: "idle", // idle | checking | current | available | downloading | ready | error
     current: "",
@@ -45,8 +50,17 @@ class ChatStore {
   retryTimer = null;
   updateTimer = null;
   desktopWired = false;
-  activityCount = 0;
+  mobileWired = false;
+  bootWired = false;
   restartGraceUntil = 0;
+
+  get shell() {
+    return this.platform !== "web";
+  }
+
+  get mobile() {
+    return this.platform === "mobile";
+  }
 
   get transportLabel() {
     return transportLabel(this.transport);
@@ -69,11 +83,55 @@ class ChatStore {
 
   get needsName() {
     return Boolean(
-      this.desktop &&
+      this.shell &&
         this.status === "connected" &&
         this.identity &&
         !this.identity.display_name_set,
     );
+  }
+
+  /// Resolve the shell this page is running in and wire its native hooks.
+  ///
+  /// Desktop answers synchronously (its boot blob is injected); mobile has to
+  /// await the `boot` command because a foreground service owns the engine.
+  /// Idempotent: `onMount` may run again after a webview reload.
+  async bootShell() {
+    if (this.bootWired) return;
+    this.bootWired = true;
+
+    if (this.desktop) {
+      await this.initDesktop();
+      this.booted = true;
+      return;
+    }
+
+    if (!hasTauri) {
+      this.booted = true;
+      return;
+    }
+
+    let info = null;
+    try {
+      info = await loadBoot();
+    } catch {
+      /* the command is missing or the shell refused to answer */
+    }
+
+    if (info?.role === "mobile") {
+      this.platform = "mobile";
+      this.initMobile();
+      this.applyBoot(info);
+      this.status = "starting";
+      if (info.error) this.desktopError = info.error;
+      else await this.loadDesktopSettings();
+    }
+    this.booted = true;
+  }
+
+  applyBoot(info) {
+    if (info?.base) this.base = info.base;
+    if (info?.token) this.token = info.token;
+    if (info?.error) this.desktopError = info.error;
   }
 
   async initDesktop() {
@@ -132,8 +190,69 @@ class ChatStore {
     if (focused) this.clearActivity();
   }
 
+  /// Mobile visibility, keyboard and wake-up wiring.
+  ///
+  /// Android has no window-state event: the WebView reports pause/resume
+  /// through `visibilitychange` and focus/blur. The soft keyboard shrinks the
+  /// visual viewport, so its height feeds a CSS variable the composer uses to
+  /// stay above it.
+  initMobile() {
+    if (this.mobileWired) return;
+    this.mobileWired = true;
+    document.documentElement.classList.add("mobile");
+
+    const syncVisibility = () => {
+      const hidden = document.visibilityState === "hidden";
+      this.windowVisible = !hidden;
+      if (hidden) {
+        this.windowFocused = false;
+        if (this.unreadTotal > 0) this.notifyActivity(this.unreadTotal, false);
+        return;
+      }
+      this.windowFocused = document.hasFocus();
+      this.clearActivity();
+      if (this.activeId) {
+        this.call({
+          cmd: "mark_read",
+          conversation_id: this.activeId,
+        }).catch(() => {});
+      }
+    };
+
+    document.addEventListener("visibilitychange", syncVisibility);
+    window.addEventListener("focus", () => {
+      this.windowFocused = true;
+      this.windowVisible = document.visibilityState !== "hidden";
+      this.clearActivity();
+    });
+    window.addEventListener("blur", () => {
+      this.windowFocused = false;
+    });
+
+    const viewport = window.visualViewport;
+    if (viewport) {
+      const syncKeyboard = () => {
+        // With `interactive-widget=resizes-content` the layout viewport already
+        // shrinks and this is zero; older WebViews only shrink the visual one.
+        const inset = Math.round(
+          window.innerHeight - viewport.height - viewport.offsetTop,
+        );
+        this.keyboardInset = inset > 40 ? inset : 0;
+        document.documentElement.style.setProperty(
+          "--kb-inset",
+          this.keyboardInset + "px",
+        );
+      };
+      viewport.addEventListener("resize", syncKeyboard);
+      viewport.addEventListener("scroll", syncKeyboard);
+      syncKeyboard();
+    }
+
+    syncVisibility();
+  }
+
   async loadDesktopSettings() {
-    if (!this.desktop) return;
+    if (!this.shell) return;
     try {
       this.desktopSettings = await invoke("get_desktop_settings");
     } catch {
@@ -229,7 +348,7 @@ class ChatStore {
       this.retryTimer = null;
     }
     if (!this.base || !this.token) {
-      if (this.desktop) {
+      if (this.shell) {
         this.status = "starting";
         this.desktopError =
           this.desktopError ?? "The local engine is not ready yet.";
@@ -283,12 +402,11 @@ class ChatStore {
     socket.onclose = () => {
       if (this.socket !== socket) return;
       this.socket = null;
-      if (this.status === "connected" || this.desktop) {
+      if (this.status === "connected" || this.shell) {
         // The engine restarted or went away. Reconnect: the address is stable
-        // across restarts, and the desktop shell may still be starting one.
-        this.status = this.desktop ? "starting" : "idle";
-        if (!this.desktop) this.desktopError = this.desktopError;
-        this.scheduleReconnect(this.desktop ? 900 : 1200);
+        // across restarts, and the shell may still be starting one.
+        this.status = this.shell ? "starting" : "idle";
+        this.scheduleReconnect(this.shell ? 900 : 1200);
       }
     };
 
@@ -306,8 +424,10 @@ class ChatStore {
       this.peers = snapshot.peers;
       const first = snapshot.conversations[0];
       if (this.activeId) await this.loadMessages(this.activeId);
-      else if (first) await this.select(first.id);
-      if (this.desktop) await this.loadDesktopSettings();
+      // A phone opens on the conversation list, not on whichever thread
+      // happens to be newest.
+      else if (first && !this.mobile) await this.select(first.id);
+      if (this.shell) await this.loadDesktopSettings();
     } catch (err) {
       this.toast(err.message);
     }
@@ -322,6 +442,27 @@ class ChatStore {
   }
 
   async retryEngine() {
+    if (this.mobile) {
+      // The engine belongs to a foreground service on Android; asking it again
+      // is enough. `boot` waits for the service endpoint to appear.
+      this.desktopError = null;
+      this.status = "starting";
+      try {
+        const info = await loadBoot();
+        this.applyBoot(info);
+        if (!info?.base || !info?.token) {
+          this.desktopError = info?.error ?? "The local engine is not ready yet.";
+          return false;
+        }
+        this.disconnect();
+        this.status = "starting";
+        this.scheduleReconnect(250);
+        return true;
+      } catch (err) {
+        this.desktopError = err?.message ?? String(err);
+        return false;
+      }
+    }
     if (!this.desktop) return false;
     this.desktopError = null;
     this.restartGraceUntil = Date.now() + 15000;
@@ -362,9 +503,14 @@ class ChatStore {
   }
 
   async setMuted(muted) {
-    if (!this.desktop) return;
+    if (!this.shell) return;
     await invoke("set_muted", { muted });
     if (this.desktopSettings) this.desktopSettings.muted = muted;
+  }
+
+  async openBackgroundSettings() {
+    if (!this.mobile) return;
+    await invoke("open_background_settings");
   }
 
   async setAutostart(enabled) {
@@ -374,17 +520,17 @@ class ChatStore {
   }
 
   notifyActivity(count, chime) {
-    this.activityCount = count;
+    // The phone cannot post from here: a backgrounded webview is suspended, so
+    // its JavaScript never sees the event at all. The engine raises message
+    // notifications from Rust instead, and only the desktop shell needs this.
     if (!this.desktop) return;
     invoke("notify_activity", { count, chime }).catch(() => {});
   }
 
   clearActivity() {
-    if (this.activityCount === 0) {
-      if (!this.desktop) return;
-    }
-    this.activityCount = 0;
-    if (!this.desktop) return;
+    if (!this.shell) return;
+    // Unconditional on mobile: the notification was posted by the shell, so
+    // this page has no reliable counter to skip the call with.
     invoke("clear_activity").catch(() => {});
   }
 
@@ -397,7 +543,7 @@ class ChatStore {
       /* already closed */
     }
     this.socket = null;
-    if (this.desktop) {
+    if (this.shell) {
       // A shell-started engine may still be coming up. Keep trying instead of
       // parking the user on an error screen.
       this.status = "starting";
@@ -482,7 +628,7 @@ class ChatStore {
       }
       case "conversation.updated": {
         this.upsertConversation(data.conversation);
-        if (this.desktop && (!this.windowFocused || !this.windowVisible)) {
+        if (this.shell && (!this.windowFocused || !this.windowVisible)) {
           if (this.unreadTotal > 0) {
             this.notifyActivity(this.unreadTotal, false);
           }
@@ -586,9 +732,16 @@ class ChatStore {
       await this.loadMessages(conversationId);
     }
     this.call({ cmd: "mark_read", conversation_id: conversationId }).catch(() => {});
-    if (this.desktop && this.windowFocused && this.windowVisible) {
+    if (this.shell && this.windowFocused && this.windowVisible) {
       this.clearActivity();
     }
+  }
+
+  /// Leave the conversation for the list. Only the phone has a list pane to
+  /// return to; the desktop keeps the conversation selected.
+  backToList() {
+    if (!this.mobile) return;
+    this.activeId = null;
   }
 
   async loadMessages(conversationId) {
