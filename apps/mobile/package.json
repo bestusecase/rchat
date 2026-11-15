@@ -1,0 +1,10 @@
+{
+  "name": "rchat-mobile",
+  "private": true,
+  "version": "0.1.3",
+  "type": "module",
+  "scripts": {
+    "build": "npm --prefix ../desktop run build",
+    "tauri": "tauri"
+  }
+}
