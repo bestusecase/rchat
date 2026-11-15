@@ -60,6 +60,7 @@ impl AppState {
         Ok(IdentityInfo {
             id: row.id,
             display_name: row.display_name,
+            display_name_set: self.store.display_name_set()?,
             address: row.address,
         })
     }

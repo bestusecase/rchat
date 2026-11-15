@@ -36,9 +36,17 @@ available through the same stack.
 
 ## Requirements
 
+For the packaged desktop app: Linux x86_64, a desktop with a system tray, and
+WebKitGTK 4.1. Python, Reticulum and LXMF are bundled, so nothing else is
+needed.
+
+For development:
+
 - Rust 1.80+
 - Python 3.10+ with Reticulum and LXMF: `pip install rns lxmf`
 - Node 20+ for the interface
+- Tauri 2 tooling: `cargo install tauri-cli --version "^2" --locked`, plus the
+  usual WebKitGTK/GTK build dependencies
 
 ## Run it
 
@@ -61,6 +69,49 @@ npm run dev
 
 Open <http://127.0.0.1:5173>, paste the token, connect. Your address is in the
 profile dialog (bottom-left avatar).
+
+## Desktop app
+
+The packaged app is a thin Tauri shell around the same interface and engine. It
+starts a private engine on a free loopback port, injects the address and token,
+and opens straight into chat — there is no connect screen and no token to paste.
+A second launch focuses the existing window.
+
+```bash
+cd apps/desktop
+npm install
+cargo tauri build
+```
+
+Output:
+
+- `apps/desktop/src-tauri/target/release/bundle/appimage/rchat_0.1.0_amd64.AppImage`
+- `apps/desktop/src-tauri/target/release/bundle/deb/rchat_0.1.0_amd64.deb`
+
+What the shell does:
+
+- **Engine lifecycle.** One engine per data directory. It reuses a healthy
+  running engine, otherwise starts the bundled `rchatd` on a free port. Quit
+  stops the engine and its Python bridge cleanly.
+- **Tray.** Closing the window hides it; the tray stays resident. Left-click
+  toggles the window; the menu has Open, Mute sounds, Start at login, Quit.
+- **Notifications.** No banners and no message previews. A message in a
+  conversation that is not on screen plays one coalesced chime. A tray dot and
+  launcher badge (or a Cinnamon taskbar needs-attention hint) appear only while
+  the window is hidden or unfocused. Nothing happens for the open conversation.
+- **Network.** The settings panel has LAN discovery and one TCP relay. Applying
+  them restarts the engine in place.
+- **First run.** Asks for a display name, then opens the conversation list.
+
+Data lives in `~/.local/share/rchat` and survives uninstalling the app.
+Start-at-login is opt-in and off by default.
+
+The shell bundles a private Python 3.12 interpreter plus RNS 1.6 and LXMF 1.3,
+so it never touches the system Python. Staging happens automatically in
+`apps/desktop/scripts/prepare-bundle.mjs` before every desktop build.
+
+Platform scope for this milestone: Linux x86_64. Windows, macOS and Flatpak are
+not packaged yet.
 
 ## Talk to yourself over a real Reticulum link
 
@@ -132,6 +183,7 @@ crates/rchat-rns/   sidecar supervisor and event parsing
 crates/rchatd/      daemon: HTTP/WebSocket API, routing, delivery policy
 sidecar/bridge.py   Reticulum + LXMF bridge
 apps/desktop/       Svelte 5 interface
+apps/desktop/src-tauri/  Tauri shell: window, tray, engine supervisor, packaging
 scripts/            smoke tests and the two-peer dev runner
 ```
 

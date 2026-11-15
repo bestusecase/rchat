@@ -1,4 +1,5 @@
 <script>
+  import { onMount } from "svelte";
   import { chat } from "./lib/store.svelte.js";
   import { shortAddress } from "./lib/util.js";
   import Connect from "./lib/Connect.svelte";
@@ -14,9 +15,18 @@
   let dialogError = $state("");
   let busy = $state(false);
   let copied = $state(false);
+  let autoDiscovery = $state(true);
+  let relayDraft = $state("");
+  let mutedDraft = $state(false);
+  let autostartDraft = $state(false);
+
+  onMount(() => {
+    chat.initDesktop();
+    if (!chat.desktop || chat.token) chat.connect();
+  });
 
   $effect(() => {
-    if (chat.status === "idle" && chat.token) chat.connect();
+    if (!chat.desktop && chat.status === "idle" && chat.token) chat.connect();
   });
 
   function openPeer() {
@@ -33,11 +43,23 @@
     copied = false;
   }
 
+  function openSettings() {
+    const settings = chat.desktopSettings;
+    autoDiscovery = settings?.autoDiscovery ?? true;
+    relayDraft = settings?.tcpRelay ?? "";
+    mutedDraft = settings?.muted ?? false;
+    autostartDraft = settings?.autostart ?? false;
+    dialogError = "";
+    dialog = "settings";
+  }
+
   function close() {
-    if (!busy) dialog = null;
+    if (busy || chat.needsName) return;
+    dialog = null;
   }
 
   function handleKey(event) {
+    if (chat.needsName) return;
     if (event.key === "Escape") close();
   }
 
@@ -76,6 +98,37 @@
     }
   }
 
+  async function applyNetwork() {
+    dialogError = "";
+    busy = true;
+    try {
+      await chat.saveNetwork(autoDiscovery, relayDraft.trim());
+      dialog = null;
+    } catch (err) {
+      dialogError = err?.message ?? String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleMute() {
+    mutedDraft = !mutedDraft;
+    try {
+      await chat.setMuted(mutedDraft);
+    } catch (err) {
+      dialogError = err?.message ?? String(err);
+    }
+  }
+
+  async function toggleAutostart() {
+    autostartDraft = !autostartDraft;
+    try {
+      await chat.setAutostart(autostartDraft);
+    } catch (err) {
+      dialogError = err?.message ?? String(err);
+    }
+  }
+
   async function copyAddress() {
     try {
       await navigator.clipboard.writeText(chat.identity?.address ?? "");
@@ -93,7 +146,7 @@
   <Connect />
 {:else}
   <div class="app">
-    <Sidebar onAddPeer={openPeer} onProfile={openProfile} />
+    <Sidebar onAddPeer={openPeer} onProfile={openProfile} onSettings={openSettings} />
 
     {#if chat.activeConversation}
       <Chat />
@@ -201,6 +254,130 @@
         <button class="btn primary" onclick={saveName} disabled={busy}>
           {busy ? "Saving…" : "Save"}
         </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if chat.needsName}
+  <div class="overlay">
+    <div
+      class="dialog first-run"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      onkeydown={(event) => event.stopPropagation()}
+    >
+      <div class="first-run-mark"><span class="brand-mark big">r</span></div>
+      <h2>What should people call you?</h2>
+      <p class="hint">
+        This is the name peers see when you announce. You can change it later in
+        your profile.
+      </p>
+      <input
+        class="field"
+        bind:value={nameDraft}
+        placeholder="Your name"
+        onkeydown={(event) => {
+          if (event.key === "Enter") saveName();
+        }}
+      />
+      {#if dialogError}<p class="form-error">{dialogError}</p>{/if}
+      <button class="btn primary wide" onclick={saveName} disabled={busy}>
+        {busy ? "Saving…" : "Start chatting"}
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if dialog === "settings"}
+  <div
+    class="overlay"
+    role="presentation"
+    onclick={close}
+    onkeydown={(event) => event.key === "Escape" && close()}
+  >
+    <div
+      class="dialog settings-dialog"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => event.stopPropagation()}
+    >
+      <h2>Settings</h2>
+
+      {#if chat.desktop}
+        <div class="settings-section">
+          <div class="settings-title">Network</div>
+          <button
+            class="toggle-row"
+            type="button"
+            aria-pressed={autoDiscovery}
+            onclick={() => (autoDiscovery = !autoDiscovery)}
+          >
+            <span class="toggle-text">
+              <strong>Find peers on this network</strong>
+              <small>Uses Reticulum's local discovery. Turn off to stay isolated.</small>
+            </span>
+            <span class="switch" data-on={autoDiscovery}></span>
+          </button>
+          <label class="field-label">
+            TCP relay
+            <input
+              class="field mono"
+              bind:value={relayDraft}
+              placeholder="relay.example:4242"
+              spellcheck="false"
+            />
+          </label>
+          <p class="hint">
+            Leave empty to stay on your local network. Applying these settings
+            restarts the engine for a moment.
+          </p>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-title">Desktop</div>
+          <button
+            class="toggle-row"
+            type="button"
+            aria-pressed={mutedDraft}
+            onclick={toggleMute}
+          >
+            <span class="toggle-text">
+              <strong>Mute sounds</strong>
+              <small>Unread dots and the taskbar hint still work.</small>
+            </span>
+            <span class="switch" data-on={mutedDraft}></span>
+          </button>
+          <button
+            class="toggle-row"
+            type="button"
+            aria-pressed={autostartDraft}
+            onclick={toggleAutostart}
+          >
+            <span class="toggle-text">
+              <strong>Start at login</strong>
+              <small>Launch rchat in the tray when you sign in.</small>
+            </span>
+            <span class="switch" data-on={autostartDraft}></span>
+          </button>
+        </div>
+      {:else}
+        <p class="hint">
+          Network and desktop options are available in the rchat desktop app.
+        </p>
+      {/if}
+
+      {#if dialogError}<p class="form-error">{dialogError}</p>{/if}
+      <div class="dialog-actions">
+        <button class="btn ghost" onclick={close} disabled={busy}>Cancel</button>
+        {#if chat.desktop}
+          <button class="btn primary" onclick={applyNetwork} disabled={busy}>
+            {busy ? "Restarting…" : "Apply"}
+          </button>
+        {/if}
       </div>
     </div>
   </div>

@@ -1,12 +1,15 @@
 mod app;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rchat_core::store::Store;
 use rchat_ipc::TransportState;
 use rchat_rns::BridgeEvent;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -25,6 +28,10 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     restrict_permissions(&data_dir);
+
+    // One engine per data directory. A lock left behind by a crashed engine is
+    // reclaimed once its pid is gone, so a user never has to clean up by hand.
+    let _engine_lock = EngineLock::acquire(&data_dir)?;
 
     let store = Arc::new(Store::open(&data_dir.join("rchat.db"))?);
     let identity = store.ensure_identity()?;
@@ -81,8 +88,11 @@ async fn main() -> Result<()> {
         "version": app::VERSION,
     });
     let endpoint_path = data_dir.join("endpoint.json");
-    std::fs::write(&endpoint_path, serde_json::to_vec_pretty(&endpoint)?)?;
-    restrict_file(&endpoint_path);
+    let endpoint_bytes = serde_json::to_vec_pretty(&endpoint)?;
+    let tmp_endpoint = data_dir.join("endpoint.json.tmp");
+    std::fs::write(&tmp_endpoint, &endpoint_bytes)?;
+    restrict_file(&tmp_endpoint);
+    std::fs::rename(&tmp_endpoint, &endpoint_path)?;
 
     println!();
     println!("  rchatd {}", app::VERSION);
@@ -95,15 +105,79 @@ async fn main() -> Result<()> {
     println!();
 
     axum::serve(listener, app::router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(options.supervised))
         .await?;
+
+    // A stale endpoint would make the next launch try a dead address.
+    let _ = std::fs::remove_file(&endpoint_path);
     Ok(())
+}
+
+/// Exclusive per-data-directory engine lock. Contains the owning pid so a lock
+/// left by a crash can be recognised and replaced.
+struct EngineLock {
+    path: PathBuf,
+}
+
+impl EngineLock {
+    fn acquire(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join("engine.lock");
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "{}", std::process::id());
+                    restrict_file(&path);
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let pid = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|text| text.trim().parse::<i32>().ok());
+                    match pid {
+                        Some(pid) if process_alive(pid) => bail!(
+                            "another rchatd is already using {} (pid {pid})",
+                            data_dir.display()
+                        ),
+                        _ => {
+                            // Stale lock from a crash or a pid that is gone.
+                            let _ = std::fs::remove_file(&path);
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+        bail!("could not lock {}", path.display());
+    }
+}
+
+impl Drop for EngineLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        return PathBuf::from(format!("/proc/{pid}")).exists();
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 struct Options {
     data_dir: PathBuf,
     port: u16,
     no_rns: bool,
+    supervised: bool,
 }
 
 impl Options {
@@ -114,6 +188,7 @@ impl Options {
             .and_then(|p| p.parse().ok())
             .unwrap_or(8787u16);
         let mut no_rns = false;
+        let mut supervised = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -132,8 +207,13 @@ impl Options {
                         .context("--port must be a number")?;
                 }
                 "--no-rns" => no_rns = true,
+                // The desktop shell holds our stdin open. EOF means the shell
+                // exited, including when it was killed, so shut down cleanly.
+                "--supervised" => supervised = true,
                 "-h" | "--help" => {
-                    println!("rchatd [--data-dir PATH] [--port PORT] [--no-rns]");
+                    println!(
+                        "rchatd [--data-dir PATH] [--port PORT] [--no-rns] [--supervised]"
+                    );
                     std::process::exit(0);
                 }
                 other => warn!(arg = other, "ignoring unknown argument"),
@@ -143,6 +223,7 @@ impl Options {
             data_dir,
             port,
             no_rns,
+            supervised,
         })
     }
 }
@@ -159,12 +240,19 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn resolve_token(data_dir: &Path) -> Result<String> {
+    let path = data_dir.join("token");
     if let Ok(token) = std::env::var("RCHAT_TOKEN") {
-        if !token.trim().is_empty() {
-            return Ok(token.trim().to_string());
+        let token = token.trim().to_string();
+        if token.len() >= 16 {
+            // Persist a token supplied by the desktop shell so a later direct
+            // launch reuses the same secret.
+            if std::fs::read_to_string(&path).ok().as_deref().map(str::trim) != Some(&token) {
+                std::fs::write(&path, &token)?;
+                restrict_file(&path);
+            }
+            return Ok(token);
         }
     }
-    let path = data_dir.join("token");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let trimmed = existing.trim();
         if trimmed.len() >= 16 {
@@ -246,7 +334,42 @@ fn restrict_file(path: &Path) {
     }
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal(supervised: bool) {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let parent_closed = async {
+        if !supervised {
+            std::future::pending::<()>().await;
+            return;
+        }
+        // rchatd is launched with a piped stdin. Reading to EOF tells us the
+        // desktop shell is gone even if it never got to send a signal.
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 256];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+        _ = parent_closed => {}
+    }
     info!("shutting down");
 }

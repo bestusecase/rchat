@@ -61,6 +61,10 @@ pub struct IdentityInfo {
     /// Stable local id (hex). Not the Reticulum address.
     pub id: String,
     pub display_name: String,
+    /// True once the user has chosen a name. The desktop shell uses this to
+    /// show a first-run prompt instead of the placeholder name.
+    #[serde(default)]
+    pub display_name_set: bool,
     /// LXMF delivery address once Reticulum is ready.
     pub address: Option<String>,
 }

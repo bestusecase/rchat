@@ -197,7 +197,25 @@ impl Store {
     pub fn set_display_name(&self, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("UPDATE identity SET display_name = ?1 WHERE slot = 'me'", [name])?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('display_name_set', '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )?;
         Ok(())
+    }
+
+    /// Whether the user has explicitly chosen a display name. Kept in `meta`
+    /// rather than inferred from the name so a user who picks "you" is not
+    /// asked again.
+    pub fn display_name_set(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let value: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'display_name_set'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(value.as_deref() == Some("1"))
     }
 
     pub fn set_address(&self, address: Option<&str>) -> Result<()> {
@@ -625,6 +643,16 @@ mod tests {
         let b = store.ensure_identity().unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(store.list_peers().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn display_name_flag_only_set_when_chosen() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        assert!(!store.display_name_set().unwrap());
+        store.set_display_name("you").unwrap();
+        assert!(store.display_name_set().unwrap());
+        assert_eq!(store.identity().unwrap().unwrap().display_name, "you");
     }
 
     #[test]

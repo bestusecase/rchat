@@ -4,49 +4,80 @@
   let showHelp = $state(false);
 </script>
 
-<div class="connect">
-  <div class="connect-card">
-    <div class="connect-brand"><span class="brand-mark big">r</span></div>
-    <h1>Welcome to rchat</h1>
-    <p class="connect-sub">Fast, offline-first messaging over Reticulum.</p>
+{#if chat.desktop}
+  <div class="connect">
+    <div class="connect-card boot-card">
+      <div class="connect-brand"><span class="brand-mark big">r</span></div>
+      <h1>{chat.desktopError ? "rchat could not start" : "Starting rchat"}</h1>
+      <p class="connect-sub">
+        {#if chat.desktopError}
+          The local engine did not come up.
+        {:else if chat.status === "connecting"}
+          Connecting to the local engine…
+        {:else}
+          Waking up your private Reticulum node. This takes a moment the first time.
+        {/if}
+      </p>
 
-    <label class="field-label">
-      Engine address
-      <input class="field mono" bind:value={chat.base} spellcheck="false" />
-    </label>
+      {#if chat.desktopError}
+        <p class="form-error">{chat.desktopError}</p>
+        <button class="btn primary wide" onclick={() => chat.retryEngine()}>
+          Try again
+        </button>
+      {:else}
+        <div class="boot-spinner" aria-label="Starting"></div>
+      {/if}
+    </div>
 
-    <label class="field-label">
-      Access token
-      <input class="field mono" bind:value={chat.token} spellcheck="false" />
-    </label>
-
-    {#if chat.error}
-      <p class="form-error">{chat.error}</p>
-    {/if}
-
-    <button
-      class="btn primary wide"
-      onclick={() => chat.connect()}
-      disabled={chat.status === "connecting" || !chat.token.trim()}
-    >
-      {chat.status === "connecting" ? "Connecting…" : "Connect"}
-    </button>
-
-    <button class="help-toggle" onclick={() => (showHelp = !showHelp)}>
-      Where do I find the token?
-    </button>
-
-    {#if showHelp}
-      <div class="help-card">
-        <p>Start the engine in a terminal:</p>
-        <code>cargo run -p rchatd</code>
-        <p>It prints the token and writes it to:</p>
-        <code>~/.local/share/rchat/token</code>
-      </div>
-    {/if}
+    <p class="connect-foot">
+      Your history stays on this device. Nothing leaves unless you send it.
+    </p>
   </div>
+{:else}
+  <div class="connect">
+    <div class="connect-card">
+      <div class="connect-brand"><span class="brand-mark big">r</span></div>
+      <h1>Welcome to rchat</h1>
+      <p class="connect-sub">Fast, offline-first messaging over Reticulum.</p>
 
-  <p class="connect-foot">
-    Your history stays on this device. Nothing leaves unless you send it.
-  </p>
-</div>
+      <label class="field-label">
+        Engine address
+        <input class="field mono" bind:value={chat.base} spellcheck="false" />
+      </label>
+
+      <label class="field-label">
+        Access token
+        <input class="field mono" bind:value={chat.token} spellcheck="false" />
+      </label>
+
+      {#if chat.error}
+        <p class="form-error">{chat.error}</p>
+      {/if}
+
+      <button
+        class="btn primary wide"
+        onclick={() => chat.connect()}
+        disabled={chat.status === "connecting" || !chat.token.trim()}
+      >
+        {chat.status === "connecting" ? "Connecting…" : "Connect"}
+      </button>
+
+      <button class="help-toggle" onclick={() => (showHelp = !showHelp)}>
+        Where do I find the token?
+      </button>
+
+      {#if showHelp}
+        <div class="help-card">
+          <p>Start the engine in a terminal:</p>
+          <code>cargo run -p rchatd</code>
+          <p>It prints the token and writes it to:</p>
+          <code>~/.local/share/rchat/token</code>
+        </div>
+      {/if}
+    </div>
+
+    <p class="connect-foot">
+      Your history stays on this device. Nothing leaves unless you send it.
+    </p>
+  </div>
+{/if}

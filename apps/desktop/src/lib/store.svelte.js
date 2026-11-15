@@ -1,13 +1,19 @@
 import { transportLabel } from "./util.js";
+import { boot, isDesktop, invoke, listen } from "./desktop.js";
 
 const BASE_KEY = "rchat.base";
 const TOKEN_KEY = "rchat.token";
 
 class ChatStore {
-  status = $state("idle"); // idle | connecting | connected | error
+  status = $state(boot ? "starting" : "idle"); // idle | starting | connecting | connected | error
   error = $state(null);
-  base = $state(localStorage.getItem(BASE_KEY) || "http://127.0.0.1:8787");
-  token = $state(localStorage.getItem(TOKEN_KEY) || "");
+  desktop = isDesktop;
+  desktopError = $state(boot?.error ?? null);
+  desktopSettings = $state(null);
+  base = $state(
+    boot?.base || localStorage.getItem(BASE_KEY) || "http://127.0.0.1:8787",
+  );
+  token = $state(boot?.token || localStorage.getItem(TOKEN_KEY) || "");
   hello = $state(null);
   identity = $state(null);
   transport = $state("offline");
@@ -17,10 +23,15 @@ class ChatStore {
   activeId = $state(null);
   toasts = $state([]);
   lastSeq = $state(0);
+  windowFocused = $state(true);
+  windowVisible = $state(true);
 
   socket = null;
   nextId = 1;
   pending = new Map();
+  retryTimer = null;
+  desktopWired = false;
+  activityCount = 0;
 
   get transportLabel() {
     return transportLabel(this.transport);
@@ -34,8 +45,93 @@ class ChatStore {
     return this.messages[this.activeId] ?? [];
   }
 
+  get unreadTotal() {
+    return this.conversations.reduce(
+      (total, conversation) => total + (conversation.unread ?? 0),
+      0,
+    );
+  }
+
+  get needsName() {
+    return Boolean(
+      this.desktop &&
+        this.status === "connected" &&
+        this.identity &&
+        !this.identity.display_name_set,
+    );
+  }
+
+  async initDesktop() {
+    if (!this.desktop || this.desktopWired) return;
+    this.desktopWired = true;
+
+    listen("window-state", (state) => {
+      const wasFocused = this.windowFocused;
+      this.windowFocused = Boolean(state.focused);
+      this.windowVisible = Boolean(state.visible);
+      if (this.windowFocused && this.windowVisible) {
+        this.clearActivity();
+        if (wasFocused === false && this.activeId) {
+          this.call({
+            cmd: "mark_read",
+            conversation_id: this.activeId,
+          }).catch(() => {});
+        }
+      } else if (this.unreadTotal > 0) {
+        this.notifyActivity(this.unreadTotal, false);
+      }
+    });
+
+    listen("settings-changed", (view) => {
+      if (view) this.desktopSettings = view;
+    });
+
+    listen("engine-restarted", (payload) => {
+      if (payload?.base && payload.base !== this.base) {
+        this.base = payload.base;
+        this.disconnect();
+      }
+    });
+
+    window.addEventListener("focus", () => this.handleBrowserFocus(true));
+    window.addEventListener("blur", () => this.handleBrowserFocus(false));
+
+    await this.loadDesktopSettings();
+  }
+
+  handleBrowserFocus(focused) {
+    if (this.desktop) return; // the shell reports the authoritative state
+    this.windowFocused = focused;
+    if (focused) this.clearActivity();
+  }
+
+  async loadDesktopSettings() {
+    if (!this.desktop) return;
+    try {
+      this.desktopSettings = await invoke("get_desktop_settings");
+    } catch {
+      /* the shell may still be attaching */
+    }
+  }
+
   async connect() {
-    if (this.status === "connecting") return;
+    if (this.status === "connecting" || this.status === "connected") return;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (!this.base || !this.token) {
+      if (this.desktop) {
+        this.status = "starting";
+        this.desktopError =
+          this.desktopError ?? "The local engine is not ready yet.";
+        this.scheduleReconnect(1500);
+      } else {
+        this.fail("The engine address and token are required.");
+      }
+      return;
+    }
+
     this.status = "connecting";
     this.error = null;
 
@@ -56,7 +152,7 @@ class ChatStore {
       await new Promise((resolve, reject) => {
         const timer = setTimeout(
           () => reject(new Error("The engine did not answer in time.")),
-          5000,
+          6000,
         );
         socket.onopen = () => {
           clearTimeout(timer);
@@ -77,17 +173,21 @@ class ChatStore {
     }
 
     socket.onclose = () => {
-      if (this.status === "connected") {
-        // The engine restarted or went away. Try once more shortly; if that
-        // fails the connect screen explains what happened.
-        this.status = "idle";
-        setTimeout(() => this.connect(), 900);
+      if (this.socket !== socket) return;
+      this.socket = null;
+      if (this.status === "connected" || this.desktop) {
+        // The engine restarted or went away. Reconnect: the address is stable
+        // across restarts, and the desktop shell may still be starting one.
+        this.status = this.desktop ? "starting" : "idle";
+        if (!this.desktop) this.desktopError = this.desktopError;
+        this.scheduleReconnect(this.desktop ? 900 : 1200);
       }
     };
 
     localStorage.setItem(BASE_KEY, this.base);
     localStorage.setItem(TOKEN_KEY, this.token);
     this.status = "connected";
+    this.desktopError = null;
 
     try {
       const snapshot = await this.call({ cmd: "snapshot" });
@@ -98,13 +198,87 @@ class ChatStore {
       const first = snapshot.conversations[0];
       if (this.activeId) await this.loadMessages(this.activeId);
       else if (first) await this.select(first.id);
+      if (this.desktop) await this.loadDesktopSettings();
     } catch (err) {
       this.toast(err.message);
     }
   }
 
+  scheduleReconnect(delay) {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  async retryEngine() {
+    if (!this.desktop) return false;
+    this.desktopError = null;
+    this.status = "starting";
+    try {
+      const result = await invoke("restart_engine");
+      this.applyEngineResult(result);
+      this.disconnect();
+      this.status = "starting";
+      this.scheduleReconnect(250);
+      return true;
+    } catch (err) {
+      this.desktopError = err?.message ?? String(err);
+      this.scheduleReconnect(1800);
+      return false;
+    }
+  }
+
+  applyEngineResult(result) {
+    if (result?.base) this.base = result.base;
+    if (result?.token) this.token = result.token;
+    if (result?.settings) this.desktopSettings = result.settings;
+    localStorage.setItem(BASE_KEY, this.base);
+    localStorage.setItem(TOKEN_KEY, this.token);
+  }
+
+  async saveNetwork(autoDiscovery, tcpRelay) {
+    if (!this.desktop) return;
+    const result = await invoke("save_network_settings", {
+      autoDiscovery,
+      tcpRelay,
+    });
+    this.applyEngineResult(result);
+    this.disconnect();
+    this.status = "starting";
+    this.scheduleReconnect(250);
+  }
+
+  async setMuted(muted) {
+    if (!this.desktop) return;
+    await invoke("set_muted", { muted });
+    if (this.desktopSettings) this.desktopSettings.muted = muted;
+  }
+
+  async setAutostart(enabled) {
+    if (!this.desktop) return;
+    await invoke("set_autostart", { enabled });
+    if (this.desktopSettings) this.desktopSettings.autostart = enabled;
+  }
+
+  notifyActivity(count, chime) {
+    this.activityCount = count;
+    if (!this.desktop) return;
+    invoke("notify_activity", { count, chime }).catch(() => {});
+  }
+
+  clearActivity() {
+    if (this.activityCount === 0) {
+      if (!this.desktop) return;
+    }
+    this.activityCount = 0;
+    if (!this.desktop) return;
+    invoke("clear_activity").catch(() => {});
+  }
+
+
   fail(message) {
-    this.status = "error";
     this.error = message;
     try {
       this.socket?.close();
@@ -112,6 +286,15 @@ class ChatStore {
       /* already closed */
     }
     this.socket = null;
+    if (this.desktop) {
+      // A shell-started engine may still be coming up. Keep trying instead of
+      // parking the user on an error screen.
+      this.desktopError = message;
+      this.status = "starting";
+      this.scheduleReconnect(1200);
+    } else {
+      this.status = "error";
+    }
   }
 
   disconnect() {
@@ -154,10 +337,25 @@ class ChatStore {
   applyEvent(name, data) {
     switch (name) {
       case "message.new": {
+        const incoming = !this.isMine(data.message);
+        const isOpen = data.message.conversation_id === this.activeId;
+        const hidden = !this.windowFocused || !this.windowVisible;
         this.appendMessage(data.message);
-        if (data.message.conversation_id === this.activeId && !this.isMine(data.message)) {
-          this.call({ cmd: "mark_read", conversation_id: this.activeId }).catch(() => {});
+        if (!incoming) break;
+        if (isOpen) {
+          // Never alert for the conversation on screen. Mark it read while the
+          // window is in front; if hidden, leave it unread until it is shown.
+          if (!hidden) {
+            this.call({
+              cmd: "mark_read",
+              conversation_id: this.activeId,
+            }).catch(() => {});
+          }
+          break;
         }
+        // A conversation the user cannot see: one coalesced chime, with the
+        // shell adding a tray dot and taskbar hint only while hidden.
+        this.notifyActivity(Math.max(this.unreadTotal + 1, 1), true);
         break;
       }
       case "message.state": {
@@ -166,6 +364,11 @@ class ChatStore {
       }
       case "conversation.updated": {
         this.upsertConversation(data.conversation);
+        if (this.desktop && (!this.windowFocused || !this.windowVisible)) {
+          if (this.unreadTotal > 0) {
+            this.notifyActivity(this.unreadTotal, false);
+          }
+        }
         break;
       }
       case "peer.updated": {
@@ -265,6 +468,9 @@ class ChatStore {
       await this.loadMessages(conversationId);
     }
     this.call({ cmd: "mark_read", conversation_id: conversationId }).catch(() => {});
+    if (this.desktop && this.windowFocused && this.windowVisible) {
+      this.clearActivity();
+    }
   }
 
   async loadMessages(conversationId) {

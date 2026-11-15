@@ -4,7 +4,7 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
-  let { onAddPeer, onProfile } = $props();
+  let { onAddPeer, onProfile, onSettings } = $props();
 </script>
 
 <div class="shell-left">
@@ -97,7 +97,7 @@
         <span class="me-name">{chat.identity?.display_name || "you"}</span>
         <span class="me-address">{shortAddress(chat.identity?.address)}</span>
       </div>
-      <button class="icon-button" title="Profile settings" onclick={onProfile}>
+      <button class="icon-button" title="Settings and network" onclick={onSettings}>
         <Icon name="gear" size={18} />
       </button>
     </footer>

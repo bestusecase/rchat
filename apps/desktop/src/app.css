@@ -1093,6 +1093,123 @@ textarea {
   }
 }
 
+/* ---------- desktop boot, first run and settings ---------- */
+
+.boot-card {
+  align-items: stretch;
+  text-align: center;
+}
+
+.boot-spinner {
+  align-self: center;
+  width: 26px;
+  height: 26px;
+  margin: 6px 0 2px;
+  border: 2px solid #2a3040;
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: boot-spin 0.8s linear infinite;
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.first-run {
+  text-align: center;
+}
+
+.first-run-mark {
+  display: flex;
+  justify-content: center;
+}
+
+.first-run h2 {
+  text-align: center;
+}
+
+.settings-dialog {
+  max-width: 460px;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  background: #0d1017;
+}
+
+.settings-title {
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 2px 0;
+  text-align: left;
+}
+
+.toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.toggle-text strong {
+  font-size: 13px;
+  font-weight: 620;
+  color: var(--text-0);
+}
+
+.toggle-text small {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+}
+
+.switch {
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 22px;
+  border-radius: 999px;
+  background: #262c3a;
+  transition: background 0.15s ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #8b93a7;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.switch[data-on="true"] {
+  background: #3f4ac8;
+}
+
+.switch[data-on="true"]::after {
+  transform: translateX(16px);
+  background: #fff;
+}
+
 @media (max-width: 860px) {
   .app {
     grid-template-columns: 244px minmax(0, 1fr);
