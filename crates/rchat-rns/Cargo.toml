@@ -1,0 +1,10 @@
+[package]
+name = "rchat-rns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+rchat-ipc = { path = "../rchat-ipc" }
