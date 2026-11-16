@@ -289,12 +289,13 @@ async function exchange(from, to, label) {
   return { body, received, id: sent.message.id };
 }
 
+/// The user-owned part of a peer row. `bandwidth_class` is derived from the
+/// current path and legitimately changes when a leaf reconnects.
 function peerConfig(peers) {
   return peers.map((peer) => ({
     id: peer.id,
     address: peer.address,
     nickname: peer.nickname,
-    bandwidth_class: peer.bandwidth_class,
   }));
 }
 

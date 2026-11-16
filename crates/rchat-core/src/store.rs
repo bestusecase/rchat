@@ -1054,6 +1054,19 @@ impl Store {
         Ok(row)
     }
 
+    /// The newest announce heard from one address, if any. Reachability reports
+    /// this instead of `peers.last_seen`, which also moves when a peer is added
+    /// by hand or writes to us; "last heard" must mean an announce.
+    pub fn latest_announce(&self, address: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let ts = conn.query_row(
+            "SELECT MAX(last_seen) FROM mesh_announces WHERE address = ?1",
+            [address],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        Ok(ts)
+    }
+
     /// Newest first, paged by `last_seen` so a live prepend cannot shift a page.
     pub fn list_announces(
         &self,

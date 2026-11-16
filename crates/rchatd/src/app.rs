@@ -550,6 +550,13 @@ impl AppState {
                     if address.is_some() {
                         mesh.address = address.clone();
                     }
+                    if state != TransportState::Ready {
+                        // The interface sample belongs to the previous bridge
+                        // session. Keeping it would let the first "ready" after
+                        // a restart claim an online interface that has not been
+                        // reattached yet, then degrade a moment later.
+                        mesh.interfaces.clear();
+                    }
                     derived_transport(&mesh.transport, &mesh.interfaces)
                 };
                 *self.transport.write().await = derived;
@@ -766,7 +773,7 @@ impl AppState {
     /// clients when it moved. Called on every mesh sample, so a relay that goes
     /// quiet turns the status to `degraded` without waiting for a bridge
     /// restart or a client poll.
-    async fn sync_transport(&self) {
+    async fn sync_transport(self: &Arc<Self>) {
         let (next, address) = {
             let cache = self.mesh.read().await;
             (
@@ -792,6 +799,13 @@ impl AppState {
                     "detail": derived_detail(next),
                 }),
             );
+            if next == TransportState::Ready {
+                // The bridge may already have said "ready" while nothing was
+                // online, and the queue that piled up in the meantime has to
+                // move now, not on the next bridge restart.
+                let state = self.clone();
+                tokio::spawn(async move { state.flush_queued().await });
+            }
         }
     }
 
@@ -838,7 +852,9 @@ impl AppState {
                     state: path
                         .map(|path| path.state.clone())
                         .unwrap_or_else(|| "none".to_string()),
-                    last_announce: peer.last_seen,
+                    // From the announce history, not `peer.last_seen`: adding a
+                    // peer by address or receiving a message also moves that.
+                    last_announce: self.store.latest_announce(address).ok().flatten(),
                 })
             })
             .collect();
@@ -2054,14 +2070,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_interface_coming_back_sends_the_queued_messages() {
+        let state = app();
+        feed_mesh(&state, json!([])).await;
+        assert_eq!(*state.transport.read().await, TransportState::Degraded);
+
+        let address = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&address, "relay")).unwrap();
+        let conversation = state
+            .store
+            .create_conversation("direct", None, &[address.clone()])
+            .unwrap();
+        let identity = state.store.identity().unwrap().unwrap();
+        let message = MessageInfo {
+            id: "queued-1".into(),
+            conversation_id: conversation.id.clone(),
+            author_id: identity.id,
+            ts: 1,
+            body: "queued while degraded".into(),
+            kind: "text".into(),
+            reply_to: None,
+            state: "queued".into(),
+            route: None,
+            edited_at: None,
+            attachments: vec![],
+        };
+        state.store.insert_message(&message, false).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.attach_transport(tx).await;
+
+        feed_mesh(
+            &state,
+            json!([{ "name": "Relay", "kind": "TCPClientInterface", "online": true }]),
+        )
+        .await;
+
+        let sent = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the queue flushes as soon as an interface is online")
+            .expect("a bridge command");
+        let payload: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(payload["cmd"], "send");
+        assert_eq!(payload["to"], address);
+        assert_eq!(payload["body"], "queued while degraded");
+        assert_eq!(
+            state.store.get_message("queued-1").unwrap().unwrap().state,
+            "sending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_bridge_does_not_claim_ready_from_a_stale_sample() {
+        let state = app();
+        feed_mesh(
+            &state,
+            json!([{ "name": "Relay", "kind": "TCPClientInterface", "online": true }]),
+        )
+        .await;
+        assert_eq!(*state.transport.read().await, TransportState::Ready);
+
+        state
+            .on_bridge_event(BridgeEvent::State {
+                state: TransportState::Starting,
+                address: None,
+                name: None,
+                detail: None,
+            })
+            .await;
+        assert_eq!(*state.transport.read().await, TransportState::Starting);
+
+        // Nothing has sampled the new bridge session yet. The old sample's
+        // online interface must not make this "ready" again.
+        state
+            .on_bridge_event(BridgeEvent::State {
+                state: TransportState::Ready,
+                address: None,
+                name: None,
+                detail: None,
+            })
+            .await;
+        assert_eq!(*state.transport.read().await, TransportState::Degraded);
+
+        feed_mesh(
+            &state,
+            json!([{ "name": "Relay", "kind": "TCPClientInterface", "online": true }]),
+        )
+        .await;
+        assert_eq!(*state.transport.read().await, TransportState::Ready);
+    }
+
+    #[tokio::test]
     async fn every_known_peer_reports_whether_a_path_exists() {
         let state = app();
         let alice = "aa".repeat(16);
         let bob = "bb".repeat(16);
         state.store.upsert_peer(&peer(&alice, "relay")).unwrap();
         let mut quiet = peer(&bob, "unknown");
+        // Recent contact, but the last actual announce is much older.
         quiet.last_seen = Some(1_760_000_000_000);
         state.store.upsert_peer(&quiet).unwrap();
+        state
+            .store
+            .record_announce(
+                &bob,
+                Some("Bob"),
+                None,
+                Some("Relay"),
+                Some(1),
+                1_700_000_000_000,
+            )
+            .unwrap();
 
         state
             .on_bridge_event(BridgeEvent::Mesh {
@@ -2093,7 +2212,10 @@ mod tests {
         assert_eq!(reachable.hops, Some(2));
         assert_eq!(reachable.interface.as_deref(), Some("Relay"));
         assert_eq!(reachable.state, "responsive");
-        assert_eq!(reachable.last_announce, Some(1));
+        assert_eq!(
+            reachable.last_announce, None,
+            "a peer added by hand has no announce history"
+        );
 
         let unreachable = status
             .peer_reachability
@@ -2105,8 +2227,8 @@ mod tests {
         assert_eq!(unreachable.state, "none");
         assert_eq!(
             unreachable.last_announce,
-            Some(1_760_000_000_000),
-            "queued-for-days is visible as an old announce, not as silence"
+            Some(1_700_000_000_000),
+            "the announce history answers this, not the peer's last contact"
         );
     }
 

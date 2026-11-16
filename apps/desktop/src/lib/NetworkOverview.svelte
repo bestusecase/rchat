@@ -30,7 +30,7 @@
   }
 
   function peerId(address) {
-    return peer(address)?.id ?? address;
+    return chat.peerByAddress(address)?.id ?? address;
   }
 
   async function copyAddress() {
