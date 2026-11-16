@@ -133,7 +133,7 @@ runs `bridge.py` under Chaquopy, so the APK needs no external Python.
 
 New-message notifications are posted from Rust, not from the page: a backgrounded
 WebView has its JavaScript suspended, so the engine's event stream is the only
-reliable trigger. Each conversation with unseen messages gets its own
+reliable trigger. Each conversation with unread messages gets its own
 notification, titled with the conversation — the peer's name for a direct chat —
 showing a messaging-style thread of what arrived while you were away, newest at
 the bottom. A summary groups them and reads `<n> conversations · <m> new

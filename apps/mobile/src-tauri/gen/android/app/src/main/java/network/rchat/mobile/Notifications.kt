@@ -45,13 +45,13 @@ object Notifications {
   private val postedChildren = mutableSetOf<Int>()
 
   /**
-   * The child id allocated to each conversation for the life of the process.
+   * The child id allocated to each conversation.
    *
-   * Allocating the lowest free id instead of hashing the conversation id makes
-   * the ids unique by construction, so no conversation can overwrite another.
-   * Cleared with [postedChildren] whenever the shade is cleared; a new process
-   * starts empty because the service cancels everything before it promotes
-   * itself.
+   * An id is handed out once and kept until the bookkeeping is fully cleared:
+   * cancelling a conversation's notification does not release its id, so a
+   * later conversation never inherits an id the shade may still remember. Only
+   * [forgetThreads] empties the map, and a new process starts empty because the
+   * service cancels everything before it promotes itself.
    */
   private val childIds = mutableMapOf<String, Int>()
 
@@ -145,10 +145,10 @@ object Notifications {
       // shared child id must not be able to sneak in a sixth line.
       if (index < SUMMARY_LINES) summaryLines.addLine("$title — $latest")
 
-      val childId = childId(id)
-      live += childId
+      val child = childId(id)
+      live += child
       manager.notify(
-        childId,
+        child,
         threadNotification(context, title, unread, style, countOnly(context, unread)),
       )
     }
@@ -179,8 +179,7 @@ object Notifications {
     val manager = context.getSystemService(NotificationManager::class.java) ?: return
     manager.cancel(SUMMARY_ID)
     for (id in postedChildren) manager.cancel(id)
-    postedChildren.clear()
-    childIds.clear()
+    forgetThreads()
   }
 
   /** Android 13+ gates notifications behind a runtime permission. */
@@ -201,15 +200,22 @@ object Notifications {
   fun cancelAll(context: Context) {
     val manager = context.getSystemService(NotificationManager::class.java) ?: return
     manager.cancelAll()
+    forgetThreads()
+  }
+
+  /**
+   * Forget both pieces of notification bookkeeping through one path.
+   *
+   * Every full clear — the foreground clear and the cancel-everything path —
+   * goes through here, so a future third piece cannot be cleared on one path
+   * and forgotten on the other.
+   */
+  private fun forgetThreads() {
     postedChildren.clear()
     childIds.clear()
   }
 
-  /**
-   * The lowest free id at or above [CHILD_ID_BASE], so a conversation never
-   * shares an id with another and never collides with [SERVICE_ID] or
-   * [SUMMARY_ID]. The allocation lasts for the process, not across restarts.
-   */
+  /** Allocate a conversation's child id, above the reserved service and summary ids. */
   private fun childId(conversationId: String): Int {
     childIds[conversationId]?.let { return it }
     var id = CHILD_ID_BASE

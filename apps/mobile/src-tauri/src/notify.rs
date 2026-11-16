@@ -50,22 +50,33 @@ pub fn spawn(running: &Running) {
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            // Visibility is a provider, not a sample: the accumulator asks it
-            // at the moment it would append, while holding the lock the
-            // foreground clear needs, so a resume cannot slip between the
-            // answer and the commit.
-            let snapshot = THREADS.lock().unwrap().observe(
-                &text,
-                &identity,
-                &store,
-                crate::muted(),
-                android::user_can_see_app,
-            );
-            if let Some(snapshot) = snapshot {
-                post(&snapshot);
-            }
+            // Muting is sampled now, when the event arrives; visibility is
+            // asked later, when the append would commit and again at
+            // delivery. One value carries both so the asymmetry is visible
+            // where it is passed.
+            let audience = Audience::new(crate::muted(), android::user_can_see_app);
+            deliver(&text, &identity, &store, &audience, post);
         }
     });
+}
+
+/// Own one engine event from arrival to shade.
+///
+/// Locks the accumulated threads across both the commit and the post, so the
+/// foreground clear cannot interleave between them. The decision itself is
+/// [`Threads::deliver`], which the tests drive directly on an isolated
+/// accumulator.
+fn deliver(
+    event: &str,
+    identity: &str,
+    store: &Store,
+    audience: &Audience<impl Fn() -> bool>,
+    post: impl FnOnce(&Snapshot),
+) -> bool {
+    THREADS
+        .lock()
+        .unwrap()
+        .deliver(event, identity, store, audience, post)
 }
 
 /// Forget every accumulated thread.
@@ -105,6 +116,32 @@ pub struct Threads {
     conversations: Vec<Thread>,
 }
 
+/// Who may be told about a message.
+///
+/// The two inputs are sampled at different moments on purpose: `muted` is read
+/// when the event arrives, so a muted app accumulates nothing, while `visible`
+/// is asked only for an event that could actually be posted, and only when the
+/// append would commit (and again at delivery). Bundling them keeps that
+/// asymmetry visible at every call site.
+pub struct Audience<F> {
+    muted: bool,
+    visible: F,
+}
+
+impl<F: Fn() -> bool> Audience<F> {
+    pub fn new(muted: bool, visible: F) -> Self {
+        Self { muted, visible }
+    }
+
+    fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    fn is_visible(&self) -> bool {
+        (self.visible)()
+    }
+}
+
 impl Threads {
     pub const fn new() -> Self {
         Self {
@@ -114,27 +151,30 @@ impl Threads {
 
     /// Feed one engine event; returns the snapshot to post, if any.
     ///
-    /// `visible` is asked here, while the lock is held, immediately before the
-    /// append is committed. The foreground path flips its flag before it takes
-    /// that same lock to clear, so the two can only interleave two safe ways:
-    /// if the clear wins, this sample sees a visible app and declines; if the
-    /// append wins, the clear that follows discards it. A message read in the
-    /// app can therefore never resurface in a later notification.
+    /// The audience is asked here, while the lock is held, immediately before
+    /// the append is committed. The foreground path flips its flag before it
+    /// takes that same lock to clear, so the two can only interleave two safe
+    /// ways: if the clear wins, this sample sees a visible app and declines; if
+    /// the append wins, the clear that follows discards it. A message read in
+    /// the app can therefore never resurface in a later notification.
+    ///
+    /// The question is deliberately asked after muting and parsing: an event
+    /// that can never be posted is decided without consulting the platform, so
+    /// the timing of this sample is part of the behaviour, not an accident.
     pub fn observe(
         &mut self,
         event: &str,
         identity: &str,
         store: &Store,
-        muted: bool,
-        visible: impl Fn() -> bool,
+        audience: &Audience<impl Fn() -> bool>,
     ) -> Option<Snapshot> {
-        if muted {
+        if audience.is_muted() {
             return None;
         }
         let incoming = Incoming::parse(event, identity)?;
         // Commit-time sample: everything above ran while the app was away, but
         // the user may have come back in the meantime.
-        if visible() {
+        if audience.is_visible() {
             return None;
         }
         let title = title_for(store, &incoming.conversation_id);
@@ -159,6 +199,44 @@ impl Threads {
         self.conversations
             .sort_by_key(|thread| std::cmp::Reverse(thread.latest_ts));
         Some(self.snapshot())
+    }
+
+    /// Own one engine event from arrival to shade.
+    ///
+    /// Callers hold the threads lock across this call and the poster; the
+    /// module-level [`deliver`] does that for the event loop, and the tests
+    /// drive this method on an isolated accumulator.
+    ///
+    /// The accumulator decides whether anything accumulates; if it does, the
+    /// visibility question is asked once more, because a resume can land
+    /// between the commit and the post. A refused snapshot is forgotten — the
+    /// user is looking at the messages now, so they must not reappear in the
+    /// next background notification — and `post` is handed the snapshot the
+    /// shade would show. Returns whether anything was posted.
+    ///
+    /// Asking twice is deliberate: the commit-time sample stops a message being
+    /// accumulated, and this delivery-time sample is the backstop for what was
+    /// accumulated a moment too early. Neither replaces the other.
+    pub fn deliver(
+        &mut self,
+        event: &str,
+        identity: &str,
+        store: &Store,
+        audience: &Audience<impl Fn() -> bool>,
+        post: impl FnOnce(&Snapshot),
+    ) -> bool {
+        let Some(snapshot) = self.observe(event, identity, store, audience) else {
+            return false;
+        };
+        // Delivery-time sample: a resume after the commit still makes this
+        // snapshot stale, and refusing without forgetting is what let text
+        // already read surface in a later notification.
+        if audience.is_visible() {
+            self.clear();
+            return false;
+        }
+        post(&snapshot);
+        true
     }
 
     pub fn clear(&mut self) {
@@ -398,12 +476,37 @@ mod tests {
             ts: i64,
             visible: impl Fn() -> bool,
         ) -> Option<Snapshot> {
-            self.threads.observe(
+            self.observe_event(&event(conversation, author, body, ts), false, visible)
+        }
+
+        /// Observe a raw event, with the suppression inputs named.
+        fn observe_event(
+            &mut self,
+            event: &str,
+            muted: bool,
+            visible: impl Fn() -> bool,
+        ) -> Option<Snapshot> {
+            self.threads
+                .observe(event, IDENTITY, &self.store, &Audience::new(muted, visible))
+        }
+
+        /// Deliver one message through the higher seam, which decides whether
+        /// the snapshot reaches the shade.
+        fn deliver(
+            &mut self,
+            conversation: &str,
+            author: &str,
+            body: &str,
+            ts: i64,
+            visible: impl Fn() -> bool,
+            post: impl FnOnce(&Snapshot),
+        ) -> bool {
+            self.threads.deliver(
                 &event(conversation, author, body, ts),
                 IDENTITY,
                 &self.store,
-                false,
-                visible,
+                &Audience::new(false, visible),
+                post,
             )
         }
 
@@ -418,8 +521,7 @@ mod tests {
                 &event(conversation, author, body, ts),
                 IDENTITY,
                 &self.store,
-                true,
-                || false,
+                &Audience::new(true, || false),
             )
         }
     }
@@ -520,12 +622,30 @@ mod tests {
             })
             .to_string(),
         ] {
-            assert!(case
-                .threads
-                .observe(event, IDENTITY, &case.store, false, || false)
-                .is_none());
+            assert!(case.observe_event(event, false, || false).is_none());
         }
         assert_eq!(case.threads.snapshot().conversations, []);
+    }
+
+    /// A `message.new` event whose clock field is written as `ts`.
+    ///
+    /// `None` omits the field entirely, so every malformed-clock case shares
+    /// one builder and changing the event shape stays one edit.
+    fn event_with_ts(conversation: &str, ts: Option<serde_json::Value>) -> String {
+        let mut message = serde_json::json!({
+            "conversation_id": conversation,
+            "author_id": "alice",
+            "body": "no clock",
+        });
+        if let Some(ts) = ts {
+            message["ts"] = ts;
+        }
+        serde_json::json!({
+            "type": "event",
+            "name": "message.new",
+            "data": { "message": message },
+        })
+        .to_string()
     }
 
     #[test]
@@ -534,50 +654,14 @@ mod tests {
         case.peer("alice", Some("Alice"), None);
         let chat = case.direct("alice");
 
-        let without_ts = serde_json::json!({
-            "type": "event",
-            "name": "message.new",
-            "data": { "message": {
-                "conversation_id": chat,
-                "author_id": "alice",
-                "body": "no clock",
-            }},
-        });
-        let string_ts = serde_json::json!({
-            "type": "event",
-            "name": "message.new",
-            "data": { "message": {
-                "conversation_id": chat,
-                "author_id": "alice",
-                "body": "no clock",
-                "ts": "1000",
-            }},
-        });
-        let float_ts = serde_json::json!({
-            "type": "event",
-            "name": "message.new",
-            "data": { "message": {
-                "conversation_id": chat,
-                "author_id": "alice",
-                "body": "no clock",
-                "ts": 1000.5,
-            }},
-        });
-        let null_ts = serde_json::json!({
-            "type": "event",
-            "name": "message.new",
-            "data": { "message": {
-                "conversation_id": chat,
-                "author_id": "alice",
-                "body": "no clock",
-                "ts": null,
-            }},
-        });
-
-        for event in [without_ts, string_ts, float_ts, null_ts] {
+        for ts in [
+            None,
+            Some(serde_json::json!("1000")),
+            Some(serde_json::json!(1000.5)),
+            Some(serde_json::json!(null)),
+        ] {
             assert!(case
-                .threads
-                .observe(&event.to_string(), IDENTITY, &case.store, false, || false)
+                .observe_event(&event_with_ts(&chat, ts), false, || false)
                 .is_none());
         }
         assert_eq!(case.threads.snapshot().conversations, []);
@@ -599,6 +683,75 @@ mod tests {
             .unwrap();
         assert_eq!(bodies(&snapshot, 0), ["now you see me"]);
         assert_eq!(snapshot.unread_count, 1);
+    }
+
+    #[test]
+    fn events_that_cannot_be_posted_never_ask_whether_the_user_is_looking() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let asked = Cell::new(0);
+        let counting = || {
+            asked.set(asked.get() + 1);
+            false
+        };
+
+        // Muted: the first gate, so nothing is accumulated before the
+        // visibility question exists.
+        assert!(case
+            .observe_event(&event(&chat, "alice", "muted", 1_000), true, counting)
+            .is_none());
+        // Malformed, unrelated and the app's own message can never be posted
+        // either, so none of them may consult the platform.
+        assert!(case.observe_event("not json", false, counting).is_none());
+        assert!(case
+            .observe_event(
+                &serde_json::json!({ "type": "hello" }).to_string(),
+                false,
+                counting,
+            )
+            .is_none());
+        assert!(case
+            .observe_event(&event(&chat, IDENTITY, "mine", 1_000), false, counting)
+            .is_none());
+
+        assert_eq!(asked.get(), 0, "an unpostable event must not ask");
+        assert_eq!(case.threads.snapshot().conversations, []);
+    }
+
+    #[test]
+    fn a_committable_message_asks_the_visibility_question_once_at_commit() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let asked = Cell::new(0);
+
+        let snapshot = case
+            .observe_while(&chat, "alice", "only once", 1_000, || {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .unwrap();
+
+        assert_eq!(asked.get(), 1);
+        assert_eq!(bodies(&snapshot, 0), ["only once"]);
+    }
+
+    #[test]
+    fn a_visible_answer_at_commit_asks_once_and_accumulates_nothing() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let asked = Cell::new(0);
+
+        let snapshot = case.observe_while(&chat, "alice", "already read", 1_000, || {
+            asked.set(asked.get() + 1);
+            true
+        });
+
+        assert!(snapshot.is_none());
+        assert_eq!(asked.get(), 1);
+        assert_eq!(case.threads.snapshot().conversations, []);
     }
 
     #[test]
@@ -661,6 +814,73 @@ mod tests {
             .observe_while(&chat, "alice", "arrived later", 2_000, || false)
             .unwrap();
         assert_eq!(bodies(&snapshot, 0), ["arrived later"]);
+    }
+
+    #[test]
+    fn a_resume_between_commit_and_post_forgets_the_snapshot() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let asked = Cell::new(0);
+        let mut posted = Vec::new();
+
+        // The append commits while nobody is looking, then the user taps the
+        // icon before the post. The delivery-time answer is "visible", so the
+        // snapshot is refused and what was committed is forgotten.
+        let delivered = case.deliver(
+            &chat,
+            "alice",
+            "already read",
+            1_000,
+            || {
+                asked.set(asked.get() + 1);
+                asked.get() > 1
+            },
+            |snapshot| posted.push(snapshot.clone()),
+        );
+
+        assert!(!delivered);
+        assert!(posted.is_empty());
+        assert_eq!(asked.get(), 2, "commit and delivery each ask once");
+        assert_eq!(case.threads.snapshot().conversations, []);
+
+        // The forget must not touch anything that arrived after the resume:
+        // the next background message stands alone.
+        let snapshot = case
+            .observe(&chat, "alice", "arrived later", 2_000)
+            .unwrap();
+        assert_eq!(bodies(&snapshot, 0), ["arrived later"]);
+        assert_eq!(snapshot.unread_count, 1);
+    }
+
+    #[test]
+    fn a_delivered_snapshot_keeps_what_came_before() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+        let mut posted = Vec::new();
+
+        assert!(case.deliver(
+            &chat,
+            "alice",
+            "first",
+            1_000,
+            || false,
+            |snapshot| posted.push(snapshot.clone()),
+        ));
+        assert!(case.deliver(
+            &chat,
+            "alice",
+            "second",
+            2_000,
+            || false,
+            |snapshot| posted.push(snapshot.clone()),
+        ));
+
+        assert_eq!(posted.len(), 2);
+        assert_eq!(bodies(&posted[0], 0), ["first"]);
+        assert_eq!(bodies(&posted[1], 0), ["first", "second"]);
+        assert_eq!(posted[1].unread_count, 2);
     }
 
     #[test]

@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
+import android.util.Log
 
 /**
  * The Java side of the native shell.
@@ -17,6 +18,7 @@ import android.provider.Settings
  */
 object EngineBridge {
   private const val LIBRARY = "rchat_mobile_lib"
+  private const val TAG = "rchat"
 
   @Volatile private var appContext: Context? = null
 
@@ -73,17 +75,17 @@ object EngineBridge {
     context.startActivity(intent)
   }
 
-  /** Post one notification per conversation with unread messages. */
+  /**
+   * Render a snapshot of the conversations waiting in the background.
+   *
+   * Rendering only: the policy of whether a snapshot should be posted, and what
+   * a refusal forgets, is decided by Rust's delivery step before this is
+   * called. A missing context, or the platform's notification permission,
+   * still posts nothing.
+   */
   @JvmStatic
   fun notifyThreads(payload: String) {
     val context = appContext ?: return
-    if (userCanSeeApp()) {
-      // The snapshot was taken while nobody was looking, so it is stale the
-      // moment the user is back. Forgetting it as well as declining is what
-      // stops the next background message from posting text already read.
-      nativeForgetThreads()
-      return
-    }
     Notifications.postThreads(context, payload)
   }
 
@@ -100,12 +102,21 @@ object EngineBridge {
   /**
    * One definition of "the user can see the app".
    *
-   * Rust asks before it commits an incoming message and Kotlin asks before it
-   * posts, so neither can drift from the other.
+   * Rust asks before it commits an incoming message and again before it posts,
+   * so neither side has to re-derive the answer. Fails closed: before the
+   * bridge has a context it cannot tell, so it says visible — nothing
+   * accumulates and no message text is posted on a guess.
    */
   @JvmStatic
   fun userCanSeeApp(): Boolean {
-    val context = appContext ?: return false
+    val context = appContext
+    if (context == null) {
+      // Cannot answer, which is not the same as "nobody is looking": count as
+      // visible so nothing accumulates and no text is posted on a guess. Log it
+      // so a device pass can tell this from a correctly suppressed post.
+      Log.w(TAG, "cannot tell whether the user can see the app: no context yet")
+      return true
+    }
     val power = context.getSystemService(PowerManager::class.java)
     val keyguard = context.getSystemService(KeyguardManager::class.java)
     return activityVisible &&
