@@ -1,4 +1,4 @@
-import { transportLabel } from "./util.js";
+import { peerReachable, shortAddress, transportLabel } from "./util.js";
 import { boot, hasTauri, isDesktop, invoke, listen, loadBoot } from "./desktop.js";
 
 const BASE_KEY = "rchat.base";
@@ -27,6 +27,32 @@ class ChatStore {
   activeId = $state(null);
   toasts = $state([]);
   lastSeq = $state(0);
+  // The Reticulum surface. `mesh` is the engine's last known picture and stays
+  // visible while the bridge is down; tabs fetch their own larger lists.
+  mesh = $state(null);
+  meshUpdatedAt = $state(0);
+  meshPaths = $state({
+    rows: [],
+    total: 0,
+    truncated: false,
+    query: "",
+    loading: false,
+    error: null,
+  });
+  meshAnnounces = $state([]);
+  /// Announce events waiting for the next batched render.
+  pendingAnnounces = new Map();
+  announceTimer = null;
+  announcesLoading = $state(false);
+  networkPane = $state(false);
+  networkTab = $state("overview");
+  transportDetail = $state(null);
+  interfaces = $state([]);
+  interfaceExtra = $state([]);
+  /// Why interface edits are unavailable, straight from the bridge.
+  interfaceReadOnly = $state(null);
+  interfaceTypes = $state(null);
+  devices = $state({ serial: [], reason: null, loaded: false });
   windowFocused = $state(true);
   windowVisible = $state(true);
   keyboardInset = $state(0);
@@ -79,6 +105,16 @@ class ChatStore {
       (total, conversation) => total + (conversation.unread ?? 0),
       0,
     );
+  }
+
+  get meshTransport() {
+    return this.mesh?.transport ?? this.transport;
+  }
+
+  /// Edits are legal while the bridge is up, even when no interface is online:
+  /// a degraded mesh is exactly when a user needs to fix an interface.
+  get meshUp() {
+    return this.meshTransport === "ready" || this.meshTransport === "degraded";
   }
 
   get needsName() {
@@ -422,6 +458,10 @@ class ChatStore {
       this.transport = snapshot.transport;
       this.conversations = snapshot.conversations;
       this.peers = snapshot.peers;
+      if (snapshot.mesh) {
+        this.mesh = snapshot.mesh;
+        this.meshUpdatedAt = Date.now();
+      }
       const first = snapshot.conversations[0];
       if (this.activeId) await this.loadMessages(this.activeId);
       // A phone opens on the conversation list, not on whichever thread
@@ -489,19 +529,6 @@ class ChatStore {
     localStorage.setItem(TOKEN_KEY, this.token);
   }
 
-  async saveNetwork(autoDiscovery, tcpRelay) {
-    if (!this.desktop) return;
-    this.restartGraceUntil = Date.now() + 15000;
-    const result = await invoke("save_network_settings", {
-      autoDiscovery,
-      tcpRelay,
-    });
-    this.applyEngineResult(result);
-    this.disconnect();
-    this.status = "starting";
-    this.scheduleReconnect(250);
-  }
-
   async setMuted(muted) {
     if (!this.shell) return;
     await invoke("set_muted", { muted });
@@ -565,6 +592,17 @@ class ChatStore {
     this.socket?.close();
     this.socket = null;
     this.status = "idle";
+    // Last known mesh data is deliberately kept for the offline banner; the
+    // lists are refetched on reconnect.
+    this.meshPaths = { rows: [], total: 0, truncated: false, query: "", loading: false, error: null };
+    this.meshAnnounces = [];
+    this.pendingAnnounces = new Map();
+    if (this.announceTimer) clearTimeout(this.announceTimer);
+    this.announceTimer = null;
+    this.interfaces = [];
+    this.interfaceExtra = [];
+    this.interfaceReadOnly = null;
+    this.interfaceTypes = null;
   }
 
   receive(raw) {
@@ -600,6 +638,26 @@ class ChatStore {
 
   applyEvent(name, data) {
     switch (name) {
+      case "mesh.updated": {
+        if (data?.mesh) {
+          this.mesh = data.mesh;
+          this.meshUpdatedAt = Date.now();
+        }
+        break;
+      }
+      case "announce.received": {
+        this.upsertAnnounce(data.announce);
+        break;
+      }
+      case "interface.changed": {
+        this.loadInterfaces().catch(() => {});
+        break;
+      }
+      case "interface.apply_failed": {
+        const name = data.name ? `"${data.name}"` : "An interface";
+        this.toast(`${name} was not applied: ${data.error ?? "Reticulum refused it"}`);
+        break;
+      }
       case "message.new": {
         const incoming = !this.isMine(data.message);
         const isOpen = data.message.conversation_id === this.activeId;
@@ -645,6 +703,7 @@ class ChatStore {
       }
       case "transport.state": {
         this.transport = data.transport;
+        this.transportDetail = data.detail ?? null;
         if (data.address && this.identity) {
           this.identity = { ...this.identity, address: data.address };
         }
@@ -722,6 +781,244 @@ class ChatStore {
     else list.push(peer);
     list.sort((a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0));
     this.peers = list;
+  }
+
+  // ---- Reticulum surface --------------------------------------------------
+
+  openNetwork(tab = "overview") {
+    if (this.mobile) this.activeId = null;
+    this.networkPane = true;
+    this.networkTab = tab;
+  }
+
+  closeNetwork() {
+    this.networkPane = false;
+  }
+
+  async openPeer(peerId) {
+    const { conversation } = await this.call({ cmd: "open_direct", peer_id: peerId });
+    this.networkPane = false;
+    await this.select(conversation.id);
+  }
+
+  async requestMeshStatus() {
+    const { mesh } = await this.call({ cmd: "mesh_status" });
+    if (mesh) {
+      this.mesh = mesh;
+      this.meshUpdatedAt = Date.now();
+    }
+    return mesh;
+  }
+
+  async loadMeshPaths({ reset = false, query = this.meshPaths.query } = {}) {
+    const offset = reset ? 0 : this.meshPaths.rows.length;
+    this.meshPaths = { ...this.meshPaths, loading: true, error: null, query };
+    try {
+      const data = await this.call({
+        cmd: "mesh_paths",
+        query: query || null,
+        offset,
+        limit: 100,
+      });
+      this.meshPaths = {
+        rows: reset ? data.paths : [...this.meshPaths.rows, ...data.paths],
+        total: data.total,
+        truncated: Boolean(data.truncated),
+        query,
+        loading: false,
+        error: null,
+      };
+    } catch (err) {
+      this.meshPaths = {
+        ...this.meshPaths,
+        loading: false,
+        error: err?.message ?? String(err),
+      };
+    }
+  }
+
+  setMeshPathQuery(query) {
+    this.meshPaths = { ...this.meshPaths, rows: [], total: 0, query };
+  }
+
+  /// Refresh the rows already on screen without collapsing an infinite scroll
+  /// back to the first page.
+  async refreshMeshPaths() {
+    const limit = Math.min(500, Math.max(100, this.meshPaths.rows.length));
+    try {
+      const data = await this.call({
+        cmd: "mesh_paths",
+        query: this.meshPaths.query || null,
+        offset: 0,
+        limit,
+      });
+      this.meshPaths = {
+        ...this.meshPaths,
+        rows: data.paths,
+        total: data.total,
+        truncated: Boolean(data.truncated),
+        error: null,
+      };
+    } catch (err) {
+      this.meshPaths = {
+        ...this.meshPaths,
+        error: err?.message ?? String(err),
+      };
+    }
+  }
+
+  async loadAnnounces({ reset = false } = {}) {
+    const before = reset
+      ? null
+      : this.meshAnnounces[this.meshAnnounces.length - 1]?.last_seen;
+    if (this.announcesLoading) return;
+    this.announcesLoading = true;
+    try {
+      const data = await this.call({
+        cmd: "mesh_announces",
+        before: before ?? null,
+        limit: 100,
+      });
+      this.meshAnnounces = reset
+        ? data.announces
+        : [...this.meshAnnounces, ...data.announces];
+    } catch (err) {
+      this.toast(err?.message ?? String(err));
+    } finally {
+      this.announcesLoading = false;
+    }
+  }
+
+  upsertAnnounce(announce) {
+    if (!announce?.address) return;
+    this.pendingAnnounces.set(`${announce.address}:${announce.bucket}`, announce);
+    if (this.announceTimer) return;
+    // Announce storms arrive in bursts; batch them into one render.
+    this.announceTimer = setTimeout(() => {
+      this.announceTimer = null;
+      this.flushAnnounces();
+    }, 250);
+  }
+
+  flushAnnounces() {
+    if (!this.pendingAnnounces.size) return;
+    const pending = this.pendingAnnounces;
+    this.pendingAnnounces = new Map();
+    const list = this.meshAnnounces.slice();
+    const index = new Map(
+      list.map((item, at) => [`${item.address}:${item.bucket}`, at]),
+    );
+    for (const [key, announce] of pending) {
+      const at = index.get(key);
+      if (at != null) list[at] = announce;
+      else list.unshift(announce);
+    }
+    list.sort((a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0));
+    this.meshAnnounces = list.slice(0, 500);
+  }
+
+  async loadInterfaces() {
+    try {
+      const data = await this.call({ cmd: "list_interfaces" });
+      this.interfaces = data.interfaces ?? [];
+      this.interfaceExtra = data.extra ?? [];
+      this.interfaceReadOnly = data.read_only ?? null;
+    } catch (err) {
+      // Offline: keep whatever we had and let the page explain why edits fail.
+      if (this.transport === "ready") this.toast(err?.message ?? String(err));
+    }
+  }
+
+  async describeInterfaces() {
+    if (this.interfaceTypes) return this.interfaceTypes;
+    const data = await this.call({ cmd: "describe_interfaces" });
+    this.interfaceTypes = data.types ?? [];
+    this.interfaceReadOnly = data.read_only ?? this.interfaceReadOnly;
+    return this.interfaceTypes;
+  }
+
+  async listDevices(kind = "serial") {
+    if (this.devices.loaded) return this.devices;
+    try {
+      const data = await this.call({ cmd: "list_devices", kind });
+      this.devices = {
+        serial: data.devices ?? [],
+        reason: data.reason ?? null,
+        loaded: true,
+      };
+    } catch (err) {
+      this.devices = { serial: [], reason: err?.message ?? String(err), loaded: true };
+    }
+    return this.devices;
+  }
+
+  async createInterface(name, kind, config) {
+    const { interface: row } = await this.call(
+      {
+        cmd: "create_interface",
+        name,
+        kind,
+        config,
+      },
+      30000,
+    );
+    await this.loadInterfaces();
+    return row;
+  }
+
+  async updateInterface(interfaceId, config) {
+    const { interface: row } = await this.call(
+      {
+        cmd: "update_interface",
+        interface_id: interfaceId,
+        config,
+      },
+      30000,
+    );
+    await this.loadInterfaces();
+    return row;
+  }
+
+  async setInterfaceEnabled(interfaceId, enabled) {
+    const { interface: row } = await this.call(
+      {
+        cmd: "set_interface_enabled",
+        interface_id: interfaceId,
+        enabled,
+      },
+      30000,
+    );
+    await this.loadInterfaces();
+    return row;
+  }
+
+  async deleteInterface(interfaceId) {
+    await this.call({ cmd: "delete_interface", interface_id: interfaceId }, 30000);
+    await this.loadInterfaces();
+  }
+
+  meshInterface(name) {
+    return this.mesh?.interfaces?.find((item) => item.name === name) ?? null;
+  }
+
+  /// The engine's reachability row for a peer, or null when it has no address
+  /// yet (or an older engine did not send the rows).
+  peerReachability(peer) {
+    const address = peer?.address;
+    if (!address) return null;
+    return (
+      this.mesh?.peer_reachability?.find((row) => row.address === address) ?? null
+    );
+  }
+
+  /// Contacts are addressed by hash, or by their row id in some replies.
+  peerByAddress(address) {
+    if (!address) return null;
+    return (
+      this.peers.find(
+        (item) => item.address === address || item.id === address,
+      ) ?? null
+    );
   }
 
   async select(conversationId) {
@@ -874,8 +1171,15 @@ class ChatStore {
 
   peerLabel(peerId) {
     if (!peerId) return "unknown";
-    const peer = this.peers.find((item) => item.id === peerId || item.address === peerId);
+    const peer = this.peerById(peerId);
     return peer?.nickname || peer?.announced_name || peerId.slice(0, 8);
+  }
+
+  peerById(peerId) {
+    if (!peerId) return null;
+    return (
+      this.peers.find((item) => item.id === peerId || item.address === peerId) ?? null
+    );
   }
 
   conversationTitle(conversation) {

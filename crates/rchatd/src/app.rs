@@ -20,19 +20,27 @@ use rchat_core::attachments::{
 use rchat_core::now_ms;
 use rchat_core::store::Store;
 use rchat_ipc::{
-    AttachmentInfo, ClientCmd, Command, IdentityInfo, MessageInfo, PeerInfo, ServerMsg, Snapshot,
-    TransportState, PROTOCOL_VERSION,
+    AttachmentInfo, ClientCmd, Command, IdentityInfo, InterfaceRow, MeshCounters, MeshInterface,
+    MeshStatus, MessageInfo, PathEntry, PeerInfo, PeerPath, PeerReachability, ServerMsg,
+    ServiceEntry, Snapshot, TransportState, PROTOCOL_VERSION,
 };
 use rchat_rns::{BridgeAttachment, BridgeEvent};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path as FilePath;
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::time::{timeout, Duration};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, warn};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a token-correlated bridge request may take before the engine gives
+/// up. Applying an interface can involve a TCP connect, so it is generous.
+const BRIDGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Total attachment bytes one message may carry over a fast peer. A judgement
 /// call: a phone photo fits, and an IP link delivers it.
@@ -77,6 +85,8 @@ pub fn peer_limit(bandwidth_class: &str) -> u64 {
     }
 }
 
+/// The minimal path table the bridge samples, cached wholesale. Clients page it
+/// through [`ClientCmd::MeshPaths`]; only known peers appear in `MeshStatus`.
 pub struct AppState {
     pub store: Arc<Store>,
     pub token: String,
@@ -85,6 +95,56 @@ pub struct AppState {
     pub tx: broadcast::Sender<String>,
     pub rns: RwLock<Option<mpsc::UnboundedSender<String>>>,
     pub transport: RwLock<TransportState>,
+    mesh: RwLock<MeshCache>,
+    bridge_pending: Mutex<HashMap<u64, oneshot::Sender<BridgeAnswer>>>,
+    bridge_token: AtomicU64,
+    descriptor: RwLock<Option<Value>>,
+    /// Network settings an older shell carried over, kept until the config
+    /// import has had its turn.
+    pub legacy_network: RwLock<Option<rchat_core::store::LegacyNetwork>>,
+}
+
+struct BridgeAnswer {
+    ok: bool,
+    data: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct MeshCache {
+    transport: String,
+    address: Option<String>,
+    started_at: Option<i64>,
+    interfaces: Vec<MeshInterface>,
+    counters: MeshCounters,
+    paths: Vec<PathEntry>,
+    path_total: u64,
+    paths_truncated: bool,
+    other_services: Vec<ServiceEntry>,
+}
+
+/// The bridge's `mesh` payload. The engine keeps the full path table here and
+/// hands out smaller, queryable views.
+#[derive(Debug, Deserialize)]
+struct BridgeMesh {
+    #[serde(default)]
+    transport: String,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    started_at: Option<i64>,
+    #[serde(default)]
+    interfaces: Vec<MeshInterface>,
+    #[serde(default)]
+    counters: MeshCounters,
+    #[serde(default)]
+    path_total: u64,
+    #[serde(default)]
+    paths_truncated: bool,
+    #[serde(default)]
+    paths: Vec<PathEntry>,
+    #[serde(default)]
+    other_services: Vec<ServiceEntry>,
 }
 
 impl AppState {
@@ -97,6 +157,14 @@ impl AppState {
             tx,
             rns: RwLock::new(None),
             transport: RwLock::new(TransportState::Offline),
+            mesh: RwLock::new(MeshCache {
+                transport: "offline".into(),
+                ..Default::default()
+            }),
+            bridge_pending: Mutex::new(HashMap::new()),
+            bridge_token: AtomicU64::new(1),
+            descriptor: RwLock::new(None),
+            legacy_network: RwLock::new(None),
         }
     }
 
@@ -139,6 +207,7 @@ impl AppState {
                     transport: *self.transport.read().await,
                     conversations: self.store.list_conversations()?,
                     peers: self.store.list_peers()?,
+                    mesh: Some(self.mesh_status().await?),
                 };
                 Ok(serde_json::to_value(snapshot)?)
             }
@@ -244,6 +313,49 @@ impl AppState {
                 let events = self.store.events_since(seq)?;
                 Ok(json!({ "events": events }))
             }
+            ClientCmd::MeshStatus => Ok(json!({ "mesh": self.mesh_status().await? })),
+            ClientCmd::MeshPaths {
+                query,
+                offset,
+                limit,
+            } => self.mesh_paths(query, offset, limit).await,
+            ClientCmd::MeshAnnounces { before, limit } => {
+                let announces = self.store.list_announces(before, limit.unwrap_or(100))?;
+                Ok(json!({ "announces": announces }))
+            }
+            ClientCmd::DescribeInterfaces => Ok(self.describe_interfaces().await?),
+            ClientCmd::ListInterfaces => {
+                let interfaces = self.store.list_interfaces()?;
+                let extra: Vec<Value> = self
+                    .store
+                    .extra_config()?
+                    .into_iter()
+                    .map(|(section, raw)| json!({ "section": section, "raw": raw }))
+                    .collect();
+                let read_only = self.interface_read_only(None).await;
+                Ok(json!({
+                    "interfaces": interfaces,
+                    "extra": extra,
+                    "read_only": read_only,
+                }))
+            }
+            ClientCmd::CreateInterface {
+                name,
+                kind,
+                config,
+            } => self.create_interface(name, kind, config).await,
+            ClientCmd::UpdateInterface {
+                interface_id,
+                config,
+            } => self.update_interface(&interface_id, config).await,
+            ClientCmd::SetInterfaceEnabled {
+                interface_id,
+                enabled,
+            } => self.set_interface_enabled(&interface_id, enabled).await,
+            ClientCmd::DeleteInterface { interface_id } => {
+                self.delete_interface(&interface_id).await
+            }
+            ClientCmd::ListDevices { kind } => self.list_devices(&kind).await,
         }
     }
 
@@ -432,7 +544,17 @@ impl AppState {
                 name,
                 detail,
             } => {
-                *self.transport.write().await = state;
+                let derived = {
+                    let mut mesh = self.mesh.write().await;
+                    mesh.transport = state.as_str().to_string();
+                    if address.is_some() {
+                        mesh.address = address.clone();
+                    }
+                    derived_transport(&mesh.transport, &mesh.interfaces)
+                };
+                *self.transport.write().await = derived;
+                // A new connection may speak a different RNS version.
+                *self.descriptor.write().await = None;
                 if let Some(address) = address.as_deref() {
                     if let Err(err) = self.store.set_address(Some(address)) {
                         warn!(error = %err, "could not persist transport address");
@@ -446,10 +568,44 @@ impl AppState {
                 }
                 let _ = self.publish(
                     "transport.state",
-                    json!({ "transport": state, "address": address, "detail": detail }),
+                    json!({
+                        "transport": derived,
+                        "address": address,
+                        "detail": detail.or_else(|| derived_detail(derived)),
+                    }),
                 );
+                let _ = self.publish_mesh().await;
                 if state == TransportState::Ready {
-                    self.flush_queued().await;
+                    // Requests need the event pump to keep draining bridge
+                    // replies, so this cannot run inline.
+                    let state = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = state.ensure_bridge_config().await {
+                            warn!(error = %err, "could not configure the bridge");
+                        }
+                        state.flush_queued().await;
+                    });
+                }
+                if state == TransportState::Starting {
+                    // A managed bridge waits briefly for its interface set
+                    // before starting Reticulum, so send it now rather than
+                    // after `ready` and pay the grace period on every launch.
+                    // No rows means a hand-written config owns the list, and
+                    // rendering an empty one here would destroy it.
+                    let state = self.clone();
+                    tokio::spawn(async move {
+                        match state.store.list_interfaces() {
+                            Ok(rows) if !rows.is_empty() => {
+                                if let Err(err) = state.apply_rows(&rows).await {
+                                    warn!(error = %err, "could not preconfigure the bridge");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                warn!(error = %err, "could not read interfaces");
+                            }
+                        }
+                    });
                 }
             }
             BridgeEvent::Message {
@@ -466,7 +622,13 @@ impl AppState {
                     warn!(error = %err, "failed to store incoming message");
                 }
             }
-            BridgeEvent::Announce { address, name } => {
+            BridgeEvent::Announce {
+                address,
+                name,
+                aspect,
+                interface,
+                hops,
+            } => {
                 if address.len() != 32 {
                     return;
                 }
@@ -476,20 +638,95 @@ impl AppState {
                         return;
                     }
                 }
-                let peer = PeerInfo {
-                    id: address.clone(),
-                    address: Some(address.clone()),
-                    nickname: None,
-                    announced_name: name,
-                    last_seen: Some(now_ms()),
-                    bandwidth_class: "unknown".into(),
-                    caps: Default::default(),
+                let ts = now_ms();
+                match self.store.record_announce(
+                    &address,
+                    name.as_deref(),
+                    aspect.as_deref(),
+                    interface.as_deref(),
+                    hops,
+                    ts,
+                ) {
+                    Ok(sighting) => {
+                        let _ = self.publish(
+                            "announce.received",
+                            json!({ "announce": sighting }),
+                        );
+                    }
+                    Err(err) => warn!(error = %err, "could not record announce"),
+                }
+                // Keep the existing bandwidth class: it comes from the path
+                // table, not from this announce.
+                let peer = match self.store.peer_by_address(&address) {
+                    Ok(Some(mut peer)) => {
+                        if name.is_some() {
+                            peer.announced_name = name;
+                        }
+                        peer.last_seen = Some(ts);
+                        peer
+                    }
+                    Ok(None) => PeerInfo {
+                        id: address.clone(),
+                        address: Some(address.clone()),
+                        nickname: None,
+                        announced_name: name,
+                        last_seen: Some(ts),
+                        bandwidth_class: "unknown".into(),
+                        caps: Default::default(),
+                    },
+                    Err(err) => {
+                        warn!(error = %err, "could not read announced peer");
+                        return;
+                    }
                 };
                 if let Err(err) = self.store.upsert_peer(&peer) {
                     warn!(error = %err, "could not store announced peer");
                     return;
                 }
                 let _ = self.publish("peer.updated", json!({ "peer": peer }));
+            }
+            BridgeEvent::Mesh { mesh } => {
+                match serde_json::from_value::<BridgeMesh>(mesh) {
+                    Ok(payload) => {
+                        {
+                            let mut cache = self.mesh.write().await;
+                            if !payload.transport.is_empty() {
+                                cache.transport = payload.transport;
+                            }
+                            if payload.address.is_some() {
+                                cache.address = payload.address;
+                            }
+                            if payload.started_at.is_some() {
+                                cache.started_at = payload.started_at;
+                            }
+                            cache.interfaces = payload.interfaces;
+                            cache.counters = payload.counters;
+                            cache.paths = payload.paths;
+                            cache.path_total = payload.path_total;
+                            cache.paths_truncated = payload.paths_truncated;
+                            cache.other_services = payload.other_services;
+                        }
+                        // Interfaces decide whether the mesh can carry anything,
+                        // so the transport word follows the sample.
+                        self.sync_transport().await;
+                        if let Err(err) = self.publish_mesh().await {
+                            warn!(error = %err, "could not publish mesh state");
+                        }
+                        self.refresh_bandwidth_classes().await;
+                    }
+                    Err(err) => warn!(error = %err, "could not parse the bridge mesh event"),
+                }
+            }
+            BridgeEvent::Reply {
+                token,
+                ok,
+                data,
+                error,
+            } => {
+                let waiter = self.bridge_pending.lock().unwrap().remove(&token);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(BridgeAnswer { ok, data, error });
+                }
             }
             BridgeEvent::Receipt { id, state } => {
                 let mapped = match state.as_str() {
@@ -515,6 +752,507 @@ impl AppState {
                 debug!(level, message, "bridge");
             }
         }
+    }
+
+    /// Build and broadcast the client-facing mesh picture. Cheap enough to do
+    /// on every bridge sample: only known peers are included, not the table.
+    async fn publish_mesh(&self) -> Result<()> {
+        let mesh = self.mesh_status().await?;
+        self.publish("mesh.updated", json!({ "mesh": mesh }))?;
+        Ok(())
+    }
+
+    /// Re-derive the transport word from the cached interface sample and tell
+    /// clients when it moved. Called on every mesh sample, so a relay that goes
+    /// quiet turns the status to `degraded` without waiting for a bridge
+    /// restart or a client poll.
+    async fn sync_transport(&self) {
+        let (next, address) = {
+            let cache = self.mesh.read().await;
+            (
+                derived_transport(&cache.transport, &cache.interfaces),
+                cache.address.clone(),
+            )
+        };
+        let changed = {
+            let mut current = self.transport.write().await;
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        };
+        if changed {
+            let _ = self.publish(
+                "transport.state",
+                json!({
+                    "transport": next,
+                    "address": address,
+                    "detail": derived_detail(next),
+                }),
+            );
+        }
+    }
+
+    async fn mesh_status(&self) -> Result<MeshStatus> {
+        let cache = self.mesh.read().await;
+        let peers = self.store.list_peers()?;
+        let by_address: HashMap<&str, &PeerInfo> = peers
+            .iter()
+            .filter_map(|peer| peer.address.as_deref().map(|address| (address, peer)))
+            .collect();
+        let peer_paths = cache
+            .paths
+            .iter()
+            .filter_map(|path| by_address.get(path.destination.as_str()).map(|_| path))
+            .map(|path| PeerPath {
+                address: path.destination.clone(),
+                hops: path.hops,
+                next_hop: path.next_hop.clone(),
+                interface: path.interface.clone(),
+                bitrate: path.bitrate,
+                state: path.state.clone(),
+                age: path.age,
+            })
+            .collect();
+        // Every known peer, not only the ones with a path: "outside, no route"
+        // is the answer that stops a user waiting for something undeliverable.
+        let paths_by_destination: HashMap<&str, &PathEntry> = cache
+            .paths
+            .iter()
+            .map(|path| (path.destination.as_str(), path))
+            .collect();
+        let peer_reachability = peers
+            .iter()
+            .filter_map(|peer| {
+                let address = peer.address.as_deref()?;
+                let path = paths_by_destination.get(address).copied();
+                Some(PeerReachability {
+                    address: address.to_string(),
+                    path: path.is_some(),
+                    hops: path.map(|path| path.hops),
+                    next_hop: path.map(|path| path.next_hop.clone()),
+                    interface: path.map(|path| path.interface.clone()),
+                    bitrate: path.and_then(|path| path.bitrate),
+                    state: path
+                        .map(|path| path.state.clone())
+                        .unwrap_or_else(|| "none".to_string()),
+                    last_announce: peer.last_seen,
+                })
+            })
+            .collect();
+        let mut counters = cache.counters.clone();
+        counters.path_count = cache.path_total;
+        let transport = derived_transport(&cache.transport, &cache.interfaces)
+            .as_str()
+            .to_string();
+        Ok(MeshStatus {
+            transport,
+            address: cache.address.clone(),
+            started_at: cache.started_at,
+            interfaces: cache.interfaces.clone(),
+            counters,
+            peer_paths,
+            peer_reachability,
+            other_services: cache.other_services.clone(),
+        })
+    }
+
+    /// Page the cached path table. Ordered by hops, then most recently used.
+    async fn mesh_paths(
+        &self,
+        query: Option<String>,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Value> {
+        let peers = self.store.list_peers()?;
+        let by_address: HashMap<String, &PeerInfo> = peers
+            .iter()
+            .filter_map(|peer| peer.address.clone().map(|address| (address, peer)))
+            .collect();
+        let needle = query.unwrap_or_default().trim().to_lowercase();
+        let (paths, total, truncated) = {
+            let cache = self.mesh.read().await;
+            let mut filtered: Vec<PathEntry> = cache
+                .paths
+                .iter()
+                .filter(|path| {
+                    if needle.is_empty() {
+                        return true;
+                    }
+                    if path.destination.to_lowercase().starts_with(&needle) {
+                        return true;
+                    }
+                    if path.interface.to_lowercase().contains(&needle) {
+                        return true;
+                    }
+                    by_address
+                        .get(&path.destination)
+                        .map(|peer| peer.label().to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            for path in &mut filtered {
+                if let Some(peer) = by_address.get(&path.destination) {
+                    path.name = Some(peer.label());
+                }
+            }
+            filtered.sort_by(|a, b| {
+                a.hops.cmp(&b.hops).then(
+                    a.age
+                        .partial_cmp(&b.age)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            });
+            let total = filtered.len();
+            let offset = offset.unwrap_or(0) as usize;
+            let limit = limit.unwrap_or(100).clamp(1, 500) as usize;
+            (
+                filtered.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                total,
+                cache.paths_truncated,
+            )
+        };
+        Ok(json!({ "paths": paths, "total": total, "truncated": truncated }))
+    }
+
+    /// Turn a path's interface bitrate into the coarse class the peer badge
+    /// shows, and publish only when it actually moved.
+    async fn refresh_bandwidth_classes(&self) {
+        let paths = self.mesh.read().await.paths.clone();
+        let peers = match self.store.list_peers() {
+            Ok(peers) => peers,
+            Err(err) => {
+                warn!(error = %err, "could not read peers for bandwidth classes");
+                return;
+            }
+        };
+        let by_address: HashMap<&str, &PeerInfo> = peers
+            .iter()
+            .filter_map(|peer| peer.address.as_deref().map(|address| (address, peer)))
+            .collect();
+        let live: std::collections::HashSet<&str> = paths
+            .iter()
+            .map(|path| path.destination.as_str())
+            .collect();
+        for path in &paths {
+            let Some(peer) = by_address.get(path.destination.as_str()) else {
+                continue;
+            };
+            let class = bandwidth_class(path.bitrate);
+            if peer.bandwidth_class == class {
+                continue;
+            }
+            match self.store.update_peer_bandwidth(&peer.id, class) {
+                Ok(true) => {
+                    let mut updated = (*peer).clone();
+                    updated.bandwidth_class = class.to_string();
+                    let _ = self.publish("peer.updated", json!({ "peer": updated }));
+                }
+                Ok(false) => {}
+                Err(err) => warn!(error = %err, "could not update peer bandwidth class"),
+            }
+        }
+        // A peer whose path went away is no longer classifiable.
+        for peer in &peers {
+            let Some(address) = peer.address.as_deref() else {
+                continue;
+            };
+            if live.contains(address) || peer.bandwidth_class == "unknown" {
+                continue;
+            }
+            if let Ok(true) = self.store.update_peer_bandwidth(&peer.id, "unknown") {
+                let mut updated = (*peer).clone();
+                updated.bandwidth_class = "unknown".into();
+                let _ = self.publish("peer.updated", json!({ "peer": updated }));
+            }
+        }
+    }
+
+    /// Send a token-correlated request to the bridge and await its answer.
+    async fn bridge_request(&self, mut payload: Value, wait: Duration) -> Result<Value> {
+        let sender = self
+            .rns
+            .read()
+            .await
+            .clone()
+            .context("the Reticulum bridge is not running")?;
+        if !payload.is_object() {
+            bail!("bridge requests must be JSON objects");
+        }
+        let token = self.bridge_token.fetch_add(1, Ordering::Relaxed);
+        payload["token"] = json!(token);
+        let (tx, rx) = oneshot::channel();
+        self.bridge_pending.lock().unwrap().insert(token, tx);
+        if sender.send(payload.to_string()).is_err() {
+            self.bridge_pending.lock().unwrap().remove(&token);
+            bail!("the Reticulum bridge is not accepting commands");
+        }
+        match timeout(wait, rx).await {
+            Ok(Ok(answer)) if answer.ok => Ok(answer.data.unwrap_or_else(|| json!({}))),
+            Ok(Ok(answer)) => Err(anyhow!(
+                answer
+                    .error
+                    .unwrap_or_else(|| "the Reticulum bridge rejected the request".into())
+            )),
+            Ok(Err(_)) => bail!("the Reticulum bridge dropped the request"),
+            Err(_) => {
+                self.bridge_pending.lock().unwrap().remove(&token);
+                bail!("the Reticulum bridge did not answer in time")
+            }
+        }
+    }
+
+    /// First start after an upgrade imports the hand-written config once, then
+    /// every bridge start receives the same rows so a restarted bridge comes up
+    /// with identical interfaces.
+    async fn ensure_bridge_config(&self) -> Result<()> {
+        let imported = self
+            .store
+            .meta("mesh_config_imported")?
+            .as_deref()
+            == Some("1");
+        if !imported {
+            match self
+                .bridge_request(json!({ "cmd": "import_config" }), Duration::from_secs(10))
+                .await
+            {
+                Ok(data) => {
+                    if let Some(items) = data.get("interfaces").and_then(Value::as_array) {
+                        for item in items {
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let kind = item
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let config = item
+                                .get("config")
+                                .cloned()
+                                .unwrap_or_else(|| json!({}));
+                            if name.is_empty() || kind.is_empty() || !config.is_object() {
+                                continue;
+                            }
+                            if self.store.interface_by_name(&name)?.is_some() {
+                                continue;
+                            }
+                            let enabled = item
+                                .get("enabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(true);
+                            if let Err(err) = self.store.create_interface(
+                                &name,
+                                &kind,
+                                &config,
+                                enabled,
+                                "imported",
+                            ) {
+                                warn!(name, error = %err, "could not import interface");
+                            }
+                        }
+                    }
+                    if let Some(blocks) = data.get("extra").and_then(Value::as_array) {
+                        let mut extra = Vec::new();
+                        for block in blocks {
+                            let Some(pair) = block.as_array() else { continue };
+                            let (Some(section), Some(raw)) =
+                                (pair.first().and_then(Value::as_str), pair.get(1).and_then(Value::as_str))
+                            else {
+                                continue;
+                            };
+                            extra.push((section.to_string(), raw.to_string()));
+                        }
+                        self.store.replace_extra_config(&extra)?;
+                    }
+                    self.store.set_meta("mesh_config_imported", "1")?;
+                    debug!("imported the existing Reticulum interface configuration");
+                }
+                Err(err) => warn!(error = %err, "could not import rns/config"),
+            }
+        }
+
+        let rows = self.store.list_interfaces()?;
+        if rows.is_empty() {
+            // A config that existed was authoritative until now. Once it has
+            // been read (or if it had no interfaces at all), finish first-run
+            // setup so a fresh install still starts with discovery.
+            let legacy = self.legacy_network.read().await.clone();
+            let rows = self
+                .store
+                .import_network_once(legacy.as_ref(), false)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            return self.apply_rows(&rows).await;
+        }
+        self.apply_rows(&rows).await
+    }
+
+    async fn apply_rows(&self, rows: &[InterfaceRow]) -> Result<()> {
+        let extra = self.store.extra_config()?;
+        let payload = json!({
+            "cmd": "configure",
+            "interfaces": rows,
+            "extra": extra,
+        });
+        self.bridge_request(payload, BRIDGE_REQUEST_TIMEOUT).await?;
+        Ok(())
+    }
+
+    /// Apply the desired set, telling every client which interface was
+    /// refused. The row is not persisted, so the page keeps the user's edits.
+    async fn apply_or_report(&self, rows: &[InterfaceRow], name: &str) -> Result<()> {
+        if let Err(err) = self.apply_rows(rows).await {
+            let _ = self.publish(
+                "interface.apply_failed",
+                json!({ "name": name, "error": err.to_string() }),
+            );
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn describe_interfaces(&self) -> Result<Value> {
+        if let Some(cached) = self.descriptor.read().await.clone() {
+            return Ok(cached);
+        }
+        let data = self
+            .bridge_request(json!({ "cmd": "describe" }), Duration::from_secs(10))
+            .await?;
+        *self.descriptor.write().await = Some(data.clone());
+        Ok(data)
+    }
+
+    /// Why interface changes are unavailable, if they are. The bridge owns the
+    /// answer: RNS refuses some types outright, and a shared instance owns its
+    /// own interfaces. `None` means edits are allowed.
+    async fn interface_read_only(&self, kind: Option<&str>) -> Option<String> {
+        match self.describe_interfaces().await {
+            Ok(descriptor) => read_only_from_descriptor(&descriptor, kind),
+            Err(_) => Some(BRIDGE_OFFLINE_REASON.to_string()),
+        }
+    }
+
+    async fn list_devices(&self, kind: &str) -> Result<Value> {
+        self.bridge_request(
+            json!({ "cmd": "list_devices", "kind": kind }),
+            Duration::from_secs(10),
+        )
+        .await
+    }
+
+    async fn create_interface(&self, name: String, kind: String, config: Value) -> Result<Value> {
+        validate_interface_name(&name)?;
+        let kind = kind.trim().to_string();
+        if kind.is_empty() {
+            bail!("choose an interface type");
+        }
+        check_config(&config)?;
+        validate_interface_config(&kind, &config)?;
+        let name = name.trim().to_string();
+        if let Some(reason) = self.interface_read_only(Some(&kind)).await {
+            bail!("{reason}");
+        }
+        if self.store.interface_by_name(&name)?.is_some() {
+            bail!("an interface named \"{name}\" already exists");
+        }
+        let mut rows = self.store.list_interfaces()?;
+        let row = InterfaceRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            kind,
+            config,
+            enabled: true,
+            origin: "managed".into(),
+            note: None,
+        };
+        rows.push(row.clone());
+        self.apply_or_report(&rows, &row.name).await?;
+        self.store.insert_interface_row(&row)?;
+        self.publish("interface.changed", json!({ "interface": row }))?;
+        Ok(json!({ "interface": row }))
+    }
+
+    async fn update_interface(&self, id: &str, config: Value) -> Result<Value> {
+        check_config(&config)?;
+        let existing = self
+            .store
+            .interface(id)?
+            .with_context(|| format!("unknown interface: {id}"))?;
+        validate_interface_config(&existing.kind, &config)?;
+        if let Some(reason) = self.interface_read_only(Some(&existing.kind)).await {
+            bail!("{reason}");
+        }
+        let name = existing.name.clone();
+        let candidate = InterfaceRow {
+            config: config.clone(),
+            ..existing
+        };
+        let rows: Vec<InterfaceRow> = self
+            .store
+            .list_interfaces()?
+            .into_iter()
+            .map(|row| if row.id == id { candidate.clone() } else { row })
+            .collect();
+        self.apply_or_report(&rows, &name).await?;
+        let saved = self.store.update_interface_config(id, &config)?;
+        self.publish("interface.changed", json!({ "interface": saved }))?;
+        Ok(json!({ "interface": saved }))
+    }
+
+    async fn set_interface_enabled(&self, id: &str, enabled: bool) -> Result<Value> {
+        let existing = self
+            .store
+            .interface(id)?
+            .with_context(|| format!("unknown interface: {id}"))?;
+        if existing.enabled == enabled {
+            return Ok(json!({ "interface": existing }));
+        }
+        if let Some(reason) = self.interface_read_only(Some(&existing.kind)).await {
+            bail!("{reason}");
+        }
+        let rows: Vec<InterfaceRow> = self
+            .store
+            .list_interfaces()?
+            .into_iter()
+            .map(|row| {
+                if row.id == id {
+                    InterfaceRow { enabled, ..row }
+                } else {
+                    row
+                }
+            })
+            .collect();
+        self.apply_or_report(&rows, &existing.name).await?;
+        let saved = self.store.set_interface_enabled(id, enabled)?;
+        self.publish("interface.changed", json!({ "interface": saved }))?;
+        Ok(json!({ "interface": saved }))
+    }
+
+    async fn delete_interface(&self, id: &str) -> Result<Value> {
+        // Not gated on read-only: deleting a row is how a user stops rchat
+        // owning an interface RNS refuses to detach. The apply still fails and
+        // rolls back if the live instance will not let it go.
+        let existing = self
+            .store
+            .interface(id)?
+            .with_context(|| format!("unknown interface: {id}"))?;
+        let rows: Vec<InterfaceRow> = self
+            .store
+            .list_interfaces()?
+            .into_iter()
+            .filter(|row| row.id != id)
+            .collect();
+        self.apply_or_report(&rows, &existing.name).await?;
+        self.store.delete_interface(id)?;
+        self.publish("interface.changed", json!({ "deleted": id }))?;
+        Ok(json!({ "deleted": id, "interface": existing }))
     }
 
     /// Attach the bytes' presence to descriptors before they reach a client.
@@ -1063,6 +1801,16 @@ fn token_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
+/// Coarse link class derived from the interface bitrate of the peer's path.
+fn bandwidth_class(bitrate: Option<u64>) -> &'static str {
+    match bitrate {
+        Some(rate) if rate >= 1_000_000 => "lan",
+        Some(rate) if rate >= 10_000 => "relay",
+        Some(_) => "radio",
+        None => "unknown",
+    }
+}
+
 /// A message's kind follows what it carries; a caption does not make it text.
 fn message_kind(attachments: &[AttachmentInfo]) -> &'static str {
     if attachments.is_empty() {
@@ -1084,5 +1832,536 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{:.0} KB", value / KB)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn validate_interface_name(name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("give the interface a name");
+    }
+    if name.chars().count() > 64 {
+        bail!("interface names are limited to 64 characters");
+    }
+    if name.contains('[') || name.contains(']') || name.contains('\n') || name.contains('\r') {
+        bail!("interface names cannot contain [ ], or line breaks");
+    }
+    Ok(())
+}
+
+/// Refuse the shapes Reticulum would only reject later, while the form still
+/// has the user's text. The bridge stays authoritative for everything else.
+fn validate_interface_config(kind: &str, config: &Value) -> Result<()> {
+    let Some(map) = config.as_object() else {
+        bail!("interface settings must be a JSON object");
+    };
+    for (key, value) in map {
+        if key.ends_with("_port") {
+            // `port` itself is a device path on radio types, so it is not a
+            // network port. The form writes network ports as numbers.
+            let Some(port) = value.as_u64() else {
+                bail!("{key} must be a whole number");
+            };
+            if !(1..=65535).contains(&port) {
+                bail!("{key} must be between 1 and 65535");
+            }
+        }
+    }
+    for key in ["target_host", "listen_ip", "forward_ip"] {
+        if let Some(value) = map.get(key) {
+            let Some(host) = value.as_str() else {
+                bail!("{key} must be text");
+            };
+            validate_host(key, host)?;
+        }
+    }
+    if matches!(
+        kind,
+        "TCPClientInterface" | "BackboneClientInterface" | "WeaveInterface"
+    ) && map
+        .get("target_host")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .is_none()
+    {
+        bail!("a host is required");
+    }
+    Ok(())
+}
+
+fn validate_host(key: &str, host: &str) -> Result<()> {
+    let host = host.trim();
+    if host.is_empty() {
+        bail!("{key} cannot be empty");
+    }
+    if host.len() > 253 {
+        bail!("{key} is too long");
+    }
+    if host.chars().any(char::is_whitespace) || host.contains('/') || host.contains("://") {
+        bail!("{key} must be a host name or IP address, not \"{host}\"");
+    }
+    Ok(())
+}
+
+/// What clients are told about the mesh. `ready` means at least one interface
+/// is online; a bridge with nothing online is `degraded`, not a success.
+fn derived_transport(cache_transport: &str, interfaces: &[MeshInterface]) -> TransportState {
+    match cache_transport {
+        "" | "offline" => TransportState::Offline,
+        "starting" => TransportState::Starting,
+        _ => {
+            if interfaces.iter().any(|interface| interface.online) {
+                TransportState::Ready
+            } else {
+                TransportState::Degraded
+            }
+        }
+    }
+}
+
+/// The sentence that goes with a derived transport word, when the bridge has
+/// none of its own.
+fn derived_detail(state: TransportState) -> Option<String> {
+    match state {
+        TransportState::Degraded => Some(
+            "The bridge is up but no interface is online, so nothing can be sent or received"
+                .to_string(),
+        ),
+        TransportState::Offline => Some("The Reticulum bridge is not running".to_string()),
+        _ => None,
+    }
+}
+
+fn check_config(config: &Value) -> Result<()> {
+    if !config.is_object() {
+        bail!("interface configuration must be a JSON object");
+    }
+    Ok(())
+}
+
+/// Why the page cannot edit interfaces while the bridge is down.
+const BRIDGE_OFFLINE_REASON: &str =
+    "The Reticulum bridge is offline, so interface changes wait until it reconnects.";
+
+/// Pick the reason out of a `describe` reply: a shared instance refuses the
+/// whole catalogue, setup otherwise refuses individual types.
+fn read_only_from_descriptor(descriptor: &Value, kind: Option<&str>) -> Option<String> {
+    if let Some(reason) = descriptor.get("read_only").and_then(Value::as_str) {
+        return Some(reason.to_string());
+    }
+    let kind = kind?;
+    descriptor
+        .get("types")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind))
+        .and_then(|entry| entry.get("read_only"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rchat_ipc::{Caps, PathEntry};
+
+    fn peer(address: &str, class: &str) -> PeerInfo {
+        PeerInfo {
+            id: address.to_string(),
+            address: Some(address.to_string()),
+            nickname: Some("Alice".into()),
+            announced_name: Some("Alice".into()),
+            last_seen: Some(1),
+            bandwidth_class: class.into(),
+            caps: Caps::default(),
+        }
+    }
+
+    fn app() -> Arc<AppState> {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store.ensure_identity().unwrap();
+        let blobs = Arc::new(BlobStore::new(std::env::temp_dir().join(format!(
+            "rchat-app-blobs-{}-{}",
+            std::process::id(),
+            now_ms()
+        ))));
+        Arc::new(AppState::new(store, "token".into(), blobs))
+    }
+
+    async fn feed_mesh(state: &Arc<AppState>, interfaces: Value) {
+        state
+            .on_bridge_event(BridgeEvent::Mesh {
+                mesh: json!({
+                    "transport": "ready",
+                    "address": "ab".repeat(16),
+                    "interfaces": interfaces,
+                    "counters": {},
+                    "paths": [],
+                    "other_services": [],
+                }),
+            })
+            .await;
+    }
+
+    fn transport_events(state: &AppState) -> Vec<Value> {
+        state
+            .store
+            .events_since(0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.name == "transport.state")
+            .map(|event| event.data)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn transport_is_degraded_until_an_interface_is_online() {
+        let state = app();
+        feed_mesh(&state, json!([])).await;
+        assert_eq!(
+            state.mesh_status().await.unwrap().transport,
+            "degraded",
+            "a bridge with no interfaces cannot carry a message"
+        );
+        assert_eq!(*state.transport.read().await, TransportState::Degraded);
+
+        feed_mesh(
+            &state,
+            json!([{ "name": "Relay", "kind": "TCPClientInterface",
+                     "online": false, "down_since": 1_760_000_000_000i64 }]),
+        )
+        .await;
+        assert_eq!(state.mesh_status().await.unwrap().transport, "degraded");
+
+        feed_mesh(
+            &state,
+            json!([{ "name": "Relay", "kind": "TCPClientInterface", "online": true }]),
+        )
+        .await;
+        assert_eq!(state.mesh_status().await.unwrap().transport, "ready");
+        assert_eq!(*state.transport.read().await, TransportState::Ready);
+
+        // Clients were told, not left to infer it from the interface list.
+        let latest = transport_events(&state).pop().expect("a transport event");
+        assert_eq!(latest["transport"], "ready");
+        let snapshot = state
+            .handle_command(ClientCmd::Snapshot)
+            .await
+            .unwrap();
+        assert_eq!(snapshot["transport"], "ready");
+        assert_eq!(snapshot["mesh"]["transport"], "ready");
+    }
+
+    #[tokio::test]
+    async fn every_known_peer_reports_whether_a_path_exists() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        let bob = "bb".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "relay")).unwrap();
+        let mut quiet = peer(&bob, "unknown");
+        quiet.last_seen = Some(1_760_000_000_000);
+        state.store.upsert_peer(&quiet).unwrap();
+
+        state
+            .on_bridge_event(BridgeEvent::Mesh {
+                mesh: json!({
+                    "transport": "ready",
+                    "interfaces": [],
+                    "counters": {},
+                    "paths": [{
+                        "destination": alice,
+                        "hops": 2,
+                        "next_hop": "cc".repeat(16),
+                        "interface": "Relay",
+                        "bitrate": 62_500,
+                        "state": "responsive",
+                        "age": 1.0,
+                    }],
+                    "other_services": [],
+                }),
+            })
+            .await;
+
+        let status = state.mesh_status().await.unwrap();
+        let reachable = status
+            .peer_reachability
+            .iter()
+            .find(|row| row.address == alice)
+            .expect("a reachable peer");
+        assert!(reachable.path);
+        assert_eq!(reachable.hops, Some(2));
+        assert_eq!(reachable.interface.as_deref(), Some("Relay"));
+        assert_eq!(reachable.state, "responsive");
+        assert_eq!(reachable.last_announce, Some(1));
+
+        let unreachable = status
+            .peer_reachability
+            .iter()
+            .find(|row| row.address == bob)
+            .expect("a known peer without a path is still reported");
+        assert!(!unreachable.path);
+        assert_eq!(unreachable.hops, None);
+        assert_eq!(unreachable.state, "none");
+        assert_eq!(
+            unreachable.last_announce,
+            Some(1_760_000_000_000),
+            "queued-for-days is visible as an old announce, not as silence"
+        );
+    }
+
+    #[test]
+    fn interface_validation_checks_host_and_port_before_applying() {
+        assert!(validate_interface_config(
+            "TCPClientInterface",
+            &json!({"target_host": "relay.example", "target_port": 4242})
+        )
+        .is_ok());
+        assert!(validate_interface_config(
+            "TCPClientInterface",
+            &json!({"target_host": "fd00::1", "target_port": 4242})
+        )
+        .is_ok());
+
+        for bad in [
+            json!({"target_host": "", "target_port": 4242}),
+            json!({"target_host": "relay.example", "target_port": 0}),
+            json!({"target_host": "relay.example", "target_port": 70_000}),
+            json!({"target_host": "relay.example", "target_port": "4242"}),
+            json!({"target_host": "relay example", "target_port": 4242}),
+            json!({"target_host": "tcp://relay.example", "target_port": 4242}),
+            json!({"target_port": 4242}),
+        ] {
+            assert!(
+                validate_interface_config("TCPClientInterface", &bad).is_err(),
+                "should be refused: {bad}"
+            );
+        }
+
+        assert!(validate_interface_config(
+            "TCPServerInterface",
+            &json!({"listen_ip": "0.0.0.0", "listen_port": 4242})
+        )
+        .is_ok());
+        assert!(validate_interface_config("TCPServerInterface", &json!({"listen_port": 0})).is_err());
+        // Radio and local types have no address of their own to check.
+        assert!(validate_interface_config(
+            "RNodeInterface",
+            &json!({"port": "/dev/ttyUSB0", "frequency": 868_000_000})
+        )
+        .is_ok());
+        assert!(validate_interface_config("AutoInterface", &json!({"group_id": "reticulum"})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_keeps_the_stored_config_and_the_users_input() {
+        let state = app();
+        let row = state
+            .store
+            .create_interface(
+                "Relay",
+                "TCPClientInterface",
+                &json!({"target_host": "relay.example", "target_port": 4242}),
+                true,
+                "managed",
+            )
+            .unwrap();
+        let error = state
+            .handle_command(ClientCmd::UpdateInterface {
+                interface_id: row.id.clone(),
+                config: json!({"target_host": "relay.example", "target_port": 70_000}),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("port"),
+            "the refusal names the field: {error}"
+        );
+        let stored = state.store.interface(&row.id).unwrap().unwrap();
+        assert_eq!(stored.config["target_port"], 4242, "nothing was written");
+    }
+
+    #[tokio::test]
+    async fn mesh_status_only_carries_known_peers() {        let state = app();
+        let alice = "aa".repeat(16);
+        let stranger = "bb".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "unknown")).unwrap();
+        {
+            let mut cache = state.mesh.write().await;
+            cache.transport = "ready".into();
+            cache.path_total = 2;
+            cache.paths = vec![
+                PathEntry {
+                    destination: alice.clone(),
+                    name: None,
+                    hops: 2,
+                    next_hop: "cc".repeat(16),
+                    interface: "Relay".into(),
+                    bitrate: Some(62_500),
+                    state: "responsive".into(),
+                    age: 3.0,
+                    aspect: Some("lxmf.delivery".into()),
+                },
+                PathEntry {
+                    destination: stranger.clone(),
+                    name: None,
+                    hops: 1,
+                    next_hop: stranger.clone(),
+                    interface: "LAN".into(),
+                    bitrate: Some(10_000_000),
+                    state: "responsive".into(),
+                    age: 1.0,
+                    aspect: None,
+                },
+            ];
+            cache.counters.path_unresponsive = 0;
+            cache.interfaces = vec![serde_json::from_value::<MeshInterface>(json!({
+                "name": "LAN", "kind": "AutoInterface", "online": true
+            }))
+            .unwrap()];
+        }
+        let status = state.mesh_status().await.unwrap();
+        assert_eq!(status.transport, "ready");
+        assert_eq!(status.peer_paths.len(), 1);
+        assert_eq!(status.peer_paths[0].address, alice);
+        assert_eq!(status.peer_paths[0].hops, 2);
+        assert_eq!(status.counters.path_count, 2);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_class_follows_the_path_bitrate() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "unknown")).unwrap();
+        {
+            let mut cache = state.mesh.write().await;
+            cache.paths = vec![PathEntry {
+                destination: alice.clone(),
+                name: None,
+                hops: 1,
+                next_hop: alice.clone(),
+                interface: "LAN".into(),
+                bitrate: Some(10_000_000),
+                state: "responsive".into(),
+                age: 0.0,
+                aspect: None,
+            }];
+        }
+        state.refresh_bandwidth_classes().await;
+        assert_eq!(
+            state.store.peer(&alice).unwrap().unwrap().bandwidth_class,
+            "lan"
+        );
+
+        {
+            let mut cache = state.mesh.write().await;
+            cache.paths[0].bitrate = Some(62_500);
+        }
+        state.refresh_bandwidth_classes().await;
+        assert_eq!(
+            state.store.peer(&alice).unwrap().unwrap().bandwidth_class,
+            "relay"
+        );
+        assert_eq!(bandwidth_class(None), "unknown");
+        assert_eq!(bandwidth_class(Some(1200)), "radio");
+
+        // A path that goes away stops classifying the peer.
+        {
+            let mut cache = state.mesh.write().await;
+            cache.paths.clear();
+        }
+        state.refresh_bandwidth_classes().await;
+        assert_eq!(
+            state.store.peer(&alice).unwrap().unwrap().bandwidth_class,
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn mesh_paths_filter_and_page() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+        {
+            let mut cache = state.mesh.write().await;
+            cache.paths = (0..150)
+                .map(|i| PathEntry {
+                    destination: if i == 0 {
+                        alice.clone()
+                    } else {
+                        format!("{:032x}", i)
+                    },
+                    name: None,
+                    hops: if i == 0 { 4 } else { 1 },
+                    next_hop: "00".repeat(16),
+                    interface: if i == 0 { "Relay".into() } else { "LAN".into() },
+                    bitrate: None,
+                    state: "responsive".into(),
+                    age: i as f64,
+                    aspect: None,
+                })
+                .collect();
+        }
+        let page = state.mesh_paths(None, Some(0), Some(100)).await.unwrap();
+        assert_eq!(page["total"], 150);
+        assert_eq!(page["paths"].as_array().unwrap().len(), 100);
+        let next = state.mesh_paths(None, Some(100), Some(100)).await.unwrap();
+        assert_eq!(next["paths"].as_array().unwrap().len(), 50);
+
+        let by_name = state.mesh_paths(Some("alice".into()), None, None).await.unwrap();
+        assert_eq!(by_name["total"], 1);
+        assert_eq!(by_name["paths"][0]["destination"], alice);
+        assert_eq!(by_name["paths"][0]["name"], "Alice");
+
+        let by_prefix = state
+            .mesh_paths(Some(alice[..6].to_string()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(by_prefix["total"], 1);
+
+        let by_interface = state.mesh_paths(Some("relay".into()), None, None).await.unwrap();
+        assert_eq!(by_interface["total"], 1);
+    }
+
+    #[test]
+    fn interface_name_validation() {
+        assert!(validate_interface_name("Relay").is_ok());
+        assert!(validate_interface_name("  ").is_err());
+        assert!(validate_interface_name("[bad]").is_err());
+        assert!(validate_interface_name(&"x".repeat(65)).is_err());
+        assert!(check_config(&json!({"a": 1})).is_ok());
+        assert!(check_config(&json!([1])).is_err());
+    }
+
+    #[test]
+    fn read_only_reasons_come_from_the_bridge_descriptor() {
+        // A shared instance owns the whole catalogue.
+        let shared = json!({
+            "types": [{ "kind": "TCPClientInterface", "read_only": "not from here" }],
+            "read_only": "attached to a shared instance",
+        });
+        assert_eq!(
+            read_only_from_descriptor(&shared, Some("TCPClientInterface")).as_deref(),
+            Some("attached to a shared instance")
+        );
+        assert_eq!(
+            read_only_from_descriptor(&shared, None).as_deref(),
+            Some("attached to a shared instance")
+        );
+
+        // Otherwise only the refused type is marked.
+        let embedded = json!({
+            "types": [
+                { "kind": "TCPClientInterface" },
+                { "kind": "I2PInterface", "read_only": "cannot detach" },
+            ],
+        });
+        assert_eq!(read_only_from_descriptor(&embedded, Some("TCPClientInterface")), None);
+        assert_eq!(
+            read_only_from_descriptor(&embedded, Some("I2PInterface")).as_deref(),
+            Some("cannot detach")
+        );
+        assert_eq!(read_only_from_descriptor(&embedded, Some("Unknown")), None);
+        assert_eq!(read_only_from_descriptor(&embedded, None), None);
     }
 }

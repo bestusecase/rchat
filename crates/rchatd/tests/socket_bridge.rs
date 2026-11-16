@@ -64,6 +64,7 @@ async fn the_real_bridge_connects_over_the_socket() {
         port: 0,
         no_rns: false,
         bridge: BridgeMode::Attach,
+        legacy_network: None,
     })
     .await
     .expect("engine should start");

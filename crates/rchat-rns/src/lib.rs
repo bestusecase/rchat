@@ -47,6 +47,23 @@ pub enum BridgeEvent {
     Announce {
         address: String,
         name: Option<String>,
+        aspect: Option<String>,
+        interface: Option<String>,
+        hops: Option<u32>,
+    },
+    /// A sampled mesh snapshot from the bridge. The engine caches it and turns
+    /// it into the client-facing status; the bridge payload carries the full
+    /// path table, which no single client event should repeat.
+    Mesh {
+        mesh: serde_json::Value,
+    },
+    /// The answer to a token-correlated bridge request (`configure`, `describe`,
+    /// `import_config`, `list_devices`).
+    Reply {
+        token: u64,
+        ok: bool,
+        data: Option<serde_json::Value>,
+        error: Option<String>,
     },
     Receipt {
         id: String,
@@ -377,6 +394,19 @@ fn parse_event(line: &str) -> Option<BridgeEvent> {
         "announce" => Some(BridgeEvent::Announce {
             address: value.get("address").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             name: value.get("name").and_then(|v| v.as_str()).map(str::to_string),
+            aspect: value.get("aspect").and_then(|v| v.as_str()).map(str::to_string),
+            interface: value.get("interface").and_then(|v| v.as_str()).map(str::to_string),
+            hops: value
+                .get("hops")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+        }),
+        "mesh" => value.get("mesh").cloned().map(|mesh| BridgeEvent::Mesh { mesh }),
+        "bridge_reply" => Some(BridgeEvent::Reply {
+            token: value.get("token").and_then(|v| v.as_u64()).unwrap_or(0),
+            ok: value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+            data: value.get("data").cloned(),
+            error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
         }),
         "receipt" => Some(BridgeEvent::Receipt {
             id: value.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),

@@ -23,6 +23,7 @@ fn options(dir: &Path, bridge: BridgeMode) -> Options {
         port: 0,
         no_rns: false,
         bridge,
+        legacy_network: None,
     }
 }
 
@@ -80,6 +81,26 @@ async fn attach_bridge_dials_in_and_reports_ready() {
         .write_all(
             format!(
                 "{{\"ev\":\"state\",\"state\":\"ready\",\"address\":\"{address}\",\"name\":\"phone\"}}\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    // A started bridge alone is not a working mesh: until an interface reports
+    // online, the API says degraded rather than ready.
+    let body = wait_for(|body| body.contains("\"transport\":\"degraded\""), endpoint.port).await;
+    assert!(
+        body.contains(&address),
+        "the announced address should be persisted: {body}"
+    );
+
+    bridge
+        .write_all(
+            format!(
+                "{{\"ev\":\"mesh\",\"mesh\":{{\"transport\":\"ready\",\"address\":\"{address}\",\
+                  \"interfaces\":[{{\"name\":\"LAN\",\"kind\":\"AutoInterface\",\"online\":true}}],\
+                  \"counters\":{{}},\"paths\":[],\"other_services\":[]}}}}\n"
             )
             .as_bytes(),
         )
@@ -182,6 +203,84 @@ async fn engine_events_expose_incoming_messages() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A fresh install has local discovery before any configuration, and an
+/// upgrade carries the old toggle and relay into interface rows exactly once.
+#[tokio::test]
+async fn first_run_seeds_discovery_and_carries_legacy_network_settings() {
+    use rchat_core::store::{LegacyNetwork, DEFAULT_DISCOVERY_NAME, LEGACY_RELAY_NAME};
+
+    let dir = scratch_dir("first-run");
+    let legacy = LegacyNetwork {
+        auto_discovery: Some(true),
+        tcp_relay: Some("relay.example:4242".into()),
+    };
+    let start = |dir: PathBuf, legacy: Option<LegacyNetwork>| {
+        Engine::start(Options {
+            data_dir: dir,
+            port: 0,
+            no_rns: false,
+            bridge: BridgeMode::Attach,
+            legacy_network: legacy,
+        })
+    };
+
+    let engine = start(dir.clone(), Some(legacy.clone()))
+        .await
+        .expect("engine should start");
+    let rows = engine.store().list_interfaces().unwrap();
+    assert_eq!(rows.len(), 2);
+    let discovery = rows
+        .iter()
+        .find(|row| row.name == DEFAULT_DISCOVERY_NAME)
+        .expect("discovery row");
+    assert!(discovery.enabled, "discovery is on from first run");
+    let relay = rows
+        .iter()
+        .find(|row| row.name == LEGACY_RELAY_NAME)
+        .expect("legacy relay row");
+    assert_eq!(relay.config["target_host"], "relay.example");
+    assert_eq!(relay.config["target_port"], 4242);
+    assert_eq!(relay.origin, "legacy");
+    engine.stop();
+    engine.wait().await.unwrap();
+
+    // A second start supplies the same settings and must not duplicate rows.
+    let engine = start(dir.clone(), Some(legacy))
+        .await
+        .expect("engine should start again");
+    assert_eq!(engine.store().list_interfaces().unwrap().len(), 2);
+    engine.stop();
+    engine.wait().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hand-written `rns/config` is the user's, not a seed target: first-run
+/// setup leaves it and the (empty) row list alone until the bridge imports it.
+#[tokio::test]
+async fn a_hand_written_config_is_not_overwritten_by_first_run_seeding() {
+    let dir = scratch_dir("hand-written");
+    std::fs::create_dir_all(dir.join("rns")).unwrap();
+    let config = "[interfaces]\n  [[Mine]]\n    type = TCPClientInterface\n    \
+                  target_host = mine.example\n    target_port = 4242\n";
+    std::fs::write(dir.join("rns/config"), config).unwrap();
+
+    let engine = Engine::start(options(&dir, BridgeMode::Attach))
+        .await
+        .expect("engine should start");
+    assert!(
+        engine.store().list_interfaces().unwrap().is_empty(),
+        "importing the config is the bridge's job, not a reason to seed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("rns/config")).unwrap(),
+        config,
+        "the config must be byte-identical when startup is done"
+    );
+    engine.stop();
+    engine.wait().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A crash leaves `engine.lock` behind. The restart must notice the owner is
 /// gone and take over, otherwise the phone can never start the engine again.
 #[tokio::test]
@@ -196,6 +295,7 @@ async fn a_stale_lock_does_not_block_a_restart() {
             port: 0,
             no_rns: true,
             bridge: BridgeMode::None,
+            legacy_network: None,
         })
         .await
         .unwrap_or_else(|err| panic!("stale lock {contents:?} blocked start: {err}"));
@@ -217,6 +317,7 @@ async fn a_stale_lock_does_not_block_a_restart() {
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,
+        legacy_network: None,
     })
     .await
     .expect("a second engine in the same process should start");

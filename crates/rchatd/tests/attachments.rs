@@ -70,6 +70,7 @@ impl Harness {
             port: 0,
             no_rns: false,
             bridge: BridgeMode::Attach,
+            legacy_network: None,
         })
         .await
         .expect("engine should start");
@@ -626,6 +627,7 @@ async fn the_startup_sweep_keeps_referenced_blobs_and_drops_the_rest() {
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,
+        legacy_network: None,
     })
     .await
     .expect("restart should succeed");
@@ -657,6 +659,7 @@ async fn an_upload_that_was_never_sent_does_not_survive_a_restart() {
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,
+        legacy_network: None,
     })
     .await
     .expect("restart should succeed");

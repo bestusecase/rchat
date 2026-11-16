@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
         } else {
             bridge_mode()
         },
+        legacy_network: cli.legacy_network,
     })
     .await?;
 
@@ -64,6 +65,9 @@ struct Cli {
     port: u16,
     no_rns: bool,
     supervised: bool,
+    /// Network settings a shell carried over from an older release, as JSON
+    /// `{"auto_discovery": bool|null, "tcp_relay": string|null}`.
+    legacy_network: Option<rchat_core::store::LegacyNetwork>,
 }
 
 impl Cli {
@@ -75,6 +79,7 @@ impl Cli {
             .unwrap_or(8787u16);
         let mut no_rns = false;
         let mut supervised = false;
+        let mut legacy_network = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -89,12 +94,21 @@ impl Cli {
                         .parse()
                         .context("--port must be a number")?;
                 }
+                "--legacy-network" => {
+                    let raw = args.next().context("--legacy-network needs JSON")?;
+                    let parsed: LegacyNetworkArg = serde_json::from_str(&raw)
+                        .context("--legacy-network must be a JSON object")?;
+                    legacy_network = Some(parsed.into());
+                }
                 "--no-rns" => no_rns = true,
                 // The desktop shell holds our stdin open. EOF means the shell
                 // exited, including when it was killed, so shut down cleanly.
                 "--supervised" => supervised = true,
                 "-h" | "--help" => {
-                    println!("rchatd [--data-dir PATH] [--port PORT] [--no-rns] [--supervised]");
+                    println!(
+                        "rchatd [--data-dir PATH] [--port PORT] [--no-rns] \
+                         [--legacy-network JSON] [--supervised]"
+                    );
                     std::process::exit(0);
                 }
                 other => warn!(arg = other, "ignoring unknown argument"),
@@ -105,7 +119,26 @@ impl Cli {
             port,
             no_rns,
             supervised,
+            legacy_network,
         })
+    }
+}
+
+/// The shell's old network settings, as it writes them into its launch flag.
+#[derive(serde::Deserialize)]
+struct LegacyNetworkArg {
+    #[serde(default)]
+    auto_discovery: Option<bool>,
+    #[serde(default)]
+    tcp_relay: Option<String>,
+}
+
+impl From<LegacyNetworkArg> for rchat_core::store::LegacyNetwork {
+    fn from(arg: LegacyNetworkArg) -> Self {
+        Self {
+            auto_discovery: arg.auto_discovery,
+            tcp_relay: arg.tcp_relay,
+        }
     }
 }
 

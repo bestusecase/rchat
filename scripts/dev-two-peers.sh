@@ -6,6 +6,10 @@
 #
 # Then start the UI (cd apps/desktop && npm run dev), connect to the address and
 # token printed below, and add the other peer's address from its profile dialog.
+#
+# The direct link is configured through the engine's interface API (a TCP
+# server on A, a client on B), with local discovery turned off so the two
+# daemons can only reach each other through that link.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -28,15 +32,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-RCHAT_RNS_AUTO=0 RCHAT_RNS_TCP_SERVER="$TCP_PORT" \
-  ./target/debug/rchatd --data-dir .dev/a --port "$PORT_A" > .dev/a.log 2>&1 &
+./target/debug/rchatd --data-dir .dev/a --port "$PORT_A" > .dev/a.log 2>&1 &
 PIDS+=($!)
 
 sleep 1.5
 
-RCHAT_RNS_AUTO=0 RCHAT_RNS_TCP_CLIENT="127.0.0.1:$TCP_PORT" \
-  ./target/debug/rchatd --data-dir .dev/b --port "$PORT_B" > .dev/b.log 2>&1 &
+./target/debug/rchatd --data-dir .dev/b --port "$PORT_B" > .dev/b.log 2>&1 &
 PIDS+=($!)
+
+wait_token() {
+  local path="$1"
+  for _ in $(seq 1 100); do
+    [ -s "$path" ] && return 0
+    sleep 0.1
+  done
+  echo "timed out waiting for $path" >&2
+  return 1
+}
+
+wait_token .dev/a/token
+wait_token .dev/b/token
+
+node scripts/mesh-config.mjs "http://127.0.0.1:$PORT_A" .dev/a/token server "$TCP_PORT"
+node scripts/mesh-config.mjs "http://127.0.0.1:$PORT_B" .dev/b/token client "127.0.0.1:$TCP_PORT"
 
 sleep 2
 

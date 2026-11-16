@@ -1,15 +1,10 @@
 <script>
   import { chat } from "./store.svelte.js";
-  import { shortAddress } from "./util.js";
+  import { peerReachable, shortAddress } from "./util.js";
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
   const peers = $derived(chat.peers);
-
-  function reachable(peer) {
-    if (chat.transport !== "ready") return false;
-    return Boolean(peer.last_seen) && Date.now() - peer.last_seen < 10 * 60 * 1000;
-  }
 </script>
 
 <aside class="members">
@@ -25,13 +20,22 @@
           id={peer.id}
           label={peer.nickname || peer.announced_name || peer.id}
           size={32}
-          status={reachable(peer) ? "online" : "offline"}
+          status={peerReachable(peer, chat.transport, chat.peerReachability(peer))
+            ? "online"
+            : "offline"}
         />
         <div class="member-text">
           <span class="member-name">
             {peer.nickname || peer.announced_name || peer.id.slice(0, 8)}
           </span>
-          <span class="member-sub">{shortAddress(peer.address)}</span>
+          <span class="member-sub">
+            {shortAddress(peer.address)}
+            {#if peer.bandwidth_class && peer.bandwidth_class !== "unknown"}
+              <span class="bandwidth-chip" data-class={peer.bandwidth_class}>
+                {peer.bandwidth_class}
+              </span>
+            {/if}
+          </span>
         </div>
       </div>
     {:else}

@@ -1,11 +1,11 @@
 <script>
   import { onMount } from "svelte";
   import { chat } from "./lib/store.svelte.js";
-  import { shortAddress } from "./lib/util.js";
   import Connect from "./lib/Connect.svelte";
   import Sidebar from "./lib/Sidebar.svelte";
   import Chat from "./lib/Chat.svelte";
   import Members from "./lib/Members.svelte";
+  import Network from "./lib/Network.svelte";
   import Icon from "./lib/Icon.svelte";
 
   let dialog = $state(null);
@@ -15,8 +15,6 @@
   let dialogError = $state("");
   let busy = $state(false);
   let copied = $state(false);
-  let autoDiscovery = $state(true);
-  let relayDraft = $state("");
   let mutedDraft = $state(false);
   let autostartDraft = $state(false);
   let updatePercent = $derived(
@@ -54,6 +52,10 @@
     if (dialog) {
       dialog = null;
       dialogError = "";
+      return;
+    }
+    if (chat.networkPane) {
+      chat.closeNetwork();
       return;
     }
     if (chat.activeId) chat.backToList();
@@ -101,13 +103,31 @@
 
   function openSettings() {
     const settings = chat.desktopSettings;
-    autoDiscovery = settings?.autoDiscovery ?? true;
-    relayDraft = settings?.tcpRelay ?? "";
     mutedDraft = settings?.muted ?? false;
     autostartDraft = settings?.autostart ?? false;
     dialogError = "";
     dialog = "settings";
     pushGuard();
+  }
+
+  function openNetwork(tab = "overview") {
+    chat.openNetwork(tab);
+    pushGuard();
+  }
+
+  function openInterfaces() {
+    if (dialog) dismissDialog();
+    openNetwork("interfaces");
+  }
+
+  function closeNetwork() {
+    chat.closeNetwork();
+    releaseGuard();
+  }
+
+  function goHome() {
+    if (chat.networkPane) chat.closeNetwork();
+    if (chat.mobile) chat.backToList();
   }
 
   function close() {
@@ -155,19 +175,6 @@
     }
   }
 
-  async function applyNetwork() {
-    dialogError = "";
-    busy = true;
-    try {
-      await chat.saveNetwork(autoDiscovery, relayDraft.trim());
-      dismissDialog();
-    } catch (err) {
-      dialogError = err?.message ?? String(err);
-    } finally {
-      busy = false;
-    }
-  }
-
   async function toggleMute() {
     mutedDraft = !mutedDraft;
     try {
@@ -205,16 +212,20 @@
   <div
     class="app"
     class:mobile={chat.mobile}
-    data-pane={chat.activeId ? "chat" : "list"}
+    data-pane={chat.networkPane ? "network" : chat.activeId ? "chat" : "list"}
   >
     <Sidebar
       onAddPeer={openPeer}
       onProfile={openProfile}
       onSettings={openSettings}
       onSelect={pushGuard}
+      onHome={goHome}
+      onNetwork={() => openNetwork("overview")}
     />
 
-    {#if chat.activeConversation}
+    {#if chat.networkPane}
+      <Network onBack={closeNetwork} />
+    {:else if chat.activeConversation}
       <Chat onBack={backFromConversation} />
     {:else if !chat.mobile}
       <section class="chat placeholder">
@@ -378,31 +389,12 @@
       {#if chat.desktop}
         <div class="settings-section">
           <div class="settings-title">Network</div>
-          <button
-            class="toggle-row"
-            type="button"
-            aria-pressed={autoDiscovery}
-            onclick={() => (autoDiscovery = !autoDiscovery)}
-          >
-            <span class="toggle-text">
-              <strong>Find peers on this network</strong>
-              <small>Uses Reticulum's local discovery. Turn off to stay isolated.</small>
-            </span>
-            <span class="switch" data-on={autoDiscovery}></span>
-          </button>
-          <label class="field-label">
-            TCP relay
-            <input
-              class="field mono"
-              bind:value={relayDraft}
-              placeholder="relay.example:4242"
-              spellcheck="false"
-            />
-          </label>
           <p class="hint">
-            Leave empty to stay on your local network. Applying these settings
-            restarts the engine for a moment.
+            Interfaces, paths and the mesh map live on the Reticulum page.
           </p>
+          <button class="btn ghost" onclick={openInterfaces}>
+            Manage interfaces
+          </button>
         </div>
 
         <div class="settings-section">
@@ -514,6 +506,12 @@
         </div>
       {:else if chat.mobile}
         <div class="settings-section">
+          <div class="settings-title">Network</div>
+          <button class="btn ghost" onclick={openInterfaces}>
+            Manage interfaces
+          </button>
+        </div>
+        <div class="settings-section">
           <div class="settings-title">Notifications</div>
           <button
             class="toggle-row"
@@ -543,12 +541,7 @@
 
       {#if dialogError}<p class="form-error">{dialogError}</p>{/if}
       <div class="dialog-actions">
-        <button class="btn ghost" onclick={close} disabled={busy}>Cancel</button>
-        {#if chat.desktop}
-          <button class="btn primary" onclick={applyNetwork} disabled={busy}>
-            {busy ? "Restarting…" : "Apply"}
-          </button>
-        {/if}
+        <button class="btn ghost" onclick={close} disabled={busy}>Close</button>
       </div>
     </div>
   </div>

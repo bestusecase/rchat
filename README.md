@@ -29,8 +29,8 @@ The pieces, on purpose:
   protocol behaviour and crypto are years of work; reimplementing them would be
   a multi-month compatibility risk. A supervised child process on desktop — and
   Chaquopy on Android — keeps the stack intact and the daemon native.
-- **`apps/desktop`** is a thin, dependency-light interface (about 70 KB of JS
-  after a production build).
+- **`apps/desktop`** is a thin, dependency-light interface (about 50 KB of JS
+  gzipped after a production build; no graph or chart library).
 - **`apps/mobile`** is the Android shell: the same Svelte interface, `rchatd`
   linked in-process, and the Python bridge under Chaquopy, so the APK is
   self-contained.
@@ -104,8 +104,11 @@ What the shell does:
   coalesced chime. A tray dot and launcher badge (or a Cinnamon taskbar
   needs-attention hint) appear only while the window is hidden or unfocused.
   Nothing happens for the open conversation.
-- **Network.** The settings panel has LAN discovery and one TCP relay. Applying
-  them restarts the engine in place.
+- **Network.** The Reticulum page (mesh button in the rail) shows transport
+  state, interfaces, the full path table, announce history and a topology map.
+  Interfaces — every type Reticulum supports, including RNode radios — are
+  added, edited, enabled and removed there and applied live, without restarting
+  the engine. Settings only holds a shortcut to that page.
 - **Updates.** AppImage installs check GitHub releases for a signed manifest and
   update on request with a restart; Debian installs ship a signed apt source and
   a daily systemd timer, so they upgrade with the rest of the system. Details in
@@ -181,9 +184,36 @@ interface on 4242, and prints each side's token and address. Open the UI twice
 (two browser profiles work), connect each to one daemon, and add the other
 peer's address.
 
+## See the mesh
+
+```bash
+./scripts/dev-mesh.sh
+```
+
+Starts a three-node mesh: two rchat daemons either side of a plain `rnsd` relay
+with transport enabled. The Mesh button in the rail opens the Reticulum page:
+Overview, Interfaces, Paths, Announced and Map. Each leaf sees the other two
+hops away behind the relay, which is what the map draws — a peer on its hop
+ring, the first-hop transport as a diamond, and the interface on the edge.
+
+The scripted check asserts the topology, path filtering and announce history:
+
+```bash
+node scripts/smoke-mesh.mjs http://127.0.0.1:8791 .dev/mesh/a/token \
+  http://127.0.0.1:8793 .dev/mesh/c/token
+```
+
 ## Transports
 
-The bridge picks its interfaces from environment variables:
+`rchat.db` owns interface configuration; `rns/config` is generated from it and
+applied hot through Reticulum's interface management API. Add, edit, disable or
+delete interfaces on the Network page. The first start after an upgrade imports
+an existing hand-written `rns/config` once (including unknown sections, kept
+verbatim), so an RNode added by hand keeps working.
+
+The environment variables below are only a seed for a config file that does not
+exist yet — for development scripts and fresh installs. Once the interface
+database exists they are ignored.
 
 | Variable | Meaning |
 | --- | --- |
@@ -193,13 +223,10 @@ The bridge picks its interfaces from environment variables:
 | `RCHAT_RNS_GROUP` | AutoInterface group id |
 | `RCHAT_RNS_MODE` | `embedded` (private instance, default) or `shared` |
 | `RCHAT_RNS_CONFIGDIR` | Config directory for `shared` mode |
+| `RCHAT_RNS_RESET_CONFIG` | `1` — discard the seed config and re-render it |
 
 Other process settings: `RCHAT_PORT`, `RCHAT_DATA_DIR`, `RCHAT_TOKEN`,
 `RCHAT_PYTHON`, `RCHAT_SIDECAR`.
-
-**Radio:** add an RNode or other interface to `<data-dir>/rns/config` and restart.
-The bridge preserves an existing config unless you pass interface variables
-explicitly (or set `RCHAT_RNS_RESET_CONFIG=1` to regenerate it).
 
 ## What works
 
@@ -210,6 +237,10 @@ explicitly (or set `RCHAT_RNS_RESET_CONFIG=1` to regenerate it).
 - Offline queue that flushes when the mesh comes back
 - Display-name changes propagate to peers
 - Reconnects automatically if the engine restarts
+- A Reticulum page with live interface, counter and path state, durable
+  announce history, and a topology map of peers and first-hop transports
+- Interface management for every Reticulum type, hot-applied and rolled back
+  when Reticulum refuses a change
 - On Android, per-conversation notification threads while backgrounded, each
   titled with the peer or conversation and grouped under a summary, gated on the
   screen being off or the app not being in front

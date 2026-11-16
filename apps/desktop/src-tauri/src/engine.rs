@@ -15,8 +15,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
-use crate::Settings;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoint {
     pub http: String,
@@ -44,13 +42,20 @@ pub struct Engine {
     python: PathBuf,
     site_packages: PathBuf,
     sidecar: PathBuf,
+    /// The old network settings as a launch flag, so the engine can import
+    /// them once instead of the shell keeping them forever.
+    legacy_network: Option<String>,
     token: Mutex<String>,
     endpoint: Mutex<Option<Endpoint>>,
     child: Mutex<Option<Child>>,
 }
 
 impl Engine {
-    pub fn discover(app: &AppHandle, data_dir: PathBuf) -> Result<Self, String> {
+    pub fn discover(
+        app: &AppHandle,
+        data_dir: PathBuf,
+        legacy_network: Option<String>,
+    ) -> Result<Self, String> {
         let rchatd = find_asset(app, "rchatd")
             .or_else(|| dev_path("target/release/rchatd"))
             .or_else(|| dev_path("target/debug/rchatd"))
@@ -79,6 +84,7 @@ impl Engine {
             python,
             site_packages,
             sidecar,
+            legacy_network,
             token: Mutex::new(String::new()),
             endpoint: Mutex::new(None),
             child: Mutex::new(None),
@@ -86,7 +92,7 @@ impl Engine {
     }
 
     /// Reuse a healthy engine if one is already serving this data directory.
-    pub fn start(&self, settings: &Settings) -> Result<Endpoint, String> {
+    pub fn start(&self) -> Result<Endpoint, String> {
         if let Some(endpoint) = self.reusable_endpoint() {
             *self.token.lock().unwrap() = endpoint.token.clone();
             *self.endpoint.lock().unwrap() = Some(endpoint.clone());
@@ -101,12 +107,12 @@ impl Engine {
             }
             token.clone()
         };
-        self.spawn(settings, &token, None)
+        self.spawn(&token, None)
     }
 
     /// Stop the engine and start it again on the same port, so the UI can
     /// simply reconnect to the address it already knows.
-    pub fn restart(&self, settings: &Settings) -> Result<Endpoint, String> {
+    pub fn restart(&self) -> Result<Endpoint, String> {
         let previous_port = self
             .endpoint
             .lock()
@@ -116,23 +122,18 @@ impl Engine {
         let token = self.token.lock().unwrap().clone();
         self.stop();
 
-        match self.spawn(settings, &token, previous_port) {
+        match self.spawn(&token, previous_port) {
             Ok(endpoint) => Ok(endpoint),
             Err(first) => {
                 // The old port may have been taken in the split second between
                 // shutdown and bind. A fresh port always works.
-                self.spawn(settings, &token, None)
+                self.spawn(&token, None)
                     .map_err(|second| format!("{first}; retry also failed: {second}"))
             }
         }
     }
 
-    fn spawn(
-        &self,
-        settings: &Settings,
-        token: &str,
-        preferred_port: Option<u16>,
-    ) -> Result<Endpoint, String> {
+    fn spawn(&self, token: &str, preferred_port: Option<u16>) -> Result<Endpoint, String> {
         let endpoint_path = self.data_dir.join("endpoint.json");
         let _ = fs::remove_file(&endpoint_path);
 
@@ -161,18 +162,16 @@ impl Engine {
             .env("RCHAT_PYTHON", &self.python)
             .env("RCHAT_SIDECAR", &self.sidecar)
             .env("PYTHONPATH", &self.site_packages)
-            .env("RCHAT_RNS_AUTO", if settings.auto_discovery { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err));
 
-        if let Some(home) = python_home {
-            command.env("PYTHONHOME", home);
+        if let Some(legacy) = self.legacy_network.as_deref() {
+            command.arg("--legacy-network").arg(legacy);
         }
 
-        let relay = settings.tcp_relay.trim();
-        if !relay.is_empty() {
-            command.env("RCHAT_RNS_TCP_CLIENT", relay);
+        if let Some(home) = python_home {
+            command.env("PYTHONHOME", home);
         }
 
         let child = command.spawn().map_err(|err| {

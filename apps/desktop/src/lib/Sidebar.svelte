@@ -4,7 +4,7 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
-  let { onAddPeer, onProfile, onSettings, onSelect } = $props();
+  let { onAddPeer, onProfile, onSettings, onSelect, onHome, onNetwork } = $props();
 </script>
 
 <div class="shell-left">
@@ -13,8 +13,22 @@
       <span class="brand-mark">r</span>
     </div>
 
-    <button class="rail-button active" title="Home">
+    <button
+      class="rail-button"
+      class:active={!chat.networkPane}
+      title="Home"
+      onclick={onHome}
+    >
       <Icon name="home" size={22} />
+    </button>
+
+    <button
+      class="rail-button"
+      class:active={chat.networkPane}
+      title="Reticulum network"
+      onclick={onNetwork}
+    >
+      <Icon name="mesh" size={22} />
     </button>
 
     <div class="rail-gap"></div>

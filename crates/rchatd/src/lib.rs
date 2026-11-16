@@ -63,6 +63,10 @@ pub struct Options {
     /// Skip the bridge regardless of `bridge`. Mirrors the `--no-rns` flag.
     pub no_rns: bool,
     pub bridge: BridgeMode,
+    /// Network settings a shell carried over from an older release. Read once,
+    /// guarded by a meta flag, and turned into interface rows with origin
+    /// `legacy`.
+    pub legacy_network: Option<rchat_core::store::LegacyNetwork>,
 }
 
 /// Where the local API is listening. Written to `endpoint.json` so a shell can
@@ -125,6 +129,38 @@ impl Engine {
             data_dir.join("attachments"),
         ));
         let state = Arc::new(AppState::new(store.clone(), token.clone(), blobs.clone()));
+        *state.legacy_network.write().await = options.legacy_network.clone();
+        // Development scripts may still ask the bridge to seed itself from the
+        // environment. Production never does: interfaces come from the store.
+        let env_seeding = std::env::var("RCHAT_RNS_ENV_SEED")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "yes" | "true" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let mode = if options.no_rns {
+            BridgeMode::None
+        } else {
+            options.bridge
+        };
+        // First-run network setup happens before the bridge exists, so its very
+        // first configure renders the right interfaces. A hand-written
+        // `rns/config` is left alone until the bridge has imported it.
+        let managed = if env_seeding || matches!(mode, BridgeMode::None) {
+            false
+        } else {
+            let config_dir = std::env::var("RCHAT_RNS_CONFIGDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| data_dir.join("rns"));
+            let config_present = config_dir.join("config").exists();
+            match store.import_network_once(options.legacy_network.as_ref(), config_present) {
+                Ok(rows) => info!(rows = rows.len(), "network interfaces ready for the bridge"),
+                Err(err) => warn!(error = %err, "could not prepare network interfaces"),
+            }
+            true
+        };
         // A crash between writing a blob and committing its row leaves bytes no
         // message refers to. Sweep them before anything else can read the store.
         // Uploads that no send ever claimed are stale by definition at startup.
@@ -146,18 +182,13 @@ impl Engine {
         let (shutdown, _) = watch::channel(false);
         let mut helpers = Vec::new();
 
-        let mode = if options.no_rns {
-            BridgeMode::None
-        } else {
-            options.bridge
-        };
         let mut bridge_port = None;
         match mode {
             BridgeMode::Spawn {
                 python,
                 script,
                 envs,
-            } => match spawn_bridge(&data_dir, &identity.display_name, &python, &script, &envs) {
+            } => match spawn_bridge(&data_dir, &identity.display_name, &python, &script, &envs, managed) {
                 Some(bridge) => {
                     info!("reticulum bridge started");
                     install_bridge(&state, bridge, shutdown.subscribe(), &mut helpers).await;
@@ -354,11 +385,13 @@ fn spawn_bridge(
     python: &str,
     script: &Path,
     extra_envs: &[(String, String)],
+    managed: bool,
 ) -> Option<Bridge> {
     let rns_dir = data_dir.join("rns").to_string_lossy().to_string();
     let mut envs: Vec<(&str, String)> = vec![
         ("RCHAT_RNS_DIR", rns_dir),
         ("RCHAT_DISPLAY_NAME", display_name.to_string()),
+        ("RCHAT_RNS_MANAGED", if managed { "1" } else { "0" }.to_string()),
         (
             "RCHAT_ATTACHMENT_MAX_BYTES",
             app::inbound_limit().to_string(),

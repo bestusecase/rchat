@@ -32,17 +32,38 @@ shared
     `share_instance = Yes`). Set RCHAT_RNS_MODE=shared and optionally
     RCHAT_RNS_CONFIGDIR.
 
-Interfaces are chosen with environment variables so no code changes are needed
-to move between LAN, TCP relay and radio:
+Interfaces
+----------
+``rchat.db`` owns interface configuration; ``rns/config`` is a generated
+artifact. When the engine has taken ownership this process waits briefly for a
+``configure`` command before starting Reticulum, and applies further changes
+through RNS's interface management API so nothing needs an engine restart.
 
-    RCHAT_RNS_AUTO=1|0               AutoInterface (LAN discovery)
+Environment interfaces are only a seed for a config file that does not exist
+yet, and only when the engine is told this is a development run
+(``RCHAT_RNS_ENV_SEED=1``). Production always waits for the engine's rows:
+
+    RCHAT_RNS_AUTO=1|0               AutoInterface (LAN discovery, on by default)
     RCHAT_RNS_TCP_SERVER=PORT        listen for peers (127.0.0.1:PORT)
     RCHAT_RNS_TCP_CLIENT=HOST:PORT   connect to a peer or relay
     RCHAT_RNS_GROUP=name             AutoInterface group id
+
+Observability
+-------------
+A sampling thread emits a ``mesh`` event every couple of seconds, but only when
+the mesh fingerprint changed, plus immediately after an announce or an interface
+change. The engine caches it and serves smaller, queryable views to clients.
+
+Management requests (``configure``, ``import_config``, ``describe``,
+``list_devices``) carry a ``token`` and are answered with a ``bridge_reply``
+event carrying the same token.
 """
 
+import collections
 import json
 import os
+import queue
+import re
 import socket
 import sys
 import tempfile
@@ -104,6 +125,17 @@ signal.signal = _signal
 import LXMF
 import RNS
 
+# Reticulum treats an interface it cannot create as fatal and calls os._exit
+# (RNS.panic) from inside _synthesize_interface, even when
+# panic_on_interface_error is off. That would let one bad form submission kill
+# the whole bridge. Raising instead lets the caller roll back and report the
+# configuration error, which is what the apply-then-persist contract needs.
+def _panic_as_error():
+    raise RuntimeError("Reticulum refused the interface configuration")
+
+
+RNS.panic = _panic_as_error
+
 _write_lock = threading.Lock()
 # Set when the bridge was given a socket to dial instead of inheriting stdio.
 _socket = None
@@ -144,11 +176,15 @@ CONFIG_DIR = os.environ.get("RCHAT_RNS_CONFIGDIR") or DATA_DIR
 TCP_SERVER = os.environ.get("RCHAT_RNS_TCP_SERVER")
 TCP_CLIENT = os.environ.get("RCHAT_RNS_TCP_CLIENT")
 GROUP = os.environ.get("RCHAT_RNS_GROUP", "reticulum")
-AUTO_DEFAULT = "1" if not TCP_SERVER and not TCP_CLIENT else "0"
-AUTO = env_flag("RCHAT_RNS_AUTO", AUTO_DEFAULT == "1")
+# Local discovery is on unless a development script turns it off. Adding a TCP
+# interface never disables it: the two are independent paths.
+AUTO = env_flag("RCHAT_RNS_AUTO", True)
+# The engine owns rns/config: wait for its configure before starting Reticulum.
+MANAGED = env_flag("RCHAT_RNS_MANAGED", False)
 
-ANNOUNCE_INTERVAL = 300
-
+# Attachments ride inside the LXMF message, so this ceiling is what the bridge
+# will stage on receipt. It matches the engine's inbound limit; the engine
+# applies the policy, and the bridge only refuses to write megabytes to disk.
 ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
 REASON_TOO_LARGE = "Attachment was too large to receive"
 REASON_UNREADABLE = "Attachment could not be read"
@@ -159,9 +195,48 @@ IMAGE_MAGIC = (
     b"GIF89a",
 )
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
-state = {"ready": False, "address": None}
+
+# RNS reports an interface mode as a bit constant; clients see the config word.
+INTERFACE_MODES = {
+    0x01: "full",
+    0x02: "pointtopoint",
+    0x03: "access_point",
+    0x04: "roaming",
+    0x05: "boundary",
+    0x06: "gateway",
+    0x07: "internal",
+}
+
+ANNOUNCE_INTERVAL = 300
+MESH_SAMPLE_INTERVAL = 2.0
+MESH_PATH_CAP = 2000
+OTHER_SERVICES_LIMIT = 200
+CONFIGURE_GRACE_SECONDS = 3.0
+
+state = {"ready": False, "address": None, "started_at": None}
 local_destination = None
 router = None
+reticulum = None
+
+# Interface rows last accepted by the engine.
+_applied = {}
+
+# Command lines arrive on a reader thread so the main thread can wait for a
+# configure before starting Reticulum without blocking on stdin forever.
+_commands = queue.Queue()
+_commands_closed = threading.Event()
+
+# Non-LXMF destinations heard recently, in memory only.
+_other_services = collections.deque(maxlen=OTHER_SERVICES_LIMIT)
+_other_services_lock = threading.Lock()
+
+# When each interface was first seen down, so an outage has an age.
+_interface_down_since = {}
+
+_mesh_wake = threading.Event()
+_mesh_fingerprint = None
+_mesh_thread = None
+_announce_thread = None
 
 
 def split_hostport(spec, default_host="127.0.0.1"):
@@ -201,25 +276,68 @@ def open_socket(spec, timeout=10.0):
             time.sleep(0.15)
 
 
-def write_config(config_dir):
-    os.makedirs(config_dir, exist_ok=True)
+# ---- config rendering and import ------------------------------------------
 
-    # Preserve hand-edited configs. Regenerate only when interface settings are
-    # supplied explicitly, or when a reset is requested. This is what lets a
-    # user add an RNode or a custom interface and keep it across restarts.
-    path = os.path.join(config_dir, "config")
-    explicit = any(
-        os.environ.get(key)
-        for key in (
-            "RCHAT_RNS_TCP_SERVER",
-            "RCHAT_RNS_TCP_CLIENT",
-            "RCHAT_RNS_AUTO",
-            "RCHAT_RNS_GROUP",
-        )
-    )
-    if os.path.exists(path) and not explicit and not env_flag("RCHAT_RNS_RESET_CONFIG", False):
-        return
+INTERFACE_TYPES = {
+    "AutoInterface",
+    "TCPClientInterface",
+    "TCPServerInterface",
+    "BackboneInterface",
+    "BackboneClientInterface",
+    "UDPInterface",
+    "PipeInterface",
+    "I2PInterface",
+    "SerialInterface",
+    "KISSInterface",
+    "AX25KISSInterface",
+    "RNodeInterface",
+    "RNodeMultiInterface",
+    "WeaveInterface",
+}
 
+_TOP_SECTION = re.compile(r"^\[([^\[\]].*)\]\s*$")
+_SUB_SECTION = re.compile(r"^\s*\[\[(.+)\]\]\s*$")
+_KEY_VALUE = re.compile(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$")
+_INT = re.compile(r"^-?\d+$")
+_FLOAT = re.compile(r"^-?\d+\.\d+$")
+_TRUTHY = {"true", "yes", "on", "1"}
+_FALSY = {"false", "no", "off", "0"}
+
+
+def _coerce(text):
+    lowered = text.strip().lower()
+    if lowered in _TRUTHY:
+        return True
+    if lowered in _FALSY:
+        return False
+    if _INT.match(text.strip()):
+        try:
+            return int(text.strip())
+        except ValueError:
+            return text
+    if _FLOAT.match(text.strip()):
+        try:
+            return float(text.strip())
+        except ValueError:
+            return text
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        return text[1:-1]
+    return text
+
+
+def _render_value(value):
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value)
+
+
+def render_config(interfaces, extra):
+    """Render rns/config from the managed rows plus preserved sections.
+
+    Flat sections are re-emitted verbatim after the managed content. Unknown
+    interface blocks are preserved under ``[interfaces]`` so an RNS release that
+    adds a field never loses data.
+    """
     lines = ["[reticulum]", "  enable_transport = No"]
     if MODE == "shared":
         lines += [
@@ -238,48 +356,1078 @@ def write_config(config_dir):
         "[interfaces]",
     ]
 
-    if AUTO:
-        lines += [
-            "  [[AutoInterface]]",
-            "    type = AutoInterface",
-            "    interface_enabled = True",
-            "    group_id = " + GROUP,
-        ]
+    for row in interfaces:
+        name = str(row.get("name") or "").strip()
+        kind = str(row.get("kind") or row.get("type") or "").strip()
+        if not name or not kind:
+            continue
+        lines.append("  [[%s]]" % name)
+        lines.append("    type = %s" % kind)
+        lines.append("    interface_enabled = %s" % (
+            "True" if row.get("enabled", True) else "False"
+        ))
+        config = row.get("config") or {}
+        if isinstance(config, dict):
+            for key in config:
+                if key in ("type", "name", "interface_enabled", "enabled"):
+                    continue
+                lines.append("    %s = %s" % (key, _render_value(config[key])))
+        lines.append("")
 
+    for section, raw in extra:
+        if str(section).startswith("interfaces/"):
+            block = str(raw).strip("\n")
+            if block:
+                lines.append(block)
+                lines.append("")
+
+    for section, raw in extra:
+        if str(section).startswith("interfaces/"):
+            continue
+        block = str(raw).strip("\n")
+        if block:
+            lines.append(block)
+            lines.append("")
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def read_config(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def write_config_text(config_dir, text):
+    """Atomically replace the config, mode 0600, never outside config_dir."""
+    os.makedirs(config_dir, exist_ok=True)
+    path = os.path.join(config_dir, "config")
+    tmp = path + ".rchat-tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        payload = text.encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+
+
+def parse_config_text(text):
+    """Split a hand-written config into managed interface rows and raw blocks.
+
+    Line-based on purpose: ConfigObj does not round-trip comments or unknown
+    keys, and the preserved blocks must stay byte-identical.
+    """
+    lines = text.splitlines()
+    chunks = []
+    current = None
+    for line in lines:
+        match = _TOP_SECTION.match(line)
+        if match:
+            current = {"name": match.group(1).strip(), "raw": [line]}
+            chunks.append(current)
+        elif current is not None:
+            current["raw"].append(line)
+        # Content before the first section is not meaningful in rns/config.
+
+    interfaces = []
+    extra = []
+    for chunk in chunks:
+        name = chunk["name"]
+        raw = "\n".join(chunk["raw"]).rstrip("\n") + "\n"
+        if name in ("reticulum", "logging"):
+            continue
+        if name != "interfaces":
+            extra.append((name, raw))
+            continue
+
+        block = None
+        trailing = []
+        for line in chunk["raw"][1:]:
+            sub = _SUB_SECTION.match(line)
+            if sub:
+                if block is not None:
+                    _finish_interface_block(block, interfaces, extra)
+                block = {"name": sub.group(1).strip(), "raw": [line], "values": []}
+                trailing = []
+                continue
+            if block is None:
+                if line.strip():
+                    trailing.append(line)
+            else:
+                block["raw"].append(line)
+                match = _KEY_VALUE.match(line)
+                if match:
+                    block["values"].append((match.group(1), match.group(2)))
+        if block is not None:
+            _finish_interface_block(block, interfaces, extra)
+        if trailing:
+            extra.append(("interfaces", "\n".join(trailing).rstrip("\n") + "\n"))
+
+    return interfaces, extra
+
+
+def _finish_interface_block(block, interfaces, extra):
+    values = dict(block["values"])
+    kind = values.get("type")
+    if kind in INTERFACE_TYPES:
+        config = {}
+        for key, value in block["values"]:
+            if key in ("type", "name", "interface_enabled", "enabled"):
+                continue
+            config[key] = _coerce(value)
+        enabled = str(values.get("interface_enabled", "True")).strip().lower() in _TRUTHY
+        interfaces.append(
+            {
+                "name": block["name"],
+                "kind": kind,
+                "config": config,
+                "enabled": enabled,
+                "origin": "imported",
+            }
+        )
+    else:
+        raw = "\n".join(block["raw"]).rstrip("\n") + "\n"
+        extra.append(("interfaces/" + block["name"], raw))
+
+
+def seed_interfaces():
+    rows = []
+    if AUTO:
+        rows.append(
+            {
+                "name": "AutoInterface",
+                "kind": "AutoInterface",
+                "config": {"group_id": GROUP},
+                "enabled": True,
+            }
+        )
     if TCP_SERVER:
         host, port = split_hostport(TCP_SERVER, "127.0.0.1")
         if port:
-            lines += [
-                "  [[TCP Server]]",
-                "    type = TCPServerInterface",
-                "    interface_enabled = True",
-                "    listen_ip = " + host,
-                "    listen_port = " + str(port),
-            ]
-
+            rows.append(
+                {
+                    "name": "TCP Server",
+                    "kind": "TCPServerInterface",
+                    "config": {"listen_ip": host, "listen_port": port},
+                    "enabled": True,
+                }
+            )
     if TCP_CLIENT:
         host, port = split_hostport(TCP_CLIENT)
         if port:
-            lines += [
-                "  [[TCP Client]]",
-                "    type = TCPClientInterface",
-                "    interface_enabled = True",
-                "    target_host = " + host,
-                "    target_port = " + str(port),
-            ]
+            rows.append(
+                {
+                    "name": "TCP Client",
+                    "kind": "TCPClientInterface",
+                    "config": {"target_host": host, "target_port": port},
+                    "enabled": True,
+                }
+            )
+    return rows
 
-    with open(os.path.join(config_dir, "config"), "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
 
-def load_identity(path):
+def write_config(config_dir):
+    """Seed a config only when there is none (or a reset was requested).
+
+    Once rchat owns the file, the engine renders it through ``configure``.
+    """
+    os.makedirs(config_dir, exist_ok=True)
+    path = os.path.join(config_dir, "config")
+    if os.path.exists(path) and not env_flag("RCHAT_RNS_RESET_CONFIG", False):
+        return
+    write_config_text(config_dir, render_config(seed_interfaces(), []))
+
+
+# ---- management replies ----------------------------------------------------
+
+
+def reply(token, ok, data=None, error=None, extra=None):
+    payload = {"ev": "bridge_reply", "token": token, "ok": bool(ok)}
+    if data is not None:
+        payload["data"] = data
+    if error is not None:
+        payload["error"] = str(error)
+    if extra:
+        payload.update(extra)
+    emit(payload)
+
+
+def _canonical(row):
+    return json.dumps(
+        {
+            "name": row.get("name"),
+            "kind": row.get("kind"),
+            "config": row.get("config") or {},
+            "enabled": bool(row.get("enabled", True)),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _applied_map(interfaces):
+    """What is actually live: a disabled row was never attached, so it must
+    never be a rollback target either."""
+    return {
+        str(row.get("name")): _canonical(row)
+        for row in interfaces
+        if row.get("enabled", True) and row.get("name") and row.get("kind")
+    }
+
+
+def _live_names():
+    return {str(interface.name) for interface in RNS.Transport.interfaces}
+
+
+class _RnsLogCapture:
+    """Collect what RNS logs while an interface operation runs.
+
+    RNS reports an interface failure as a boolean and writes the reason to its
+    log. Relaying that text verbatim is the difference between "check the
+    address" and knowing what the address did wrong.
+    """
+
+    def __init__(self):
+        self.messages = []
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = RNS.log
+        capture = self
+
+        def listener(message, level=3, *_args, **_kwargs):
+            try:
+                if int(level) <= RNS.LOG_ERROR:
+                    capture.messages.append(str(message))
+            except Exception:
+                pass
+            previous = capture._previous
+            if previous is not None:
+                return previous(message, level, *_args, **_kwargs)
+            return None
+
+        RNS.log = listener
+        return self
+
+    def __exit__(self, *_exc):
+        if self._previous is not None:
+            RNS.log = self._previous
+            self._previous = None
+        return False
+
+    def reason(self):
+        for message in reversed(self.messages):
+            text = " ".join(str(message).split())
+            if text:
+                return text
+        return None
+
+
+class InterfaceFailure(RuntimeError):
+    """RNS reports a boolean and logs the cause; name the row and quote it."""
+
+    def __init__(self, action, name, reason=None):
+        detail = " %s" % reason if reason else ""
+        super().__init__(
+            "Reticulum could not %s interface \"%s\".%s Check the address, port "
+            "and hardware settings; the previous configuration was restored."
+            % (action, name, detail)
+        )
+        self.name = name
+        self.reason = reason
+
+
+def _rns_failure(action, name, reason=None):
+    return InterfaceFailure(action, name, reason)
+
+
+def apply_configure(interfaces, extra):
+    """Render and hot-apply the desired interface set."""
+    global _applied
+    if reticulum is None:
+        # Pre-start: only the file matters; Reticulum reads it next.
+        write_config_text(CONFIG_DIR, render_config(interfaces, extra))
+        _applied = _applied_map(interfaces)
+        return
+
+    if MODE == "shared":
+        # The interfaces on the wire belong to the shared instance, and this
+        # config file is the client's, so there is nothing here to attach.
+        # Keep the file correct for the next start and leave the instance alone.
+        write_config_text(CONFIG_DIR, render_config(interfaces, extra))
+        _applied = {}
+        return
+
+    desired_enabled = {
+        str(row.get("name")): row
+        for row in interfaces
+        if row.get("enabled", True) and row.get("name") and row.get("kind")
+    }
+    previous_applied = dict(_applied)
+    previous_text = read_config(os.path.join(CONFIG_DIR, "config"))
+
+    write_config_text(CONFIG_DIR, render_config(interfaces, extra))
+    capture = _RnsLogCapture()
     try:
-        if os.path.exists(path):
-            return RNS.Identity.from_file(path)
-    except Exception as exc:  # corrupt or incompatible file
-        emit({"ev": "log", "level": "warn", "message": "identity reload failed: %s" % exc})
-    identity = RNS.Identity()
-    identity.to_file(path)
-    return identity
+        with capture:
+            # Only interfaces rchat manages take part: a TCP server spawns client
+            # interfaces of its own, and detaching those would cut live links.
+            for name in sorted(set(previous_applied) - set(desired_enabled)):
+                if name in _live_names():
+                    result = reticulum.detach_interface(name)
+                    if result is False:
+                        raise _rns_failure("detach", name, capture.reason())
+            for name in desired_enabled:
+                if name not in _live_names():
+                    result = reticulum.attach_interface(name)
+                    if not result:
+                        raise _rns_failure("attach", name, capture.reason())
+                elif previous_applied.get(name) != _canonical(desired_enabled[name]):
+                    result = reticulum.reload_interface(name)
+                    if not result:
+                        raise _rns_failure("reload", name, capture.reason())
+    except Exception:
+        _restore(previous_text, previous_applied, desired_enabled)
+        raise
+
+    _applied = _applied_map(interfaces)
+    _mesh_wake.set()
+
+
+def _restore(previous_text, previous_applied, desired):
+    global _applied
+    try:
+        if previous_text is not None:
+            write_config_text(CONFIG_DIR, previous_text)
+        if reticulum is not None:
+            live = _live_names()
+            target = set(previous_applied)
+            for name in sorted((live - target) & set(desired)):
+                reticulum.detach_interface(name)
+            for name in sorted(target - live):
+                reticulum.attach_interface(name)
+            for name in sorted(target & live):
+                if desired.get(name) and _canonical(desired[name]) != previous_applied.get(name):
+                    reticulum.reload_interface(name)
+    except Exception:
+        emit(
+            {
+                "ev": "error",
+                "message": "rollback failed: " + traceback.format_exc(limit=3),
+            }
+        )
+    _applied = previous_applied
+
+
+def record_started_config():
+    """Remember what the running instance was started from.
+
+    Without this, the first engine `configure` after an import would look like a
+    change for every row and reload interfaces that are already correct — which
+    drops live peers.
+    """
+    global _applied
+    text = read_config(os.path.join(CONFIG_DIR, "config"))
+    if not text:
+        return
+    try:
+        interfaces, _extra = parse_config_text(text)
+        _applied = _applied_map(interfaces)
+    except Exception:
+        _applied = {}
+
+
+def do_configure(command):
+    token = command.get("token")
+    interfaces = command.get("interfaces") or []
+    extra = command.get("extra") or []
+    try:
+        apply_configure(interfaces, extra)
+        reply(token, True, {"applied": len(interfaces)})
+    except Exception as exc:
+        name = getattr(exc, "name", None)
+        reply(token, False, error=str(exc), extra={"name": name} if name else None)
+
+
+def do_import(token):
+    path = os.path.join(CONFIG_DIR, "config")
+    text = read_config(path)
+    if text is None:
+        reply(token, True, {"interfaces": [], "extra": [], "existed": False})
+        return
+    try:
+        interfaces, extra = parse_config_text(text)
+        reply(
+            token,
+            True,
+            {
+                "interfaces": interfaces,
+                "extra": [[section, raw] for section, raw in extra],
+                "existed": True,
+            },
+        )
+    except Exception as exc:
+        reply(token, False, error="could not import %s: %s" % (path, exc))
+
+
+def do_list_devices(token, kind):
+    if kind not in ("serial", None, ""):
+        reply(token, True, {"devices": [], "reason": "unsupported device kind"})
+        return
+    try:
+        from serial.tools import list_ports
+
+        devices = [
+            {"device": port.device, "description": port.description}
+            for port in list_ports.comports()
+        ]
+        reply(token, True, {"devices": devices})
+    except Exception:
+        reply(
+            token,
+            True,
+            {
+                "devices": [],
+                "reason": "serial device listing is not available on this platform",
+            },
+        )
+
+
+# ---- interface type catalogue ----------------------------------------------
+
+
+def _field(key, label, widget, **extra):
+    field = {"key": key, "label": label, "widget": widget}
+    field.update(extra)
+    return field
+
+
+def _common_advanced():
+    return [
+        _field(
+            "interface_mode",
+            "Mode",
+            "select",
+            default="full",
+            choices=[
+                "full",
+                "access_point",
+                "pointtopoint",
+                "roaming",
+                "boundary",
+                "gateway",
+            ],
+            help="How this interface participates in the mesh.",
+        ),
+        _field("bitrate", "Bitrate (bps)", "int"),
+        _field("announce_rate_target", "Announce rate target (s)", "int"),
+        _field("ifac_netname", "IFAC network name", "text"),
+        _field("ifac_netkey", "IFAC passphrase", "secret"),
+        _field("ifac_size", "IFAC size (bytes)", "int", default=16),
+    ]
+
+
+# RNS refuses to detach these (Reticulum._detach_interface), so a managed row
+# could never be disabled, edited or deleted: mark it read-only instead.
+READ_ONLY_KINDS = {
+    "I2PInterface": (
+        "Reticulum does not allow detaching an I2P interface, so rchat cannot "
+        "change it live. Edit it in the Reticulum config and restart."
+    ),
+}
+
+# Attached to someone else's instance, the config rchat writes is this client's,
+# not the daemon's: the interface sections it manages would be invisible to the
+# instance asked to attach them.
+SHARED_READ_ONLY_REASON = (
+    "Attached to a shared Reticulum instance. Its interfaces belong to that "
+    "instance, so manage them in its own config."
+)
+
+
+def interface_catalogue():
+    def kind(kind_name, label, summary, group, fields):
+        entry = {
+            "kind": kind_name,
+            "label": label,
+            "summary": summary,
+            "group": group,
+            "fields": fields + _common_advanced(),
+        }
+        reason = READ_ONLY_KINDS.get(kind_name)
+        if reason:
+            entry["read_only"] = reason
+        return entry
+
+    serial_fields = [
+        _field("port", "Serial port", "serial", required=True, common=True,
+               help="Pick the device, or paste its path."),
+        _field("speed", "Baud rate", "int", default=1200, common=True),
+    ]
+    kiss_extra = [
+        _field("databits", "Data bits", "int", default=8),
+        _field(
+            "parity",
+            "Parity",
+            "select",
+            default="none",
+            choices=["none", "even", "odd"],
+        ),
+        _field("stopbits", "Stop bits", "int", default=1),
+        _field("preamble", "Preamble (ms)", "int", default=150),
+        _field("txtail", "TX tail (ms)", "int", default=10),
+        _field("persistence", "Persistence", "int", default=64),
+        _field("slottime", "Slot time (ms)", "int", default=20),
+    ]
+
+    return [
+        kind(
+            "AutoInterface",
+            "AutoInterface",
+            "Discover peers on the local network link.",
+            "Local",
+            [
+                _field("group_id", "Group id", "text", default="reticulum",
+                       common=True,
+                       help="Interfaces with the same group id find each other."),
+                _field(
+                    "discovery_scope",
+                    "Discovery scope",
+                    "select",
+                    default="link",
+                    choices=["link", "admin", "site", "organisation", "global"],
+                    common=True,
+                ),
+                _field("discovery_port", "Discovery port", "port"),
+                _field("data_port", "Data port", "port"),
+                _field("devices", "Interface devices", "text",
+                       placeholder="eth0,wlan0"),
+                _field(
+                    "multicast_address_type",
+                    "Multicast address type",
+                    "select",
+                    default="temporary",
+                    choices=["temporary", "permanent"],
+                ),
+                _field("configured_bitrate", "Configured bitrate (bps)", "int"),
+            ],
+        ),
+        kind(
+            "TCPClientInterface",
+            "TCP client",
+            "Connect to a peer or relay over TCP.",
+            "TCP",
+            [
+                _field("target_host", "Host", "text", required=True,
+                       placeholder="relay.example", common=True,
+                       help="Hostname or IP of the relay."),
+                _field("target_port", "Port", "port", required=True,
+                       default=4242, common=True),
+                _field("kiss_framing", "KISS framing", "bool", default=False),
+                _field("i2p_tunneled", "Via I2P", "bool", default=False),
+                _field("connect_timeout", "Connect timeout (s)", "int"),
+            ],
+        ),
+        kind(
+            "TCPServerInterface",
+            "TCP server",
+            "Listen for peers over TCP.",
+            "TCP",
+            [
+                _field("listen_ip", "Listen address", "text",
+                       default="0.0.0.0", common=True,
+                       placeholder="0.0.0.0"),
+                _field("listen_port", "Port", "port", required=True,
+                       default=4242, common=True),
+                _field("i2p_tunneled", "Via I2P", "bool", default=False),
+            ],
+        ),
+        kind(
+            "BackboneInterface",
+            "Backbone",
+            "A high-throughput TCP backbone link.",
+            "TCP",
+            [
+                _field("listen_ip", "Listen address", "text",
+                       default="0.0.0.0", common=True),
+                _field("listen_port", "Port", "port", required=True,
+                       default=4242, common=True),
+                _field("target_host", "Remote host", "text"),
+                _field("target_port", "Remote port", "port"),
+                _field("device", "Device", "text"),
+            ],
+        ),
+        kind(
+            "BackboneClientInterface",
+            "Backbone client",
+            "Connect to a backbone node.",
+            "TCP",
+            [
+                _field("target_host", "Host", "text", required=True, common=True),
+                _field("target_port", "Port", "port", required=True,
+                       default=4242, common=True),
+                _field("device", "Device", "text"),
+            ],
+        ),
+        kind(
+            "UDPInterface",
+            "UDP",
+            "A UDP link for local or routed networks.",
+            "TCP",
+            [
+                _field("listen_ip", "Listen address", "text",
+                       default="0.0.0.0", common=True),
+                _field("listen_port", "Listen port", "port", required=True,
+                       default=4242, common=True),
+                _field("forward_ip", "Forward address", "text"),
+                _field("forward_port", "Forward port", "port"),
+            ],
+        ),
+        kind(
+            "PipeInterface",
+            "Pipe",
+            "Run a command and speak Reticulum over its pipes.",
+            "Other",
+            [
+                _field("command", "Command", "mono", required=True, common=True,
+                       placeholder="/usr/bin/my-transport"),
+            ],
+        ),
+        kind(
+            "I2PInterface",
+            "I2P",
+            "Reach peers through an I2P tunnel.",
+            "Other",
+            [],
+        ),
+        kind(
+            "SerialInterface",
+            "Serial",
+            "A raw serial link.",
+            "Radio",
+            serial_fields + [
+                _field("databits", "Data bits", "int", default=8),
+                _field(
+                    "parity",
+                    "Parity",
+                    "select",
+                    default="none",
+                    choices=["none", "even", "odd"],
+                ),
+                _field("stopbits", "Stop bits", "int", default=1),
+            ],
+        ),
+        kind(
+            "KISSInterface",
+            "KISS",
+            "Packet radio over a KISS TNC.",
+            "Radio",
+            serial_fields + kiss_extra + [
+                _field("id_callsign", "ID callsign", "text"),
+                _field("id_interval", "ID interval (s)", "int"),
+            ],
+        ),
+        kind(
+            "AX25KISSInterface",
+            "AX.25 KISS",
+            "AX.25 packet radio over a KISS TNC.",
+            "Radio",
+            [
+                _field("callsign", "Callsign", "text", required=True,
+                       common=True),
+                _field("ssid", "SSID", "int", default=0, common=True),
+            ]
+            + serial_fields
+            + kiss_extra,
+        ),
+        kind(
+            "RNodeInterface",
+            "RNode",
+            "A LoRa radio managed by RNode firmware.",
+            "Radio",
+            [
+                _field("port", "Serial port", "serial", required=True,
+                       common=True),
+                _field("frequency", "Frequency", "int", default=868000000,
+                       units="MHz", common=True),
+                _field("bandwidth", "Bandwidth", "int", default=125000,
+                       units="kHz", common=True),
+                _field(
+                    "spreadingfactor",
+                    "Spreading factor",
+                    "select",
+                    default="8",
+                    choices=[str(value) for value in range(5, 13)],
+                    common=True,
+                ),
+                _field(
+                    "codingrate",
+                    "Coding rate",
+                    "select",
+                    default="5",
+                    choices=["5", "6", "7", "8"],
+                    common=True,
+                ),
+                _field("txpower", "TX power", "int", default=17,
+                       units="dBm", common=True),
+                _field("airtime_limit_short", "Airtime limit, short (%)",
+                       "int", default=33),
+                _field("airtime_limit_long", "Airtime limit, long (%)",
+                       "int", default=1),
+                _field("id_callsign", "ID callsign", "text"),
+                _field("id_interval", "ID interval (s)", "int"),
+            ],
+        ),
+        kind(
+            "RNodeMultiInterface",
+            "RNode multi",
+            "Several RNode radios on one USB device.",
+            "Radio",
+            [
+                _field("port", "Serial port", "serial", required=True,
+                       common=True),
+                _field("id_callsign", "ID callsign", "text"),
+                _field("id_interval", "ID interval (s)", "int"),
+            ],
+        ),
+        kind(
+            "WeaveInterface",
+            "Weave",
+            "A Weave device over serial.",
+            "Radio",
+            [
+                _field("port", "Serial port", "serial", required=True,
+                       common=True),
+                _field("configured_bitrate", "Configured bitrate (bps)", "int"),
+            ],
+        ),
+    ]
+
+
+def describe_payload():
+    """The type catalogue plus why the catalogue is unmanageable, if it is."""
+    payload = {"types": interface_catalogue()}
+    if MODE == "shared":
+        payload["read_only"] = SHARED_READ_ONLY_REASON
+    return payload
+
+
+def do_describe(token):
+    try:
+        reply(token, True, describe_payload())
+    except Exception as exc:
+        reply(token, False, error=str(exc))
+
+
+# ---- mesh observability ----------------------------------------------------
+
+
+def _aspect_for(destination_hash):
+    try:
+        destination = RNS.Transport.destinations_map.get(destination_hash)
+    except Exception:
+        destination = None
+    if destination is None:
+        return None
+    name = str(getattr(destination, "name", "") or "")
+    parts = name.split(".")
+    if len(parts) > 1:
+        return ".".join(parts[:-1])
+    return None
+
+
+def _radio_stats(stats):
+    radio = {}
+    for key in (
+        "rssi",
+        "snr",
+        "frequency",
+        "bandwidth",
+        "sf",
+        "cr",
+        "txpower",
+        "airtime_short",
+        "airtime_long",
+    ):
+        value = stats.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            radio[key] = float(value)
+    return radio or None
+
+
+def _interface_payload(stats):
+    hashed = stats.get("hash")
+    if isinstance(hashed, (bytes, bytearray)):
+        hashed = hashed.hex()
+    payload = {
+        "name": str(stats.get("short_name") or stats.get("name") or ""),
+        "kind": str(stats.get("type") or ""),
+        "hash": str(hashed or ""),
+        "online": bool(stats.get("status")),
+        "rxb": int(stats.get("rxb") or 0),
+        "txb": int(stats.get("txb") or 0),
+        "rxs": float(stats.get("rxs") or 0.0),
+        "txs": float(stats.get("txs") or 0.0),
+    }
+    bitrate = stats.get("bitrate")
+    if isinstance(bitrate, (int, float)) and not isinstance(bitrate, bool):
+        payload["bitrate"] = int(bitrate)
+    mtu = stats.get("mtu")
+    if isinstance(mtu, int) and not isinstance(mtu, bool):
+        payload["mtu"] = mtu
+    peers = stats.get("peers")
+    if isinstance(peers, int) and not isinstance(peers, bool):
+        payload["peers"] = peers
+    mode = stats.get("mode")
+    if mode is not None:
+        if isinstance(mode, int) and not isinstance(mode, bool):
+            payload["mode"] = INTERFACE_MODES.get(mode, str(mode))
+        else:
+            payload["mode"] = str(mode)
+    ifac = stats.get("ifac_netname")
+    if ifac:
+        payload["ifac"] = str(ifac)
+    radio = _radio_stats(stats)
+    if radio:
+        payload["radio"] = radio
+    return payload
+
+
+def annotate_interface_health(interfaces, down_since, now_ms):
+    """Stamp offline interfaces with when their outage began.
+
+    ``down_since`` is threading state carried between samples. An interface
+    that is online loses its stamp; one that is offline keeps the first sample
+    that saw it down, so the age is the length of the outage, not the age of
+    the process. Returns the state for the next sample.
+    """
+    updated = dict(down_since)
+    for item in interfaces:
+        name = item.get("name")
+        if not name:
+            continue
+        if item.get("online"):
+            updated.pop(name, None)
+            item.pop("down_since", None)
+        else:
+            item["down_since"] = updated.setdefault(name, now_ms)
+    return updated
+
+
+def _copy_path_table():
+    """Copy the path table under its lock; formatting happens outside it."""
+    copied = []
+    with RNS.Transport.path_table_lock:
+        now = time.time()
+        for destination, entry in RNS.Transport.path_table.items():
+            try:
+                timestamp, next_hop, hops, _expires, _blobs, interface = entry[:6]
+            except Exception:
+                continue
+            used = entry[7] if len(entry) > 7 else 0
+            copied.append((destination, next_hop, hops, timestamp, used, interface))
+    return copied, now
+
+
+def mesh_snapshot():
+    global _interface_down_since
+    interfaces = []
+    stats = None
+    if reticulum is not None:
+        try:
+            stats = reticulum.get_interface_stats()
+        except Exception:
+            stats = None
+    if stats:
+        for entry in stats.get("interfaces") or []:
+            try:
+                interfaces.append(_interface_payload(entry))
+            except Exception:
+                continue
+    interfaces.sort(key=lambda item: item.get("name") or "")
+    _interface_down_since = annotate_interface_health(
+        interfaces, _interface_down_since, now_ms()
+    )
+
+    bitrates = {        item["name"]: item.get("bitrate")
+        for item in interfaces
+        if item.get("bitrate") is not None
+    }
+
+    copied, now = _copy_path_table()
+    online_by_name = {item["name"]: item["online"] for item in interfaces}
+    paths = []
+    unresponsive = 0
+    for destination, next_hop, hops, timestamp, used, interface in copied:
+        try:
+            refused = RNS.Transport.path_is_unresponsive(destination)
+        except Exception:
+            refused = False
+        name = str(getattr(interface, "name", interface) or "")
+        # A path through an interface that is down cannot carry anything right
+        # now, even though Reticulum keeps the entry until it expires.
+        if online_by_name.get(name) is False:
+            refused = True
+        if refused:
+            unresponsive += 1
+        age = now - (used or timestamp or now)
+        aspect = _aspect_for(destination)
+        entry = {
+            "destination": destination.hex()
+            if isinstance(destination, (bytes, bytearray))
+            else str(destination),
+            "hops": int(hops or 0),
+            "next_hop": next_hop.hex()
+            if isinstance(next_hop, (bytes, bytearray))
+            else str(next_hop),
+            "interface": name,
+            "state": "unresponsive" if refused else "responsive",
+            "age": round(float(age), 3),
+        }
+        if bitrates.get(name) is not None:
+            entry["bitrate"] = bitrates[name]
+        if aspect:
+            entry["aspect"] = aspect
+        paths.append(entry)
+
+    path_total = len(paths)
+    paths.sort(key=lambda item: (item["hops"], -item["age"]))
+    truncated = path_total > MESH_PATH_CAP
+    if truncated:
+        paths = paths[:MESH_PATH_CAP]
+
+    counters = {
+        "rx_packets": int(getattr(RNS.Transport, "rx_packets", 0) or 0),
+        "tx_packets": int(getattr(RNS.Transport, "tx_packets", 0) or 0),
+        "rx_pps": float(getattr(RNS.Transport, "rx_pps", 0.0) or 0.0),
+        "tx_pps": float(getattr(RNS.Transport, "tx_pps", 0.0) or 0.0),
+        "announce_rx": int(getattr(RNS.Transport, "announce_rxc", 0) or 0),
+        "announce_tx": int(getattr(RNS.Transport, "announce_txc", 0) or 0),
+        "links": int(getattr(RNS.Transport, "link_count", lambda: 0)() or 0),
+        "path_count": path_total,
+        "path_unresponsive": unresponsive,
+    }
+
+    with _other_services_lock:
+        other_services = list(_other_services)
+
+    return {
+        "transport": "ready" if state["ready"] else "starting",
+        "address": state["address"],
+        "started_at": state["started_at"],
+        "interfaces": interfaces,
+        "counters": counters,
+        "path_total": path_total,
+        "paths_truncated": truncated,
+        "paths": paths,
+        "other_services": other_services,
+    }
+
+
+def mesh_fingerprint(payload):
+    """Cheap identity of the mesh picture, ignoring byte counters."""
+    return (
+        payload.get("transport"),
+        payload.get("address"),
+        tuple(
+            (
+                item.get("name"),
+                item.get("online"),
+                item.get("bitrate"),
+                item.get("peers"),
+                item.get("mode"),
+                item.get("down_since"),
+            )
+            for item in payload.get("interfaces") or []
+        ),
+        (payload.get("counters") or {}).get("path_count"),
+        (payload.get("counters") or {}).get("announce_rx"),
+        tuple(
+            (
+                item.get("destination"),
+                item.get("hops"),
+                item.get("next_hop"),
+                item.get("interface"),
+                item.get("state"),
+            )
+            for item in payload.get("paths") or []
+        ),
+        tuple(
+            (item.get("destination"), item.get("aspect"))
+            for item in payload.get("other_services") or []
+        ),
+    )
+
+
+def emit_mesh(force=False):
+    global _mesh_fingerprint
+    if not state["ready"]:
+        return
+    try:
+        payload = mesh_snapshot()
+    except Exception:
+        emit(
+            {
+                "ev": "error",
+                "message": "mesh sampling failed: " + traceback.format_exc(limit=3),
+            }
+        )
+        return
+    fingerprint = mesh_fingerprint(payload)
+    if not force and fingerprint == _mesh_fingerprint:
+        return
+    _mesh_fingerprint = fingerprint
+    emit({"ev": "mesh", "mesh": payload})
+
+
+def mesh_loop():
+    while state["ready"]:
+        emit_mesh()
+        _mesh_wake.wait(MESH_SAMPLE_INTERVAL)
+        _mesh_wake.clear()
+
+
+def now_ms():
+    """Epoch milliseconds: the unit every timestamp on the wire uses but
+    ``started_at`` (see MeshStatus), which is seconds for uptime maths."""
+    return int(time.time() * 1000)
+
+
+def _remember_other_service(destination_hash, aspect, now):
+    destination = destination_hash.hex() if isinstance(destination_hash, (bytes, bytearray)) else str(destination_hash)
+    with _other_services_lock:
+        for index in range(len(_other_services) - 1, -1, -1):
+            if _other_services[index]["destination"] == destination:
+                _other_services.pop(index)
+        entry = {"destination": destination, "last_seen": int(now)}
+        if aspect:
+            entry["aspect"] = aspect
+        _other_services.append(entry)
+
+
+# ---- announce handling -----------------------------------------------------
+
+
+def _announce_context(destination_hash):
+    """Interface and hop count for an announce, from the path table."""
+    interface_name = None
+    hops = None
+    try:
+        with RNS.Transport.path_table_lock:
+            entry = RNS.Transport.path_table.get(destination_hash)
+            if entry is not None:
+                hops = int(entry[2] or 0)
+                received = entry[5]
+                interface_name = str(getattr(received, "name", received) or "") or None
+    except Exception:
+        pass
+    return interface_name, hops
 
 
 class AnnounceHandler:
@@ -298,7 +1446,18 @@ class AnnounceHandler:
                 name = LXMF.display_name_from_app_data(app_data)
             except Exception:
                 name = None
-            emit({"ev": "announce", "address": address, "name": name})
+            # Only report an aspect RNS still has cached; the spec allows
+            # omitting it rather than guessing.
+            aspect = _aspect_for(destination_hash)
+            interface, hops = _announce_context(destination_hash)
+            payload = {"ev": "announce", "address": address, "name": name,
+                       "aspect": aspect}
+            if interface:
+                payload["interface"] = interface
+            if hops is not None:
+                payload["hops"] = hops
+            emit(payload)
+            _mesh_wake.set()
         except Exception:
             emit(
                 {
@@ -307,6 +1466,25 @@ class AnnounceHandler:
                     + traceback.format_exc(limit=2),
                 }
             )
+
+
+class ServiceAnnounceHandler:
+    """Keeps a short in-memory ring of non-LXMF destinations for the graph."""
+
+    aspect_filter = None
+
+    def received_announce(self, destination_hash, announced_identity, app_data):
+        try:
+            aspect = _aspect_for(destination_hash)
+            if not aspect or aspect == "lxmf.delivery":
+                return
+            _remember_other_service(destination_hash, aspect, now_ms())
+            _mesh_wake.set()
+        except Exception:
+            pass
+
+
+# ---- message handling ------------------------------------------------------
 
 
 # ---- attachments -----------------------------------------------------------
@@ -539,6 +1717,7 @@ def on_delivery(message):
         )
 
 
+
 def announce_loop():
     while True:
         time.sleep(ANNOUNCE_INTERVAL)
@@ -663,8 +1842,56 @@ def handle_command(line):
                 "name": DISPLAY_NAME,
             }
         )
+    elif kind == "describe":
+        do_describe(command.get("token"))
+    elif kind == "import_config":
+        do_import(command.get("token"))
+    elif kind == "configure":
+        do_configure(command)
+    elif kind == "list_devices":
+        do_list_devices(command.get("token"), command.get("kind"))
     elif kind == "shutdown":
         raise SystemExit(0)
+
+
+def _read_commands(stream):
+    try:
+        for line in stream:
+            line = line.strip()
+            if line:
+                _commands.put(line)
+    except Exception:
+        pass
+    _commands_closed.set()
+
+
+def _next_command(timeout):
+    try:
+        return _commands.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _prestart(deferred):
+    """Give the engine a chance to render the config before Reticulum starts."""
+    if not MANAGED:
+        return
+    deadline = time.time() + CONFIGURE_GRACE_SECONDS
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            return
+        line = _next_command(left)
+        if line is None:
+            return
+        try:
+            command = json.loads(line)
+        except Exception:
+            continue
+        if command.get("cmd") == "configure":
+            handle_command(line)
+            return
+        deferred.append(line)
 
 
 def main(socket_spec=None, data_dir=None, display_name=None):
@@ -699,8 +1926,19 @@ def main(socket_spec=None, data_dir=None, display_name=None):
     # Whatever a previous run staged was never collected by the engine.
     _clear_staging()
 
-    if MODE != "shared":
+    if MODE != "shared" and not MANAGED:
         write_config(CONFIG_DIR)
+
+    # The command reader starts first so a configure can render the config
+    # before Reticulum reads it.
+    if _socket is not None:
+        commands = _socket.makefile("r", encoding="utf-8", errors="replace")
+    else:
+        commands = sys.stdin
+    threading.Thread(target=_read_commands, args=(commands,), daemon=True).start()
+
+    deferred = []
+    _prestart(deferred)
 
     source_notes = []
     if AUTO:
@@ -709,6 +1947,8 @@ def main(socket_spec=None, data_dir=None, display_name=None):
         source_notes.append("tcp-server")
     if TCP_CLIENT:
         source_notes.append("tcp-client")
+    if MANAGED:
+        source_notes.append("managed")
     emit(
         {
             "ev": "log",
@@ -718,11 +1958,15 @@ def main(socket_spec=None, data_dir=None, display_name=None):
         }
     )
 
-    RNS.Reticulum(
+    global reticulum
+    reticulum = RNS.Reticulum(
         configdir=CONFIG_DIR,
         loglevel=3,
+        # RNS logs to stdout by default, which is the JSON event channel here.
+        logdest=RNS.LOG_FILE,
         require_shared_instance=(MODE == "shared"),
     )
+    record_started_config()
 
     identity = load_identity(os.path.join(DATA_DIR, "identity"))
     global router, local_destination
@@ -735,10 +1979,12 @@ def main(socket_spec=None, data_dir=None, display_name=None):
     )
     router.register_delivery_callback(on_delivery)
     RNS.Transport.register_announce_handler(AnnounceHandler())
+    RNS.Transport.register_announce_handler(ServiceAnnounceHandler())
 
     address = local_destination.hash.hex()
     state["ready"] = True
     state["address"] = address
+    state["started_at"] = int(time.time())
     emit(
         {
             "ev": "state",
@@ -748,20 +1994,51 @@ def main(socket_spec=None, data_dir=None, display_name=None):
         }
     )
 
-    do_announce()
-    threading.Thread(target=announce_loop, daemon=True).start()
+    for line in deferred:
+        handle_command(line)
+    deferred = []
 
-    # Commands arrive from the daemon, one JSON object per line. Over a socket
-    # the file object gives us the same line iterator stdio does.
-    if _socket is not None:
-        commands = _socket.makefile("r", encoding="utf-8", errors="replace")
-    else:
-        commands = sys.stdin
-    for line in commands:
-        line = line.strip()
-        if line:
-            handle_command(line)
+    do_announce()
+    # A peer that dialled in a moment after we announced should still find us
+    # without waiting the full interval. Daemon so it cannot hold exit open.
+    reminder = threading.Timer(8.0, do_announce)
+    reminder.daemon = True
+    reminder.start()
+    global _mesh_thread, _announce_thread
+    _announce_thread = threading.Thread(target=announce_loop, daemon=True)
+    _announce_thread.start()
+    _mesh_thread = threading.Thread(target=mesh_loop, daemon=True)
+    _mesh_thread.start()
+
+    # Commands arrive from the daemon, one JSON object per line, on the reader
+    # thread started before the router came up.
+    while True:
+        line = _next_command(1.0)
+        if line is None:
+            if _commands_closed.is_set() and _commands.empty():
+                break
+            continue
+        handle_command(line)
+
+    # The engine is gone; stop sampling and announcing so nothing outlives the
+    # bridge (the embedded Android interpreter keeps the process alive).
+    state["ready"] = False
+    _mesh_wake.set()
+    for thread in (_mesh_thread, _announce_thread):
+        if thread is not None:
+            thread.join(timeout=1.0)
     return 0
+
+
+def load_identity(path):
+    try:
+        if os.path.exists(path):
+            return RNS.Identity.from_file(path)
+    except Exception as exc:  # corrupt or incompatible file
+        emit({"ev": "log", "level": "warn", "message": "identity reload failed: %s" % exc})
+    identity = RNS.Identity()
+    identity.to_file(path)
+    return identity
 
 
 if __name__ == "__main__":

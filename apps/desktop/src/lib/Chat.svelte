@@ -1,7 +1,7 @@
 <script>
   import { onDestroy } from "svelte";
   import { chat } from "./store.svelte.js";
-  import { dayLabel, formatBytes, formatTime, shortAddress } from "./util.js";
+  import { dayLabel, formatBytes, formatRelative, formatTime, shortAddress } from "./util.js";
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
@@ -25,7 +25,35 @@
   let dragging = $state(false);
 
   const conversation = $derived(chat.activeConversation);
+  const otherPeer = $derived(
+    conversation?.kind === "direct"
+      ? chat.peerById(conversation.peer_ids?.[0])
+      : null,
+  );
+  const reach = $derived(chat.peerReachability(otherPeer));
+  // The engine flushes the queue when a path returns; deriving the banner from
+  // the messages themselves makes it disappear at the same moment.
+  const queuedCount = $derived(
+    chat.activeMessages.filter(
+      (message) => chat.isMine(message) && message.state === "queued",
+    ).length,
+  );
   const canSend = $derived(draft.trim().length > 0 || chips.length > 0);
+
+  /// "direct via AutoInterface · last heard 2 min ago", or the plain answer
+  /// that there is no route. Null when the engine has no row to show.
+  const reachLine = $derived.by(() => {
+    if (!reach) return null;
+    const route = reach.path
+      ? `${reach.hops === 1 ? "direct" : `${reach.hops} hops`}${
+          reach.interface ? ` via ${reach.interface}` : ""
+        }`
+      : "no path right now";
+    const heard = reach.last_announce
+      ? `last heard ${formatRelative(reach.last_announce)}`
+      : "never heard";
+    return `${route} · ${heard}`;
+  });
 
   const rows = $derived.by(() => {
     const list = chat.activeMessages;
@@ -315,6 +343,9 @@
       <span class="chat-sub">
         {#if conversation?.kind === "direct"}
           {shortAddress(chat.conversationAddress(conversation))}
+          {#if reachLine}
+            · {reachLine}
+          {/if}
         {:else}
           {conversation?.peer_ids?.length ?? 0} peers
         {/if}
@@ -324,7 +355,15 @@
     <div class="chat-actions">
       <span class="transport-pill" data-state={chat.transport}>
         <span class="dot" data-state={chat.transport}></span>
-        {chat.transport === "ready" ? "Mesh online" : chat.transport === "starting" ? "Connecting" : "Offline"}
+        {#if chat.transport === "ready"}
+          Mesh online
+        {:else if chat.transport === "degraded"}
+          Mesh degraded
+        {:else if chat.transport === "starting"}
+          Connecting
+        {:else}
+          Offline
+        {/if}
       </span>
       <button class="icon-button" title="Search (coming soon)" disabled>
         <Icon name="search" size={18} />
@@ -334,6 +373,27 @@
       </button>
     </div>
   </header>
+
+  {#if queuedCount > 0}
+    <div class="queue-banner" role="status">
+      <Icon name="clock" size={15} />
+      <div class="queue-banner-text">
+        <strong>
+          {queuedCount === 1
+            ? "1 message is waiting to be sent"
+            : `${queuedCount} messages are waiting to be sent`}
+        </strong>
+        <span>
+          {#if reach?.path}
+            The path is back. They will be delivered as soon as the link is ready.
+          {:else}
+            There is no path to this peer right now, so nothing can be delivered.
+            They will be sent automatically when a path appears.
+          {/if}
+        </span>
+      </div>
+    </div>
+  {/if}
 
   <div class="messages" bind:this={viewport}>
     {#if rows.length === 0}

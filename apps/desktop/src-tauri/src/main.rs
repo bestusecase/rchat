@@ -28,25 +28,24 @@ use tauri::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(default = "default_true")]
-    pub auto_discovery: bool,
-    #[serde(default)]
-    pub tcp_relay: String,
     #[serde(default)]
     pub muted: bool,
 }
 
-fn default_true() -> bool {
-    true
+/// The network fields settings used to carry before interfaces moved into
+/// `rchat.db`. Read only, so an upgrade can notice them; the engine imports
+/// them into interface rows and the shell never writes them back.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct LegacyNetworkSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_discovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_relay: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            auto_discovery: true,
-            tcp_relay: String::new(),
-            muted: false,
-        }
+        Self { muted: false }
     }
 }
 
@@ -56,6 +55,13 @@ impl Settings {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
+    }
+
+    fn legacy_network(data_dir: &std::path::Path) -> Option<LegacyNetworkSettings> {
+        let text = std::fs::read_to_string(data_dir.join("desktop.json")).ok()?;
+        serde_json::from_str::<LegacyNetworkSettings>(&text)
+            .ok()
+            .filter(|legacy| legacy.auto_discovery.is_some() || legacy.tcp_relay.is_some())
     }
 
     fn save(&self, data_dir: &std::path::Path) {
@@ -74,8 +80,6 @@ impl Settings {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
-    auto_discovery: bool,
-    tcp_relay: String,
     muted: bool,
     autostart: bool,
 }
@@ -83,7 +87,6 @@ struct SettingsView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NetworkResult {
-    settings: SettingsView,
     base: String,
     token: String,
 }
@@ -105,7 +108,6 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_desktop_settings,
-            save_network_settings,
             set_muted,
             set_autostart,
             notify_activity,
@@ -121,10 +123,18 @@ fn main() {
             let data_dir = data_dir();
             std::fs::create_dir_all(&data_dir)?;
             let settings = Settings::load(&data_dir);
+            let legacy_network = Settings::legacy_network(&data_dir).map(|legacy| {
+                eprintln!(
+                    "rchat: importing the old network settings (auto discovery {:?}, relay {:?}) \
+                     into interfaces; this happens once",
+                    legacy.auto_discovery, legacy.tcp_relay
+                );
+                serde_json::to_string(&legacy).unwrap_or_default()
+            });
 
-            let engine = Engine::discover(&handle, data_dir.clone())
+            let engine = Engine::discover(&handle, data_dir.clone(), legacy_network)
                 .map_err(|err| Box::<dyn std::error::Error>::from(err))?;
-            let endpoint = engine.start(&settings);
+            let endpoint = engine.start();
             let (base, token, boot_error) = match &endpoint {
                 Ok(endpoint) => (endpoint.base(), endpoint.token.clone(), None),
                 Err(err) => (String::new(), String::new(), Some(err.clone())),
@@ -353,8 +363,6 @@ fn emit_settings(state: &AppState, app: &AppHandle) {
 fn settings_view(state: &AppState) -> SettingsView {
     let settings = state.settings.lock().unwrap().clone();
     SettingsView {
-        auto_discovery: settings.auto_discovery,
-        tcp_relay: settings.tcp_relay,
         muted: settings.muted,
         autostart: autostart_enabled(),
     }
@@ -368,51 +376,11 @@ fn get_desktop_settings(state: State<'_, AppState>) -> SettingsView {
 }
 
 #[tauri::command]
-fn save_network_settings(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    auto_discovery: bool,
-    tcp_relay: String,
-) -> Result<NetworkResult, String> {
-    let relay = tcp_relay.trim().to_string();
-    if !relay.is_empty() {
-        let (host, port) = relay
-            .rsplit_once(':')
-            .ok_or_else(|| "Use host:port for the relay, for example relay.example:4242.".to_string())?;
-        let port: u16 = port
-            .parse()
-            .map_err(|_| "The relay port must be a number between 1 and 65535.".to_string())?;
-        if port == 0 || host.trim().is_empty() {
-            return Err("The relay needs a host and a port.".into());
-        }
-    }
-
-    {
-        let mut settings = state.settings.lock().unwrap();
-        settings.auto_discovery = auto_discovery;
-        settings.tcp_relay = relay;
-        settings.save(&state.data_dir);
-    }
-
-    let settings = state.settings.lock().unwrap().clone();
-    let endpoint = state.engine.restart(&settings)?;
-    set_badge(0);
-    let _ = app.emit("engine-restarted", json!({ "base": endpoint.base() }));
-    Ok(NetworkResult {
-        settings: settings_view(&state),
-        base: endpoint.base(),
-        token: endpoint.token,
-    })
-}
-
-#[tauri::command]
 fn restart_engine(app: AppHandle, state: State<'_, AppState>) -> Result<NetworkResult, String> {
-    let settings = state.settings.lock().unwrap().clone();
-    let endpoint = state.engine.restart(&settings)?;
+    let endpoint = state.engine.restart()?;
     set_badge(0);
     let _ = app.emit("engine-restarted", json!({ "base": endpoint.base() }));
     Ok(NetworkResult {
-        settings: settings_view(&state),
         base: endpoint.base(),
         token: endpoint.token,
     })
