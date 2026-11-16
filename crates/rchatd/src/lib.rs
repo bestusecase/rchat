@@ -121,7 +121,25 @@ impl Engine {
         info!(id = %identity.id, name = %identity.display_name, "identity ready");
 
         let token = resolve_token(&data_dir)?;
-        let state = Arc::new(AppState::new(store.clone(), token.clone()));
+        let blobs = Arc::new(rchat_core::attachments::BlobStore::new(
+            data_dir.join("attachments"),
+        ));
+        let state = Arc::new(AppState::new(store.clone(), token.clone(), blobs.clone()));
+        // A crash between writing a blob and committing its row leaves bytes no
+        // message refers to. Sweep them before anything else can read the store.
+        // Uploads that no send ever claimed are stale by definition at startup.
+        match store.discard_unclaimed_uploads() {
+            Ok(0) => {}
+            Ok(removed) => info!(removed, "dropped abandoned attachment uploads"),
+            Err(err) => warn!(error = %err, "could not drop abandoned uploads"),
+        }
+        match store.sweep_orphan_blobs(&blobs) {
+            Ok(0) => {}
+            Ok(removed) => info!(removed, "swept unreferenced attachment blobs"),
+            Err(err) => warn!(error = %err, "could not sweep attachment blobs"),
+        }
+        // A budget lowered since the last launch is enforced on the next one.
+        state.enforce_attachment_budget();
         // Subscribe before the server starts so a host that reacts to events
         // (the Android shell) cannot miss the first one.
         let events = state.tx.clone();
@@ -341,6 +359,10 @@ fn spawn_bridge(
     let mut envs: Vec<(&str, String)> = vec![
         ("RCHAT_RNS_DIR", rns_dir),
         ("RCHAT_DISPLAY_NAME", display_name.to_string()),
+        (
+            "RCHAT_ATTACHMENT_MAX_BYTES",
+            app::inbound_limit().to_string(),
+        ),
     ];
     for (key, value) in extra_envs {
         envs.push((key.as_str(), value.clone()));

@@ -40,6 +40,9 @@ pub enum BridgeEvent {
         from: String,
         body: String,
         ts: i64,
+        /// Payloads the bridge staged on disk. Bytes never cross the JSON
+        /// channel; the engine reads these paths and deletes them.
+        attachments: Vec<BridgeAttachment>,
     },
     Announce {
         address: String,
@@ -56,6 +59,17 @@ pub enum BridgeEvent {
         level: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeAttachment {
+    /// Where the bridge wrote the payload. Empty when it refused the bytes.
+    pub path: String,
+    pub name: String,
+    pub ordinal: u32,
+    pub size: u64,
+    /// Set when the payload was not written: too large, or unreadable.
+    pub reason: Option<String>,
 }
 
 pub struct Bridge {
@@ -358,6 +372,7 @@ fn parse_event(line: &str) -> Option<BridgeEvent> {
             from: value.get("from").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             body: value.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
             ts: value.get("ts").and_then(|v| v.as_i64()).unwrap_or_else(crate_now_ms),
+            attachments: parse_attachments(&value),
         }),
         "announce" => Some(BridgeEvent::Announce {
             address: value.get("address").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -378,10 +393,79 @@ fn parse_event(line: &str) -> Option<BridgeEvent> {
     }
 }
 
+fn parse_attachments(value: &serde_json::Value) -> Vec<BridgeAttachment> {
+    let Some(items) = value.get("attachments").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| BridgeAttachment {
+            path: item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            ordinal: item
+                .get("ordinal")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(index as u32),
+            size: item.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            reason: item
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        })
+        .collect()
+}
+
 fn crate_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_event_carries_paths_not_bytes() {
+        let line = r#"{"ev":"message","id":"h","from":"ab","body":"look","ts":7,
+                        "attachments":[
+                          {"path":"/tmp/stage/one","name":"one.png","ordinal":0,"size":12},
+                          {"name":"big.pdf","ordinal":1,"size":999,
+                           "reason":"Attachment was too large to receive"}]}"#;
+        let Some(BridgeEvent::Message { attachments, body, .. }) = parse_event(line) else {
+            panic!("expected a message event");
+        };
+        assert_eq!(body, "look");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].path, "/tmp/stage/one");
+        assert_eq!(attachments[0].ordinal, 0);
+        assert_eq!(attachments[0].size, 12);
+        assert!(attachments[0].reason.is_none());
+        assert!(attachments[1].path.is_empty());
+        assert_eq!(
+            attachments[1].reason.as_deref(),
+            Some("Attachment was too large to receive")
+        );
+    }
+
+    #[test]
+    fn a_plain_message_has_no_attachments() {
+        let line = r#"{"ev":"message","id":"h","from":"ab","body":"hi","ts":7}"#;
+        let Some(BridgeEvent::Message { attachments, .. }) = parse_event(line) else {
+            panic!("expected a message event");
+        };
+        assert!(attachments.is_empty());
+    }
 }

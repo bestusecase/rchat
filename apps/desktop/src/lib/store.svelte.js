@@ -757,14 +757,99 @@ class ChatStore {
     }
   }
 
-  async sendMessage(body) {
+  async sendMessage(body, attachments = []) {
     const text = body.trim();
-    if (!text || !this.activeId) return;
-    await this.call({
+    if ((!text && attachments.length === 0) || !this.activeId) return;
+    const command = {
       cmd: "send_message",
       conversation_id: this.activeId,
       body: text,
-    });
+    };
+    if (attachments.length) command.attachments = attachments;
+    await this.call(command, 60000);
+  }
+
+  /// Upload one chosen file and return its descriptor. Raw bytes go over HTTP,
+  /// never the socket: the WebSocket stays a control channel.
+  ///
+  /// The filename travels percent-encoded because a header cannot carry an
+  /// arbitrary name, and the engine uses it only for display.
+  async uploadAttachment(file) {
+    if (!this.base || !this.token) {
+      throw new Error("Not connected to the engine.");
+    }
+    const url =
+      this.base.replace(/\/+$/, "") +
+      "/attachments?token=" +
+      encodeURIComponent(this.token);
+    let response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": file.type || "application/octet-stream",
+          "x-rchat-filename": encodeURIComponent(file.name || "attachment"),
+        },
+        body: file,
+      });
+    } catch {
+      throw new Error("Could not reach the engine to upload " + file.name + ".");
+    }
+    if (!response.ok) {
+      const reason = (await response.text()).trim();
+      throw new Error(
+        reason || "The engine refused " + (file.name || "that file") + ".",
+      );
+    }
+    const data = await response.json();
+    if (!data?.attachment?.hash) {
+      throw new Error("The engine did not accept " + (file.name || "that file") + ".");
+    }
+    return data.attachment;
+  }
+
+  /// The download route, with the token this client already holds. `variant`
+  /// is "thumb" for the display cache and unset for the original.
+  attachmentUrl(attachment, variant = null) {
+    const hash = typeof attachment === "string" ? attachment : attachment?.hash;
+    if (!hash) return "";
+    const base = this.base.replace(/\/+$/, "");
+    const thumb =
+      variant === "thumb" && typeof attachment === "object" && attachment?.thumbnail
+        ? attachment.thumbnail
+        : hash;
+    let url =
+      base +
+      "/attachments/" +
+      encodeURIComponent(thumb) +
+      "?token=" +
+      encodeURIComponent(this.token);
+    if (variant === "thumb" && !attachment?.thumbnail) url += "&variant=thumb";
+    return url;
+  }
+
+  /// Hand one attachment's bytes to the shell, which owns where they land. A
+  /// cancelled dialog is not an error and returns false.
+  async saveAttachment(attachment) {
+    if (!attachment?.hash || attachment.reason) return false;
+    if (this.shell) {
+      const saved = await invoke("save_attachment", {
+        hash: attachment.hash,
+        name: attachment.name || "attachment",
+      });
+      if (saved) this.toast("Saved " + (attachment.name || "attachment"));
+      return Boolean(saved);
+    }
+    // In a browser a download is the save action; the interface never holds
+    // the bytes itself.
+    const link = document.createElement("a");
+    link.href = this.attachmentUrl(attachment);
+    link.download = attachment.name || "attachment";
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    return true;
   }
 
   async addPeer(address, nickname) {

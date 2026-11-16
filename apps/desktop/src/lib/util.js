@@ -47,3 +47,11 @@ export function transportLabel(state) {
       return "Offline";
   }
 }
+
+/// A file size a person can read: "812 B", "64 KB", "8.0 MB".
+export function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return value + " B";
+  if (value < 1024 * 1024) return Math.round(value / 1024) + " KB";
+  return (value / (1024 * 1024)).toFixed(1) + " MB";
+}

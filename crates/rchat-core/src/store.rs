@@ -6,7 +6,7 @@
 //! client can replay instead of refetching.
 
 use anyhow::{Context, Result};
-use rchat_ipc::{Caps, ConversationInfo, MessageInfo, PeerInfo};
+use rchat_ipc::{AttachmentInfo, Caps, ConversationInfo, MessageInfo, PeerInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
@@ -122,6 +122,27 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_messages_conv_ts
                 ON messages(conversation_id, ts);
 
+            -- One row per attached file. `message_id` is null between an upload
+            -- and the send that claims it. Blobs themselves live in the
+            -- content-addressed store, keyed by `hash`; a row without bytes
+            -- carries `reason` instead.
+            CREATE TABLE IF NOT EXISTS attachments (
+                message_id TEXT REFERENCES messages(id) ON DELETE CASCADE,
+                ordinal    INTEGER NOT NULL DEFAULT 0,
+                name       TEXT NOT NULL,
+                mime       TEXT NOT NULL,
+                size       INTEGER NOT NULL,
+                hash       TEXT NOT NULL,
+                width      INTEGER,
+                height     INTEGER,
+                thumbnail  TEXT,
+                reason     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_attachments_message
+                ON attachments(message_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_attachments_hash
+                ON attachments(hash);
+
             CREATE TABLE IF NOT EXISTS events (
                 seq  INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -142,12 +163,16 @@ impl Store {
                 INSERT INTO messages_fts(messages_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
                 INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
             END;
+
             "#,
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema', '1')",
             [],
         )?;
+        // An install that predates attachments carries schema 1 or 2; schema 3
+        // added the attachment tables.
+        conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema'", [])?;
         Ok(())
     }
 
@@ -345,32 +370,19 @@ impl Store {
     }
 
     pub fn get_conversation(&self, id: &str) -> Result<ConversationInfo> {
-        let (kind, title, created_at, last_message_at, unread, preview): (
+        let (kind, title, created_at, last_message_at, unread): (
             String,
             Option<String>,
             i64,
             Option<i64>,
             i64,
-            Option<String>,
         ) = {
             let conn = self.conn.lock().unwrap();
             conn.query_row(
-                "SELECT c.kind, c.title, c.created_at, c.last_message_at, c.unread,
-                        (SELECT m.body FROM messages m
-                         WHERE m.conversation_id = c.id
-                         ORDER BY m.ts DESC, m.rowid DESC LIMIT 1)
+                "SELECT c.kind, c.title, c.created_at, c.last_message_at, c.unread
                  FROM conversations c WHERE c.id = ?1",
                 [id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                },
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?
             .with_context(|| format!("conversation {id} not found"))?
@@ -382,19 +394,16 @@ impl Store {
             created_at,
             last_message_at,
             unread,
-            preview,
+            preview: self.preview(id)?,
             peer_ids: self.members(id)?,
         })
     }
 
     pub fn list_conversations(&self) -> Result<Vec<ConversationInfo>> {
-        let rows: Vec<(String, String, Option<String>, i64, Option<i64>, i64, Option<String>)> = {
+        let rows: Vec<(String, String, Option<String>, i64, Option<i64>, i64)> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
-                "SELECT c.id, c.kind, c.title, c.created_at, c.last_message_at, c.unread,
-                        (SELECT m.body FROM messages m
-                         WHERE m.conversation_id = c.id
-                         ORDER BY m.ts DESC, m.rowid DESC LIMIT 1)
+                "SELECT c.id, c.kind, c.title, c.created_at, c.last_message_at, c.unread
                  FROM conversations c
                  ORDER BY coalesce(c.last_message_at, c.created_at) DESC",
             )?;
@@ -407,7 +416,6 @@ impl Store {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
-                        r.get(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -415,20 +423,44 @@ impl Store {
         };
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, kind, title, created_at, last_message_at, unread, preview) in rows {
+        for (id, kind, title, created_at, last_message_at, unread) in rows {
             let peer_ids = self.members(&id)?;
             out.push(ConversationInfo {
+                preview: self.preview(&id)?,
                 id,
                 kind,
                 title,
                 created_at,
                 last_message_at,
                 unread,
-                preview,
                 peer_ids,
             });
         }
         Ok(out)
+    }
+
+    /// One line for the conversation list. An attachment-only message still
+    /// says something: an image reads as a photo, a lone file is named.
+    fn preview(&self, conversation_id: &str) -> Result<Option<String>> {
+        let latest: Option<(String, String)> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT id, body FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY ts DESC, rowid DESC LIMIT 1",
+                [conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        };
+        let Some((message_id, body)) = latest else {
+            return Ok(None);
+        };
+        if !body.trim().is_empty() {
+            return Ok(Some(body));
+        }
+        let attachments = self.attachments_for(&message_id)?;
+        Ok(preview_text(&attachments))
     }
 
     pub fn members(&self, conversation_id: &str) -> Result<Vec<String>> {
@@ -453,6 +485,17 @@ impl Store {
     // ---- messages ---------------------------------------------------------
 
     pub fn insert_message(&self, msg: &MessageInfo, incoming: bool) -> Result<()> {
+        self.insert_message_with_attachments(msg, incoming, &[])
+    }
+
+    /// Store a message and the attachment rows that belong to it in one
+    /// transaction, so a crash never leaves a bubble pointing at nothing.
+    pub fn insert_message_with_attachments(
+        &self,
+        msg: &MessageInfo,
+        incoming: bool,
+        attachments: &[AttachmentInfo],
+    ) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -472,6 +515,9 @@ impl Store {
                 msg.edited_at
             ],
         )?;
+        for (ordinal, attachment) in attachments.iter().enumerate() {
+            insert_attachment_row(&tx, Some(&msg.id), ordinal, attachment)?;
+        }
         tx.execute(
             "UPDATE conversations
              SET last_message_at = max(coalesce(last_message_at, 0), ?2),
@@ -483,17 +529,52 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_message(&self, id: &str) -> Result<Option<MessageInfo>> {
+    /// Record an upload before any message refers to it. The send that uses the
+    /// hash inserts its own rows; this one only keeps the bytes reachable.
+    pub fn insert_upload(&self, attachment: &AttachmentInfo) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let msg = conn
-            .query_row(
+        insert_attachment_row(&conn, None, 0, attachment)?;
+        Ok(())
+    }
+
+    /// Forget unclaimed upload rows for hashes that a send has just claimed.
+    pub fn forget_unclaimed(&self, hashes: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        for hash in hashes {
+            conn.execute(
+                "DELETE FROM attachments WHERE message_id IS NULL AND hash = ?1",
+                [hash],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Drop upload rows no send ever claimed. Safe at startup, when no shell is
+    /// mid-composition: a row left by a refused or abandoned send would
+    /// otherwise pin its bytes for the life of the install.
+    pub fn discard_unclaimed_uploads(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute("DELETE FROM attachments WHERE message_id IS NULL", [])?;
+        Ok(removed)
+    }
+
+    pub fn get_message(&self, id: &str) -> Result<Option<MessageInfo>> {
+        let message = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
                 "SELECT id, conversation_id, author_id, ts, body, kind, reply_to, state, route, edited_at
                  FROM messages WHERE id = ?1",
                 [id],
                 map_message,
             )
-            .optional()?;
-        Ok(msg)
+            .optional()?
+        };
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        let mut messages = [message];
+        self.hydrate(&mut messages)?;
+        Ok(messages.into_iter().next())
     }
 
     pub fn update_message_state(&self, id: &str, state: &str) -> Result<()> {
@@ -515,47 +596,242 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<MessageInfo>> {
         let limit = limit.clamp(1, 500) as i64;
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, author_id, ts, body, kind, reply_to, state, route, edited_at
-             FROM messages
-             WHERE conversation_id = ?1 AND (?2 IS NULL OR ts < ?2)
-             ORDER BY ts DESC, rowid DESC
-             LIMIT ?3",
-        )?;
-        let mut rows = stmt
-            .query_map(params![conversation_id, before, limit], map_message)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, conversation_id, author_id, ts, body, kind, reply_to, state, route, edited_at
+                 FROM messages
+                 WHERE conversation_id = ?1 AND (?2 IS NULL OR ts < ?2)
+                 ORDER BY ts DESC, rowid DESC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![conversation_id, before, limit], map_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         rows.reverse();
+        self.hydrate(&mut rows)?;
         Ok(rows)
     }
 
     /// Messages that still need to go out. Recomputed rather than stored in a
     /// separate outbox table so there is a single source of truth.
     pub fn queued_messages(&self) -> Result<Vec<MessageInfo>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, author_id, ts, body, kind, reply_to, state, route, edited_at
-             FROM messages WHERE state = 'queued' ORDER BY ts ASC LIMIT 200",
-        )?;
-        let rows = stmt.query_map([], map_message)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT id, conversation_id, author_id, ts, body, kind, reply_to, state, route, edited_at
+                 FROM messages WHERE state = 'queued' ORDER BY ts ASC LIMIT 200",
+            )?;
+            let rows = stmt
+                .query_map([], map_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        self.hydrate(&mut rows)?;
         Ok(rows)
     }
 
     pub fn search(&self, query: &str, limit: u32) -> Result<Vec<MessageInfo>> {
+        let mut rows = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.conversation_id, m.author_id, m.ts, m.body, m.kind,
+                        m.reply_to, m.state, m.route, m.edited_at
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY m.ts DESC LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![query, limit.clamp(1, 200)], map_message)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        self.hydrate(&mut rows)?;
+        Ok(rows)
+    }
+
+    // ---- attachments ------------------------------------------------------
+
+    pub fn attachments_for(&self, message_id: &str) -> Result<Vec<AttachmentInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.conversation_id, m.author_id, m.ts, m.body, m.kind,
-                    m.reply_to, m.state, m.route, m.edited_at
-             FROM messages_fts f
-             JOIN messages m ON m.rowid = f.rowid
-             WHERE messages_fts MATCH ?1
-             ORDER BY m.ts DESC LIMIT ?2",
+            "SELECT name, mime, size, hash, width, height, thumbnail, reason
+             FROM attachments WHERE message_id = ?1 ORDER BY ordinal ASC",
         )?;
         let rows = stmt
-            .query_map(params![query, limit.clamp(1, 200)], map_message)?
+            .query_map([message_id], map_attachment)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Attach descriptors to messages that were read without them. A single
+    /// query per message: a page is at most a few hundred rows.
+    pub fn hydrate(&self, messages: &mut [MessageInfo]) -> Result<()> {
+        for message in messages.iter_mut() {
+            message.attachments = self.attachments_for(&message.id)?;
+        }
+        Ok(())
+    }
+
+    /// The descriptor for one hash. Uploads leave an unclaimed row, so a send
+    /// can only name bytes the engine actually stores.
+    pub fn attachment_by_hash(&self, hash: &str) -> Result<Option<AttachmentInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT name, mime, size, hash, width, height, thumbnail, reason
+                 FROM attachments WHERE hash = ?1 ORDER BY rowid DESC LIMIT 1",
+                [hash],
+                map_attachment,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The descriptor whose display thumbnail has this hash. Thumbnails are
+    /// addressed by their own content, so a client can use the hash from a
+    /// descriptor as an image URL without knowing the original.
+    pub fn attachment_by_thumbnail(&self, hash: &str) -> Result<Option<AttachmentInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT name, mime, size, hash, width, height, thumbnail, reason
+                 FROM attachments WHERE thumbnail = ?1 ORDER BY rowid DESC LIMIT 1",
+                [hash],
+                map_attachment,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn has_attachment_hash(&self, hash: &str) -> Result<bool> {
+        if hash.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM attachments WHERE hash = ?1 LIMIT 1",
+                [hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Bytes used by attachments that still have a blob, counting identical
+    /// content once.
+    pub fn attachment_usage(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let total: i64 = conn.query_row(
+            "SELECT coalesce(sum(size), 0) FROM
+               (SELECT max(size) AS size FROM attachments
+                WHERE reason IS NULL AND hash <> '' GROUP BY hash)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(total.max(0) as u64)
+    }
+
+    /// Hashes eligible for eviction, oldest first. `received` selects the first
+    /// pass; sent blobs are only considered once no received blob remains.
+    pub fn evictable_hashes(&self, received: bool) -> Result<Vec<(String, u64)>> {
+        let me = self
+            .identity()?
+            .map(|identity| identity.id)
+            .unwrap_or_default();
+        let comparison = if received { "<>" } else { "=" };
+        let sql = format!(
+            "SELECT a.hash, max(a.size)
+             FROM attachments a JOIN messages m ON m.id = a.message_id
+             WHERE a.reason IS NULL AND a.hash <> '' AND m.author_id {comparison} ?1
+             GROUP BY a.hash
+             ORDER BY min(m.ts) ASC, a.hash ASC"
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([me], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Clear every row that shares an evicted hash. Returns how many rows were
+    /// touched, so a caller can publish only when something changed.
+    pub fn mark_hash_missing(&self, hash: &str, reason: &str) -> Result<usize> {
+        if hash.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let touched = conn.execute(
+            "UPDATE attachments SET reason = ?2, thumbnail = NULL
+             WHERE hash = ?1 AND reason IS NULL",
+            params![hash, reason],
+        )?;
+        Ok(touched)
+    }
+
+    /// The thumbnail hash recorded for an original, if it had one.
+    pub fn thumbnail_for(&self, hash: &str) -> Result<Option<String>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        let found: Option<String> = conn
+            .query_row(
+                "SELECT thumbnail FROM attachments
+                 WHERE hash = ?1 AND thumbnail IS NOT NULL LIMIT 1",
+                [hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found)
+    }
+
+    pub fn has_attachment_thumbnail(&self, hash: &str) -> Result<bool> {
+        if hash.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM attachments WHERE thumbnail = ?1 LIMIT 1",
+                [hash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Remove one attachment's bytes and thumbnail, then mark every row that
+    /// shares the hash as missing. Returns whether a row changed.
+    pub fn evict_attachment(
+        &self,
+        blobs: &crate::attachments::BlobStore,
+        hash: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let thumbnail = self.thumbnail_for(hash)?;
+        blobs.remove(hash)?;
+        if let Some(thumbnail) = thumbnail {
+            blobs.remove_thumbnail(&thumbnail)?;
+        }
+        Ok(self.mark_hash_missing(hash, reason)? > 0)
+    }
+
+    /// Drop blobs and thumbnails no row references any more, which is what a
+    /// crash between writing bytes and committing the row leaves behind.
+    pub fn sweep_orphan_blobs(&self, blobs: &crate::attachments::BlobStore) -> Result<usize> {
+        crate::attachments::sweep(
+            blobs,
+            |hash| self.has_attachment_hash(hash),
+            |hash| self.has_attachment_thumbnail(hash),
+        )
     }
 
     // ---- event log --------------------------------------------------------
@@ -587,6 +863,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
 }
 
 fn map_peer(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerInfo> {
@@ -614,7 +891,72 @@ fn map_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageInfo> {
         state: r.get(7)?,
         route: r.get(8)?,
         edited_at: r.get(9)?,
+        attachments: Vec::new(),
     })
+}
+
+fn insert_attachment_row(
+    conn: &Connection,
+    message_id: Option<&str>,
+    ordinal: usize,
+    attachment: &AttachmentInfo,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO attachments
+           (message_id, ordinal, name, mime, size, hash, width, height, thumbnail, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            message_id,
+            ordinal as i64,
+            attachment.name,
+            attachment.mime,
+            attachment.size as i64,
+            attachment.hash,
+            attachment.width,
+            attachment.height,
+            attachment.thumbnail,
+            attachment.reason
+        ],
+    )?;
+    Ok(())
+}
+
+fn map_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentInfo> {
+    Ok(AttachmentInfo {
+        name: r.get(0)?,
+        mime: r.get(1)?,
+        size: r.get::<_, i64>(2)?.max(0) as u64,
+        hash: r.get(3)?,
+        width: r.get(4)?,
+        height: r.get(5)?,
+        thumbnail: r.get(6)?,
+        reason: r.get(7)?,
+    })
+}
+
+/// The conversation-list line for a message whose body is only a caption.
+fn preview_text(attachments: &[AttachmentInfo]) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    if attachments.len() == 1 {
+        let only = &attachments[0];
+        return Some(if only.is_image() {
+            "Photo".to_string()
+        } else if only.name.is_empty() {
+            "File".to_string()
+        } else {
+            only.name.clone()
+        });
+    }
+    let images = attachments.iter().filter(|item| item.is_image()).count();
+    if images == attachments.len() {
+        Some(format!("{images} photos"))
+    } else if images == 0 {
+        Some(format!("{} files", attachments.len()))
+    } else {
+        Some(format!("{} attachments", attachments.len()))
+    }
 }
 
 #[cfg(test)]
@@ -633,6 +975,20 @@ mod tests {
             state: "sent".into(),
             route: None,
             edited_at: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn attachment(name: &str, mime: &str, size: u64, hash: &str) -> AttachmentInfo {
+        AttachmentInfo {
+            name: name.to_string(),
+            mime: mime.to_string(),
+            size,
+            hash: hash.to_string(),
+            width: None,
+            height: None,
+            thumbnail: None,
+            reason: None,
         }
     }
 
@@ -707,5 +1063,311 @@ mod tests {
         store.insert_message(&msg(&conv.id, "peer-1", "lazy dog", 2), true).unwrap();
         let hits = store.search("quick", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn attachments_are_ordered_and_hydrated_with_their_message() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let mut message = msg(&conv.id, "peer-1", "look", 10);
+        message.kind = "image".into();
+        let rows = [
+            attachment("one.png", "image/png", 10, &"aa".repeat(32)),
+            attachment("two.pdf", "application/pdf", 20, &"bb".repeat(32)),
+        ];
+        store
+            .insert_message_with_attachments(&message, true, &rows)
+            .unwrap();
+
+        let read = store.get_message(&message.id).unwrap().unwrap();
+        assert_eq!(read.attachments, rows);
+        let page = store.list_messages(&conv.id, None, 10).unwrap();
+        assert_eq!(page[0].attachments.len(), 2);
+        assert_eq!(page[0].attachments[1].name, "two.pdf");
+        // The caption stays in the body and is what search sees.
+        assert_eq!(page[0].body, "look");
+        assert_eq!(store.search("look", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_message_takes_its_attachment_rows() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let mut message = msg(&conv.id, "peer-1", "", 10);
+        let rows = [attachment("photo.png", "image/png", 10, &"cc".repeat(32))];
+        store
+            .insert_message_with_attachments(&message, true, &rows)
+            .unwrap();
+        assert!(store.has_attachment_hash(&rows[0].hash).unwrap());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM messages WHERE id = ?1", [&message.id])
+                .unwrap();
+        }
+        assert!(!store.has_attachment_hash(&rows[0].hash).unwrap());
+        assert!(store.attachments_for(&message.id).unwrap().is_empty());
+        message.body.clear();
+    }
+
+    #[test]
+    fn an_upload_row_is_claimable_but_not_a_message() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        store
+            .insert_upload(&attachment("draft.png", "image/png", 5, &"dd".repeat(32)))
+            .unwrap();
+
+        let found = store
+            .attachment_by_hash(&"dd".repeat(32))
+            .unwrap()
+            .expect("an upload leaves a row a send can name");
+        assert_eq!(found.name, "draft.png");
+        assert_eq!(store.attachment_usage().unwrap(), 5);
+        assert!(store.evictable_hashes(true).unwrap().is_empty(), "unclaimed rows have no author");
+
+        store.forget_unclaimed(&[found.hash]).unwrap();
+        assert!(store.attachment_by_hash(&"dd".repeat(32)).unwrap().is_none());
+    }
+
+    #[test]
+    fn usage_counts_identical_content_once() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let shared = "ee".repeat(32);
+        let mut first = msg(&conv.id, "peer-1", "", 1);
+        first.kind = "image".into();
+        let mut second = msg(&conv.id, "me", "", 2);
+        second.kind = "image".into();
+        store
+            .insert_message_with_attachments(
+                &first,
+                true,
+                &[attachment("a.png", "image/png", 100, &shared)],
+            )
+            .unwrap();
+        store
+            .insert_message_with_attachments(
+                &second,
+                false,
+                &[attachment("a-again.png", "image/png", 100, &shared)],
+            )
+            .unwrap();
+        assert_eq!(store.attachment_usage().unwrap(), 100);
+    }
+
+    #[test]
+    fn eviction_offers_received_blobs_before_sent_ones() {
+        let store = Store::open_in_memory().unwrap();
+        let me = store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let received = "11".repeat(32);
+        let sent_old = "22".repeat(32);
+        let sent_new = "33".repeat(32);
+
+        let mut incoming = msg(&conv.id, "peer-1", "", 100);
+        incoming.kind = "file".into();
+        let mut mine = msg(&conv.id, &me.id, "", 50);
+        mine.kind = "file".into();
+        let mut mine_newer = msg(&conv.id, &me.id, "", 200);
+        mine_newer.kind = "file".into();
+        store
+            .insert_message_with_attachments(
+                &incoming,
+                true,
+                &[attachment("in.pdf", "application/pdf", 7, &received)],
+            )
+            .unwrap();
+        store
+            .insert_message_with_attachments(
+                &mine,
+                false,
+                &[attachment("old.pdf", "application/pdf", 7, &sent_old)],
+            )
+            .unwrap();
+        store
+            .insert_message_with_attachments(
+                &mine_newer,
+                false,
+                &[attachment("new.pdf", "application/pdf", 7, &sent_new)],
+            )
+            .unwrap();
+
+        let received_first = store.evictable_hashes(true).unwrap();
+        assert_eq!(
+            received_first.iter().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(),
+            [received.as_str()]
+        );
+        let sent_after = store.evictable_hashes(false).unwrap();
+        assert_eq!(
+            sent_after.iter().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(),
+            [sent_old.as_str(), sent_new.as_str()],
+            "oldest sent blob goes first"
+        );
+    }
+
+    #[test]
+    fn marking_a_hash_missing_keeps_the_row_and_its_metadata() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let message = msg(&conv.id, "peer-1", "caption", 10);
+        let hash = "44".repeat(32);
+        store
+            .insert_message_with_attachments(
+                &message,
+                true,
+                &[attachment("gone.pdf", "application/pdf", 9, &hash)],
+            )
+            .unwrap();
+
+        let touched = store
+            .mark_hash_missing(&hash, crate::attachments::REASON_EVICTED)
+            .unwrap();
+        assert_eq!(touched, 1);
+
+        let read = store.get_message(&message.id).unwrap().unwrap();
+        assert_eq!(read.body, "caption");
+        assert_eq!(read.ts, 10);
+        let item = &read.attachments[0];
+        assert_eq!(item.name, "gone.pdf");
+        assert_eq!(item.size, 9);
+        assert!(!item.has_bytes());
+        assert_eq!(
+            item.reason.as_deref(),
+            Some(crate::attachments::REASON_EVICTED)
+        );
+        assert_eq!(store.attachment_usage().unwrap(), 0, "evicted bytes stop counting");
+        assert!(
+            store.evictable_hashes(true).unwrap().is_empty(),
+            "an evicted blob is not evicted twice"
+        );
+    }
+
+    #[test]
+    fn conversation_previews_describe_attachments() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+
+        let mut photo = msg(&conv.id, "peer-1", "", 10);
+        photo.kind = "image".into();
+        store
+            .insert_message_with_attachments(
+                &photo,
+                true,
+                &[attachment("photo.png", "image/png", 1, &"55".repeat(32))],
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_conversation(&conv.id).unwrap().preview.as_deref(),
+            Some("Photo")
+        );
+
+        let mut pdf = msg(&conv.id, "peer-1", "", 20);
+        pdf.kind = "file".into();
+        store
+            .insert_message_with_attachments(
+                &pdf,
+                true,
+                &[attachment("statement.pdf", "application/pdf", 2, &"66".repeat(32))],
+            )
+            .unwrap();
+        assert_eq!(
+            store.list_conversations().unwrap()[0].preview.as_deref(),
+            Some("statement.pdf")
+        );
+
+        let captioned = msg(&conv.id, "peer-1", "look at this", 30);
+        store.insert_message(&captioned, true).unwrap();
+        assert_eq!(
+            store.get_conversation(&conv.id).unwrap().preview.as_deref(),
+            Some("look at this"),
+            "a caption is still the preview"
+        );
+    }
+
+    #[test]
+    fn evicting_an_attachment_frees_both_halves() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "rchat-evict-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blobs = crate::attachments::BlobStore::new(&dir);
+
+        let ingested = crate::attachments::ingest_bytes(
+            &blobs,
+            &{
+                let mut picture = image::RgbImage::new(20, 20);
+                picture.put_pixel(0, 0, image::Rgb([1, 2, 3]));
+                let mut out = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::ImageRgb8(picture)
+                    .write_to(&mut out, image::ImageFormat::Png)
+                    .unwrap();
+                out.into_inner()
+            },
+            "photo.png",
+            None,
+        )
+        .unwrap();
+        let thumbnail = ingested.thumbnail.clone().unwrap();
+
+        let mut message = msg(&conv.id, "peer-1", "", 10);
+        message.kind = "image".into();
+        store
+            .insert_message_with_attachments(&message, true, &[ingested.descriptor()])
+            .unwrap();
+
+        assert!(store.evict_attachment(&blobs, &ingested.hash, crate::attachments::REASON_EVICTED).unwrap());
+        assert!(!blobs.contains(&ingested.hash));
+        assert!(!blobs.contains_thumbnail(&thumbnail));
+        let read = store.get_message(&message.id).unwrap().unwrap();
+        assert_eq!(read.body, "", "an empty caption stays empty");
+        assert_eq!(read.ts, 10);
+        assert_eq!(
+            read.attachments[0].reason.as_deref(),
+            Some(crate::attachments::REASON_EVICTED)
+        );
+        assert!(store.attachment_usage().unwrap() == 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_orphan_sweep_keeps_referenced_blobs_only() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let conv = store.open_direct("peer-1").unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "rchat-sweep-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blobs = crate::attachments::BlobStore::new(&dir);
+        let kept = blobs.write_bytes(b"kept bytes").unwrap();
+        let orphan = blobs.write_bytes(b"orphan bytes").unwrap();
+
+        let message = msg(&conv.id, "peer-1", "", 10);
+        store
+            .insert_message_with_attachments(
+                &message,
+                true,
+                &[attachment("keep.png", "image/png", 10, &kept)],
+            )
+            .unwrap();
+
+        let removed = store.sweep_orphan_blobs(&blobs).unwrap();
+        assert_eq!(removed, 1);
+        assert!(blobs.contains(&kept), "a referenced blob stays");
+        assert!(!blobs.contains(&orphan), "a crash leftover goes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

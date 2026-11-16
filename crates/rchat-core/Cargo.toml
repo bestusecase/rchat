@@ -12,6 +12,15 @@ rchat-ipc = { path = "../rchat-ipc" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 getrandom = "0.2"
+# Decoding, dimensions and the one display thumbnail. No encoder beyond JPEG,
+# because the payload itself is never transcoded.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "bmp",
+] }
 
 [dev-dependencies]
 tempfile = "3"

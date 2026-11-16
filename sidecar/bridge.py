@@ -45,6 +45,7 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -147,6 +148,17 @@ AUTO_DEFAULT = "1" if not TCP_SERVER and not TCP_CLIENT else "0"
 AUTO = env_flag("RCHAT_RNS_AUTO", AUTO_DEFAULT == "1")
 
 ANNOUNCE_INTERVAL = 300
+
+ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024
+REASON_TOO_LARGE = "Attachment was too large to receive"
+REASON_UNREADABLE = "Attachment could not be read"
+IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+)
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 state = {"ready": False, "address": None}
 local_destination = None
 router = None
@@ -297,6 +309,192 @@ class AnnounceHandler:
             )
 
 
+# ---- attachments -----------------------------------------------------------
+#
+# Bytes never cross the JSON channel. The engine hands the bridge `{name, path}`
+# on send and the bridge stages received payloads under a directory the engine
+# collects from. Both directions use the standard LXMF image and
+# file-attachments fields, so Sideband peers interoperate in both directions.
+
+
+class AttachmentReadError(Exception):
+    """A file the engine asked to send could not be read."""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.name = name
+
+
+def attachment_max_bytes():
+    raw = os.environ.get("RCHAT_ATTACHMENT_MAX_BYTES")
+    if raw:
+        try:
+            value = int(str(raw).strip())
+            if value >= 0:
+                return value
+        except ValueError:
+            pass
+    return ATTACHMENT_MAX_BYTES
+
+
+def staging_dir():
+    """Derived on every call: ``main`` may override ``DATA_DIR``."""
+    return os.path.join(DATA_DIR, "staging")
+
+
+def _clear_staging():
+    """Drop payloads a previous run staged but the engine never collected."""
+    directory = staging_dir()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        try:
+            os.remove(os.path.join(directory, name))
+        except OSError:
+            pass
+
+
+def _basename(path):
+    return os.path.basename(str(path or "").replace("\\", "/"))
+
+
+def _looks_like_image(name, data):
+    if data.startswith(IMAGE_MAGIC) or (data[8:12] == b"WEBP" and data[:4] == b"RIFF"):
+        return True
+    return str(name).lower().endswith(IMAGE_EXTENSIONS)
+
+
+def attachment_fields(command):
+    """Build the LXMF fields for a send command's `{name, path}` list.
+
+    One image uses the standard image field; anything else (including several
+    images) uses the standard file-attachments field. Raises
+    :class:`AttachmentReadError` when a path cannot be read, so the caller can
+    fail the send instead of quietly dropping the file.
+    """
+    specs = command.get("attachments") or []
+    if not isinstance(specs, (list, tuple)) or not specs:
+        return {}
+
+    files = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        name = _basename(spec.get("name")) or "attachment"
+        path = spec.get("path")
+        if not path:
+            raise AttachmentReadError(name)
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            raise AttachmentReadError(name)
+        files.append((name, data))
+
+    if not files:
+        return {}
+    if len(files) == 1 and _looks_like_image(*files[0]):
+        return {LXMF.FIELD_IMAGE: [files[0][0], files[0][1]]}
+    return {LXMF.FIELD_FILE_ATTACHMENTS: [[name, data] for name, data in files]}
+
+
+def _decode_name(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return ""
+
+
+def _as_pair(value):
+    """A `(name, bytes)` tuple, or None if the payload is not one.
+
+    Some clients send a filename as bytes rather than text; both are accepted.
+    A payload that is not bytes is refused rather than guessed at.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    payload = value[1]
+    if isinstance(payload, bytearray):
+        payload = bytes(payload)
+    if not isinstance(payload, bytes):
+        return None
+    return _decode_name(value[0]), payload
+
+
+def decode_attachment_fields(fields):
+    """Return `[(name, bytes)]` from LXMF fields, in order. Never raises.
+
+    The image field is read before the file-attachments field, so a peer that
+    sets both shows its image first. Malformed entries are skipped so a bad
+    payload cannot cost the message its text.
+    """
+    if not isinstance(fields, dict):
+        return []
+    entries = []
+    try:
+        pair = _as_pair(fields.get(LXMF.FIELD_IMAGE))
+        if pair is not None:
+            entries.append(pair)
+    except Exception:
+        pass
+    try:
+        files = fields.get(LXMF.FIELD_FILE_ATTACHMENTS)
+        if isinstance(files, (list, tuple)):
+            for item in files:
+                pair = _as_pair(item)
+                if pair is not None:
+                    entries.append(pair)
+    except Exception:
+        pass
+    return entries
+
+
+def stage_attachments(fields):
+    """Write received payloads into the staging directory.
+
+    Returns `[{name, ordinal, size[, path][, reason]}]`. An entry with a reason
+    has no path: the engine records the row without bytes so the bubble can say
+    the attachment did not arrive. Empty when the message carried none.
+    """
+    entries = decode_attachment_fields(fields)
+    if not entries:
+        return []
+
+    limit = attachment_max_bytes()
+    directory = staging_dir()
+    staged = []
+    for index, (name, payload) in enumerate(entries):
+        item = {
+            "name": name or ("attachment-%d" % (index + 1)),
+            "ordinal": index,
+            "size": len(payload),
+        }
+        if len(payload) > limit:
+            item["reason"] = REASON_TOO_LARGE
+            staged.append(item)
+            continue
+        try:
+            os.makedirs(directory, exist_ok=True)
+            handle, path = tempfile.mkstemp(prefix="rx-", dir=directory)
+            try:
+                with os.fdopen(handle, "wb") as stream:
+                    stream.write(payload)
+            except Exception:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise
+            item["path"] = path
+        except OSError:
+            item["reason"] = REASON_UNREADABLE
+        staged.append(item)
+    return staged
+
+
 def on_delivery(message):
     try:
         content = message.content
@@ -318,15 +516,20 @@ def on_delivery(message):
             remote_hash = str(remote_hash or "")
 
         timestamp = message.timestamp or time.time()
-        emit(
-            {
-                "ev": "message",
-                "id": remote_hash,
-                "from": source,
-                "body": body,
-                "ts": int(float(timestamp) * 1000),
-            }
-        )
+        payload = {
+            "ev": "message",
+            "id": remote_hash,
+            "from": source,
+            "body": body,
+            "ts": int(float(timestamp) * 1000),
+        }
+        try:
+            attachments = stage_attachments(getattr(message, "fields", None))
+        except Exception:
+            attachments = []
+        if attachments:
+            payload["attachments"] = attachments
+        emit(payload)
     except Exception:
         emit(
             {
@@ -371,6 +574,18 @@ def do_send(command):
         return
 
     try:
+        fields = attachment_fields(command)
+    except AttachmentReadError as exc:
+        emit(
+            {
+                "ev": "error",
+                "message": "\"%s\" could not be read; attach it again" % exc.name,
+            }
+        )
+        receipt("failed")
+        return
+
+    try:
         if not RNS.Transport.has_path(destination_hash):
             RNS.Transport.request_path(destination_hash)
             deadline = time.time() + 12
@@ -401,6 +616,7 @@ def do_send(command):
             local_destination,
             content=body,
             title=title,
+            fields=fields,
             desired_method=LXMF.LXMessage.DIRECT,
         )
 
@@ -480,6 +696,8 @@ def main(socket_spec=None, data_dir=None, display_name=None):
 
     emit({"ev": "state", "state": "starting", "name": DISPLAY_NAME})
     os.makedirs(DATA_DIR, exist_ok=True)
+    # Whatever a previous run staged was never collected by the engine.
+    _clear_staging()
 
     if MODE != "shared":
         write_config(CONFIG_DIR)
