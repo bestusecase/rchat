@@ -22,7 +22,43 @@ TCP_PORT="${TCP_PORT:-4242}"
 cargo build -q -p rchatd
 
 rm -rf .dev/a .dev/b
-mkdir -p .dev
+mkdir -p .dev/a/rns .dev/b/rns
+
+# Two Reticulum instances on one machine cannot both bind AutoInterface's
+# fixed data port, so each side starts from an imported hand-written config.
+cat > .dev/a/rns/config <<EOF
+[reticulum]
+  enable_transport = No
+  share_instance = No
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 3
+
+[interfaces]
+  [[TCP Server]]
+    type = TCPServerInterface
+    interface_enabled = True
+    listen_ip = 127.0.0.1
+    listen_port = $TCP_PORT
+EOF
+
+cat > .dev/b/rns/config <<EOF
+[reticulum]
+  enable_transport = No
+  share_instance = No
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 3
+
+[interfaces]
+  [[Peer]]
+    type = TCPClientInterface
+    interface_enabled = True
+    target_host = 127.0.0.1
+    target_port = $TCP_PORT
+EOF
 
 PIDS=()
 cleanup() {

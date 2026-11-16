@@ -196,12 +196,26 @@ Overview, Interfaces, Paths, Announced and Map. Each leaf sees the other two
 hops away behind the relay, which is what the map draws — a peer on its hop
 ring, the first-hop transport as a diamond, and the interface on the edge.
 
-The scripted check asserts the topology, path filtering and announce history:
+The scripted check asserts the topology, path filtering and announce history,
+and that a message crosses the relay with no peer address in either leaf's
+interface rows:
 
 ```bash
 node scripts/smoke-mesh.mjs http://127.0.0.1:8791 .dev/mesh/a/token \
   http://127.0.0.1:8793 .dev/mesh/c/token
 ```
+
+The full rendezvous story runs the relay and both leaves itself:
+
+```bash
+node scripts/smoke-rendezvous.mjs
+```
+
+It proves relay delivery and a leaf restart with the other side's stored
+configuration untouched. Add `--phases=a,b,c` on two devices (or with each leaf
+in its own network namespace) to also remove the relay and fall back to local
+discovery; RNS AutoInterface uses one fixed data port per host, so two instances
+on this machine cannot both run it.
 
 ## Transports
 
@@ -211,13 +225,24 @@ delete interfaces on the Network page. The first start after an upgrade imports
 an existing hand-written `rns/config` once (including unknown sections, kept
 verbatim), so an RNode added by hand keeps working.
 
-The environment variables below are only a seed for a config file that does not
-exist yet — for development scripts and fresh installs. Once the interface
-database exists they are ignored.
+A fresh install starts with one enabled `AutoInterface` row, so two devices on
+the same network talk with no configuration at all. Adding a relay never turns
+discovery off: keep the `AutoInterface` row and add a TCP (or backbone) client
+pointing at a transport-enabled relay, preferably by hostname. The stored address
+belongs to the relay, and no device ever writes another device's current address
+into its own configuration.
+
+An upgrade imports the old discovery flag and relay string once, with origin
+`legacy`; a malformed relay is kept disabled with the reason shown instead of
+being dropped.
+
+The environment variables below are a development seed only, and only when
+`RCHAT_RNS_ENV_SEED=1`. Production never seeds interfaces from the environment.
 
 | Variable | Meaning |
 | --- | --- |
-| `RCHAT_RNS_AUTO` | `1`/`0` — AutoInterface LAN discovery (on by default) |
+| `RCHAT_RNS_ENV_SEED` | `1` — let the environment seed the bridge (development only) |
+| `RCHAT_RNS_AUTO` | `1`/`0` — AutoInterface LAN discovery |
 | `RCHAT_RNS_TCP_SERVER` | Listen, e.g. `4242` or `0.0.0.0:4242` |
 | `RCHAT_RNS_TCP_CLIENT` | Connect, e.g. `host:4242` |
 | `RCHAT_RNS_GROUP` | AutoInterface group id |
@@ -231,10 +256,17 @@ Other process settings: `RCHAT_PORT`, `RCHAT_DATA_DIR`, `RCHAT_TOKEN`,
 ## What works
 
 - 1:1 conversations over LXMF, direct and opportunistic delivery
+- Zero-config LAN discovery on by default, and a named relay for devices on
+  different networks
 - Peer discovery from announces, plus manual add by address
 - Delivery receipts, live state (`queued → sending → sent → delivered`)
 - Persistent encrypted-at-rest-ready SQLite history and full-text search
 - Offline queue that flushes when the mesh comes back
+- Honest transport state: `ready` only when an interface is online, `degraded`
+  when the bridge is up but nothing can move, per-interface outage age, and a
+  per-peer path/hop/interface/last-announce answer
+- One-shot import of the old discovery toggle, relay string and hand-written
+  `rns/config`
 - Display-name changes propagate to peers
 - Reconnects automatically if the engine restarts
 - A Reticulum page with live interface, counter and path state, durable

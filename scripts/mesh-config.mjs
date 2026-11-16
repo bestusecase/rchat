@@ -89,26 +89,44 @@ async function ensure(api, name, kind, config) {
   await setEnabled(api, existing, true);
 }
 
-async function setDiscovery(api, enabled) {
+async function setDiscovery(api, enabled, config = null) {
   const rows = await interfaces(api);
   const auto = rows.filter((row) => row.kind === DISCOVERY);
   if (!auto.length) {
     if (!enabled) return;
     // A store that predates the first-run seed: add the row rather than
     // relying on an environment variable.
-    await create(api, DISCOVERY, DISCOVERY, { group_id: "reticulum" });
+    await create(api, DISCOVERY, DISCOVERY, config ?? { group_id: "reticulum" });
     return;
   }
-  for (const row of auto) await setEnabled(api, row, enabled);
+  const [first, ...rest] = auto;
+  if (config && JSON.stringify(first.config) !== JSON.stringify(config)) {
+    await api.call(
+      { cmd: "update_interface", interface_id: first.id, config },
+      30000,
+    );
+  }
+  await setEnabled(api, first, enabled);
+  for (const row of rest) await setEnabled(api, row, false);
+}
+
+/// Discovery settings. The group id is the only knob: RNS AutoInterface uses one
+/// fixed data port per host, so two full Reticulum instances on the same
+/// machine cannot both run discovery. Use this role on a real device, or inside
+/// separate network namespaces.
+function discoveryConfig(groupId) {
+  return {
+    group_id: groupId || process.env.DISCOVERY_GROUP || "reticulum",
+  };
 }
 
 /// Apply one topology role. Idempotent, so a restarted script can re-run it.
-export async function configureInterfaces(api, role, target) {
+export async function configureInterfaces(api, role, target, options = {}) {
   await waitForBridge(api);
 
   if (role === "discovery") {
     // Bring discovery up first so the mesh is never left with zero paths.
-    await setDiscovery(api, true);
+    await setDiscovery(api, true, discoveryConfig(options.groupId));
     for (const row of await interfaces(api)) {
       if (RENDEZVOUS_NAMES.has(row.name)) {
         await api.call(

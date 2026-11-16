@@ -80,9 +80,15 @@ if (byPrefix.paths[0].destination !== addressC) {
 }
 console.log("mesh_paths filter: ok, name:", byPrefix.paths[0].name ?? "(unknown)");
 
-const byInterface = await a.call({ cmd: "mesh_paths", query: "TCP Client", limit: 50 });
+const byInterface = await a.call({
+  cmd: "mesh_paths",
+  query: path.interface,
+  limit: 50,
+});
 if (!byInterface.paths.some((entry) => entry.destination === addressC)) {
-  throw new Error("mesh_paths interface filter did not include C");
+  throw new Error(
+    `mesh_paths interface filter "${path.interface}" did not include C`,
+  );
 }
 console.log("mesh_paths interface filter: ok");
 

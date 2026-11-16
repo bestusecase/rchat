@@ -2,9 +2,9 @@
 // Usage: node scripts/smoke-rns.mjs BASE_A TOKEN_A BASE_B TOKEN_B
 //
 // Expects daemon A to expose a TCP server interface and daemon B to connect to
-// it, for example:
-//   A: RCHAT_RNS_AUTO=0 RCHAT_RNS_TCP_SERVER=4242
-//   B: RCHAT_RNS_AUTO=0 RCHAT_RNS_TCP_CLIENT=127.0.0.1:4242
+// it. The dev scripts create those rows through the engine's interface API:
+//   node scripts/mesh-config.mjs BASE_A TOKEN_A server 4242
+//   node scripts/mesh-config.mjs BASE_B TOKEN_B client 127.0.0.1:4242
 import fs from "node:fs";
 import { connect, until } from "./lib.mjs";
 
