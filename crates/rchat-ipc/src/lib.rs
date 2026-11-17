@@ -385,6 +385,18 @@ pub struct InterfaceRow {
     pub note: Option<String>,
 }
 
+/// One derived fact the Network page should tell the user. Currently only the
+/// upgrade case: a hand-written `rns/config` won, so old app settings were not
+/// imported.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InterfaceNotice {
+    /// Stable identifier, so a future client can style or speak about the
+    /// notice without parsing the message.
+    pub kind: String,
+    /// Human text naming only the settings that were actually skipped.
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShowIf {
     pub key: String,
@@ -554,6 +566,8 @@ pub enum ClientCmd {
     /// Interface type catalogue and field schema (bridge-owned).
     DescribeInterfaces,
     ListInterfaces,
+    /// Permanently dismiss the upgrade notice on the interfaces reply.
+    DismissInterfaceNotice,
     CreateInterface {
         name: String,
         kind: String,
@@ -848,6 +862,34 @@ mod tests {
         )
         .unwrap();
         assert!(old.peer_reachability.is_empty());
+    }
+
+    #[test]
+    fn the_upgrade_notice_carries_a_stable_kind_and_one_message() {
+        let notice = InterfaceNotice {
+            kind: "legacy-settings-not-imported".into(),
+            message: "The old relay was not imported.".into(),
+        };
+        let value = serde_json::to_value(&notice).unwrap();
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["kind", "message"]);
+        assert_eq!(
+            serde_json::from_value::<InterfaceNotice>(value).unwrap(),
+            notice
+        );
+    }
+
+    #[test]
+    fn a_client_can_dismiss_the_upgrade_notice() {
+        let raw = r#"{"id":9,"cmd":"dismiss_interface_notice"}"#;
+        let cmd: Command = serde_json::from_str(raw).unwrap();
+        assert!(matches!(cmd.cmd, ClientCmd::DismissInterfaceNotice));
     }
 
     #[test]

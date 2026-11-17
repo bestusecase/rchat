@@ -678,3 +678,40 @@ fn set_autostart_enabled(enabled: bool) {
     );
     let _ = std::fs::write(path, entry);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared UI reads exactly these keys, on both shells. A network field
+    /// here would be dead: the engine owns interfaces now.
+    #[test]
+    fn the_settings_payload_is_muted_and_autostart_only() {
+        let value = serde_json::to_value(SettingsView {
+            muted: true,
+            autostart: false,
+        })
+        .unwrap();
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["autostart", "muted"]);
+        assert_eq!(value["muted"], true);
+        assert_eq!(value["autostart"], false);
+    }
+
+    /// The old network fields are migration input, read from `desktop.json`
+    /// and handed to the engine; the shell never writes them back.
+    #[test]
+    fn legacy_network_fields_stay_readable_as_migration_input() {
+        let value: LegacyNetworkSettings =
+            serde_json::from_str(r#"{"auto_discovery":false,"tcp_relay":"relay.example:4242"}"#)
+                .unwrap();
+        assert_eq!(value.auto_discovery, Some(false));
+        assert_eq!(value.tcp_relay.as_deref(), Some("relay.example:4242"));
+    }
+}

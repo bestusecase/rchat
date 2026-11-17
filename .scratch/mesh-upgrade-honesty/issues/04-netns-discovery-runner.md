@@ -1,6 +1,6 @@
 # Add a Linux namespace runner for the discovery case
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Effort: `mesh-upgrade-honesty`
 
@@ -33,3 +33,14 @@ only manual.
 - Linux only; Windows and macOS skip.
 - See `.scratch/mesh-upgrade-honesty/spec.md`, the decisions on the namespace
   runner, topology, LAN isolation, skipping and cleanup.
+
+## Comments
+
+<!-- outcome -->
+- `scripts/smoke-rendezvous-netns.mjs` puts leaf C in a namespace behind a veth,
+  forwards its loopback API from the veth address, seeds both leaves with one
+  isolated AutoInterface row, and asserts a relay-free direct path and delivery.
+- Cleanup runs on success, failure, SIGINT and SIGTERM. The capability probe
+  (Linux, `ip`, root or passwordless sudo, `ip netns`, IPv6 on the veth) prints
+  one skip line and exits 0; its skip path is tested by
+  `node --test scripts/smoke-rendezvous-netns.test.mjs`.

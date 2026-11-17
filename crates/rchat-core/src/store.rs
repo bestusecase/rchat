@@ -7,7 +7,8 @@
 
 use anyhow::{Context, Result};
 use rchat_ipc::{
-    AnnounceSighting, AttachmentInfo, Caps, ConversationInfo, InterfaceRow, MessageInfo, PeerInfo,
+    AnnounceSighting, AttachmentInfo, Caps, ConversationInfo, InterfaceNotice, InterfaceRow,
+    MessageInfo, PeerInfo,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -24,6 +25,38 @@ pub struct LegacyNetwork {
 /// Meta key guarding the one-shot first-run interface setup. Distinct from
 /// `mesh_config_imported`, which guards reading `rns/config`.
 pub const NETWORK_IMPORTED: &str = "mesh_network_imported";
+/// Which source won the one-shot interface setup: `config`, `legacy`, `default`
+/// or `empty`. Recorded in the same start as the decision, never re-derived.
+pub const NETWORK_SOURCE: &str = "mesh_network_source";
+/// Set once the user dismisses the config-wins upgrade notice.
+pub const UPGRADE_NOTICE_DISMISSED: &str = "mesh_upgrade_notice_dismissed";
+/// Stable kind for the config-wins upgrade notice.
+pub const UPGRADE_NOTICE_KIND: &str = "legacy-settings-not-imported";
+
+/// Which source won the one-shot interface setup. A type rather than a bare
+/// string so a typo cannot record a fact that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkSource {
+    /// The bridge imported at least one interface from `rns/config`.
+    Config,
+    /// At least one row came from the old app settings.
+    Legacy,
+    /// Only first-run defaults were seeded.
+    Default,
+    /// The user explicitly chose local-only: discovery off, no relay.
+    Empty,
+}
+
+impl NetworkSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NetworkSource::Config => "config",
+            NetworkSource::Legacy => "legacy",
+            NetworkSource::Default => "default",
+            NetworkSource::Empty => "empty",
+        }
+    }
+}
 
 /// Name given to the discovery row every install starts with.
 pub const DEFAULT_DISCOVERY_NAME: &str = "AutoInterface";
@@ -1332,20 +1365,32 @@ impl Store {
     /// Order matters: a hand-written `rns/config` is authoritative until the
     /// bridge has imported it, so when one is present and no rows exist this
     /// does nothing and leaves the flag unset. Otherwise discovery and the
-    /// legacy relay become rows once, and every later start returns them
-    /// untouched.
+    /// legacy relay become rows once, the winning source is recorded, and every
+    /// later start returns them untouched.
     pub fn import_network_once(
         &self,
         legacy: Option<&LegacyNetwork>,
         config_present: bool,
     ) -> Result<Vec<InterfaceRow>> {
         if self.meta(NETWORK_IMPORTED)?.as_deref() == Some("1") {
+            // Installs from before the source key already closed the gate on a
+            // second start. Derive the fact once from the rows themselves so
+            // the upgrade notice is not lost for exactly the cohort it targets.
+            if self.network_source()?.is_none() {
+                let rows = self.list_interfaces()?;
+                if let Some(source) = source_for_rows(&rows) {
+                    self.set_meta(NETWORK_SOURCE, source.as_str())?;
+                }
+            }
             return self.list_interfaces();
         }
         let existing = self.list_interfaces()?;
         if !existing.is_empty() {
             // The user already has interfaces (imported from a config, or
             // created by an earlier run): never add to or rewrite them.
+            if let Some(source) = source_for_rows(&existing) {
+                self.record_network_source(source)?;
+            }
             self.set_meta(NETWORK_IMPORTED, "1")?;
             return Ok(existing);
         }
@@ -1418,11 +1463,116 @@ impl Store {
             self.insert_interface_row(&row)?;
             stored.push(row);
         }
+        if let Some(source) = source_for_rows(&stored) {
+            self.record_network_source(source)?;
+        }
         self.set_meta(NETWORK_IMPORTED, "1")?;
         if stored.is_empty() {
             return self.list_interfaces();
         }
         Ok(stored)
+    }
+
+    /// Record which source produced the interface rows and close the legacy
+    /// gate. Called only after a successful bridge config import.
+    ///
+    /// A successful import that produced no rows has not settled anything: the
+    /// gate stays open so first-run seeding still runs, and a config containing
+    /// only extra sections still yields the default discovery row. Returns
+    /// whether this call settled the gate; a second call is a no-op.
+    pub fn settle_network_import(&self, source: NetworkSource) -> Result<bool> {
+        if self.meta(NETWORK_IMPORTED)?.as_deref() == Some("1") {
+            return Ok(false);
+        }
+        if self.list_interfaces()?.is_empty() {
+            return Ok(false);
+        }
+        self.record_network_source(source)?;
+        self.set_meta(NETWORK_IMPORTED, "1")?;
+        Ok(true)
+    }
+
+    /// Which source won the one-shot interface setup, if it has settled.
+    pub fn network_source(&self) -> Result<Option<String>> {
+        self.meta(NETWORK_SOURCE)
+    }
+
+    /// The one derived fact the upgrade produced: a hand-written `rns/config`
+    /// won, so explicit old app settings were not imported. Names only what was
+    /// actually present; a default-on discovery flag was never a saved choice.
+    pub fn upgrade_notice(&self, legacy: Option<&LegacyNetwork>) -> Result<Option<InterfaceNotice>> {
+        if self.meta(UPGRADE_NOTICE_DISMISSED)?.as_deref() == Some("1") {
+            return Ok(None);
+        }
+        if self.network_source()?.as_deref() != Some(NetworkSource::Config.as_str()) {
+            return Ok(None);
+        }
+        let Some(legacy) = legacy else {
+            return Ok(None);
+        };
+        let relay = legacy
+            .tcp_relay
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|spec| !spec.is_empty());
+        let discovery_off = legacy.auto_discovery == Some(false);
+        let message = match (relay, discovery_off) {
+            (true, true) => {
+                "Your hand-written Reticulum config is in use, so rchat did not \
+                 import your old relay setting or turn on discovery. On the Network \
+                 page, add a TCP interface for the relay and an AutoInterface row \
+                 for discovery if you want them."
+            }
+            (true, false) => {
+                "Your hand-written Reticulum config is in use, so rchat did not \
+                 import your old relay setting. On the Network page, add a TCP \
+                 interface for the relay if you want it."
+            }
+            (false, true) => {
+                "Your hand-written Reticulum config is in use, so rchat did not \
+                 turn on discovery. On the Network page, add an AutoInterface row \
+                 for discovery if you want it."
+            }
+            (false, false) => return Ok(None),
+        };
+        Ok(Some(InterfaceNotice {
+            kind: UPGRADE_NOTICE_KIND.to_string(),
+            message: message.to_string(),
+        }))
+    }
+
+    /// Dismiss the upgrade notice for good. Idempotent: the fact it describes
+    /// can never change, so a second dismissal writes the same flag.
+    pub fn dismiss_upgrade_notice(&self) -> Result<()> {
+        self.set_meta(UPGRADE_NOTICE_DISMISSED, "1")
+    }
+
+    /// Record the source once. A settled source is a fact; later callers must
+    /// not rewrite it.
+    fn record_network_source(&self, source: NetworkSource) -> Result<()> {
+        if self.network_source()?.is_none() {
+            self.set_meta(NETWORK_SOURCE, source.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+/// Which source a set of rows came from, when the answer is one of the four
+/// facts. `legacy` outranks `config` only because at least one carried-over row
+/// is the stronger fact; the notice keys off `config` alone. Managed rows are
+/// the user's own and match none of them, so they produce no source rather than
+/// a guess.
+fn source_for_rows(rows: &[InterfaceRow]) -> Option<NetworkSource> {
+    if rows.iter().any(|row| row.origin == "legacy") {
+        Some(NetworkSource::Legacy)
+    } else if rows.iter().any(|row| row.origin == "imported") {
+        Some(NetworkSource::Config)
+    } else if rows.iter().any(|row| row.origin == "default") {
+        Some(NetworkSource::Default)
+    } else if rows.is_empty() {
+        Some(NetworkSource::Empty)
+    } else {
+        None
     }
 }
 
@@ -2457,6 +2607,250 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty(), "the user's choice to stay local-only is kept");
         assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
+    }
+
+    // ---- settling the legacy gate and the upgrade notice ------------------
+
+    /// The state a config-wins upgrade is in when the bridge has imported at
+    /// least one interface: rows exist but the legacy gate is still open.
+    fn store_after_a_config_import() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "imported",
+            )
+            .unwrap();
+        assert!(
+            store.settle_network_import(NetworkSource::Config).unwrap(),
+            "rows exist, so the config import is the source"
+        );
+        store
+    }
+
+    #[test]
+    fn settling_after_a_config_import_records_config_and_closes_the_gate() {
+        let store = store_after_a_config_import();
+        assert_eq!(
+            store.meta(NETWORK_IMPORTED).unwrap().as_deref(),
+            Some("1"),
+            "the gate closes in the start that read the config"
+        );
+        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+    }
+
+    #[test]
+    fn settling_without_interface_rows_leaves_the_gate_open() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            !store.settle_network_import(NetworkSource::Config).unwrap(),
+            "an import with no rows has not settled anything"
+        );
+        assert_eq!(store.meta(NETWORK_IMPORTED).unwrap(), None);
+        assert_eq!(
+            store.network_source().unwrap(),
+            None,
+            "the source is recorded only once rows exist"
+        );
+
+        // First-run seeding still runs afterwards and records its own source.
+        let rows = store.import_network_once(None, false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(store.network_source().unwrap().as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn a_second_settle_never_rewrites_the_source() {
+        let store = store_after_a_config_import();
+        assert!(!store.settle_network_import(NetworkSource::Legacy).unwrap());
+        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+        assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn settling_never_touches_the_config_import_flag() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.meta("mesh_config_imported").unwrap(), None);
+        store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "imported",
+            )
+            .unwrap();
+        store.settle_network_import(NetworkSource::Config).unwrap();
+        assert_eq!(
+            store.meta("mesh_config_imported").unwrap(),
+            None,
+            "the two gates stay separate"
+        );
+    }
+
+    #[test]
+    fn a_first_run_and_a_legacy_import_record_their_own_source() {
+        let fresh = Store::open_in_memory().unwrap();
+        fresh.import_network_once(None, false).unwrap();
+        assert_eq!(fresh.network_source().unwrap().as_deref(), Some("default"));
+
+        let carried = Store::open_in_memory().unwrap();
+        carried
+            .import_network_once(Some(&legacy(Some(true), None)), false)
+            .unwrap();
+        assert_eq!(carried.network_source().unwrap().as_deref(), Some("legacy"));
+
+        let local_only = Store::open_in_memory().unwrap();
+        local_only
+            .import_network_once(Some(&legacy(Some(false), None)), false)
+            .unwrap();
+        assert_eq!(
+            local_only.network_source().unwrap().as_deref(),
+            Some("empty")
+        );
+    }
+
+    #[test]
+    fn the_upgrade_notice_names_only_the_relay_when_only_it_was_skipped() {
+        let store = store_after_a_config_import();
+        let notice = store
+            .upgrade_notice(Some(&legacy(None, Some("relay.example:4242"))))
+            .unwrap()
+            .expect("an explicit old relay is worth explaining");
+        assert_eq!(notice.kind, UPGRADE_NOTICE_KIND);
+        assert!(notice.message.contains("relay"), "{}", notice.message);
+        assert!(
+            !notice.message.contains("discovery"),
+            "nothing was said about discovery: {}",
+            notice.message
+        );
+    }
+
+    #[test]
+    fn the_upgrade_notice_names_only_discovery_when_only_it_was_turned_off() {
+        let store = store_after_a_config_import();
+        let notice = store
+            .upgrade_notice(Some(&legacy(Some(false), None)))
+            .unwrap()
+            .expect("an explicit discovery-off is worth explaining");
+        assert!(notice.message.contains("discovery"), "{}", notice.message);
+        assert!(
+            !notice.message.contains("relay"),
+            "nothing was said about a relay: {}",
+            notice.message
+        );
+    }
+
+    #[test]
+    fn the_upgrade_notice_names_both_when_both_were_present() {
+        let store = store_after_a_config_import();
+        let notice = store
+            .upgrade_notice(Some(&legacy(Some(false), Some("relay.example:4242"))))
+            .unwrap()
+            .expect("both skipped settings are explained");
+        assert!(notice.message.contains("relay"), "{}", notice.message);
+        assert!(notice.message.contains("discovery"), "{}", notice.message);
+    }
+
+    #[test]
+    fn there_is_no_upgrade_notice_for_settings_that_were_never_a_choice() {
+        let store = store_after_a_config_import();
+        assert!(store
+            .upgrade_notice(Some(&legacy(Some(true), None)))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .upgrade_notice(Some(&legacy(None, Some("   "))))
+            .unwrap()
+            .is_none());
+        assert!(store.upgrade_notice(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_normal_legacy_import_has_no_upgrade_notice() {
+        let store = Store::open_in_memory().unwrap();
+        let legacy = legacy(Some(false), Some("relay.example:4242"));
+        store.import_network_once(Some(&legacy), false).unwrap();
+        assert_eq!(store.network_source().unwrap().as_deref(), Some("legacy"));
+        assert!(
+            store.upgrade_notice(Some(&legacy)).unwrap().is_none(),
+            "the settings were imported, so there is nothing to explain"
+        );
+    }
+
+    #[test]
+    fn dismissing_the_upgrade_notice_is_permanent_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rchat.db");
+        let legacy = legacy(Some(false), Some("relay.example:4242"));
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .create_interface(
+                    "Mine",
+                    "TCPClientInterface",
+                    &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                    true,
+                    "imported",
+                )
+                .unwrap();
+            store.settle_network_import(NetworkSource::Config).unwrap();
+            assert!(store.upgrade_notice(Some(&legacy)).unwrap().is_some());
+
+            store.dismiss_upgrade_notice().unwrap();
+            store.dismiss_upgrade_notice().unwrap();
+            assert!(store.upgrade_notice(Some(&legacy)).unwrap().is_none());
+        }
+
+        let reopened = Store::open(&path).unwrap();
+        assert!(
+            reopened.upgrade_notice(Some(&legacy)).unwrap().is_none(),
+            "the fact never changes, so a dismissal never expires"
+        );
+    }
+
+    #[test]
+    fn an_install_from_before_the_source_key_gets_it_backfilled_once() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "imported",
+            )
+            .unwrap();
+        // The preceding release closed the gate on its second start, before any
+        // source was recorded.
+        store.set_meta(NETWORK_IMPORTED, "1").unwrap();
+        assert_eq!(store.network_source().unwrap(), None);
+
+        store.import_network_once(None, true).unwrap();
+        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+    }
+
+    #[test]
+    fn managed_rows_are_not_passed_off_as_a_default_source() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "managed",
+            )
+            .unwrap();
+        store.import_network_once(None, false).unwrap();
+        assert_eq!(
+            store.network_source().unwrap(),
+            None,
+            "the user's own row is none of the four recorded facts"
+        );
     }
 
     #[test]

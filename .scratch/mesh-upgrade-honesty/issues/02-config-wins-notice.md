@@ -1,6 +1,6 @@
 # Show a dismissible notice when a config wins over old settings
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 01
 Effort: `mesh-upgrade-honesty`
@@ -30,3 +30,14 @@ let them dismiss the notice permanently.
 - See `.scratch/mesh-upgrade-honesty/spec.md`, decisions "The notice is derived
   from explicit settings only" and "The notice rides on the existing interfaces
   reply".
+
+## Comments
+
+<!-- outcome -->
+- `Store::upgrade_notice` derives the notice from source `config` plus explicit
+  old settings; `ListInterfaces` carries it as `notice {kind, message}` and
+  `DismissInterfaceNotice` writes `mesh_upgrade_notice_dismissed`.
+- The Network page renders it above the interface list as a dismissible
+  informational banner.
+- Covered by the store notice/dismissal tests and
+  `a_config_winning_upgrade_tells_clients_what_was_not_imported`.

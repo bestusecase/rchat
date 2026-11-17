@@ -1,6 +1,6 @@
 # Shrink the mobile settings payload and lock the two-field shape
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Effort: `mesh-upgrade-honesty`
 
@@ -26,3 +26,11 @@ cannot drift from either one.
 - Mobile `autostart` stays `false`; Android has no login autostart.
 - See `.scratch/mesh-upgrade-honesty/spec.md`, decisions "The mobile settings
   payload shrinks" and "One settings shape, two small types".
+
+## Comments
+
+<!-- outcome -->
+- `SettingsView` on the phone now serialises exactly `muted` and `autostart`.
+  `LegacyNetwork` stays as migration input.
+- Both shells assert that exact key set; `npm run build`, both Tauri
+  `cargo check`s and both shell test suites pass.

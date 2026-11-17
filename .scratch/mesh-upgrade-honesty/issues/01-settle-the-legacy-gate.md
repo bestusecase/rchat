@@ -1,6 +1,6 @@
 # Settle the legacy import gate after the config import
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Effort: `mesh-upgrade-honesty`
 
@@ -33,3 +33,17 @@ hand-written `rns/config`, and record which source won, without touching
 - Prior art: `a_present_rns_config_is_imported_before_anything_is_seeded`.
 - See `.scratch/mesh-upgrade-honesty/spec.md`, decisions "The two import flags
   stay separate" and "The legacy gate settles with the config import".
+
+## Comments
+
+<!-- outcome -->
+- `Store::settle_network_import` closes `mesh_network_imported` and records
+  `mesh_network_source` after the bridge import succeeds with rows.
+  `import_network_once` records `legacy`/`default`/`empty` in the same start and
+  never touches `mesh_config_imported`.
+- A failed import leaves both gates open and seeds nothing; existing rows still
+  drive that session. A config with no interface rows still gets first-run
+  discovery.
+- Covered by the store source/settle tests, `a_config_winning_upgrade_...`,
+  `a_failed_config_import_...`, `a_config_with_no_interfaces_...`, and the
+  startup assertion in `a_hand_written_config_is_not_overwritten_...`.

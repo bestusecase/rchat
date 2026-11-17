@@ -9,6 +9,7 @@
   let selectedType = $state(null);
   let error = $state("");
   let busy = $state(null);
+  let noticeBusy = $state(false);
 
   const types = $derived(chat.interfaceTypes ?? []);
   const groups = $derived.by(() => {
@@ -128,6 +129,18 @@
     }
   }
 
+  async function dismissNotice() {
+    noticeBusy = true;
+    error = "";
+    try {
+      await chat.dismissInterfaceNotice();
+    } catch (err) {
+      error = err?.message ?? String(err);
+    } finally {
+      noticeBusy = false;
+    }
+  }
+
   async function remove(row) {
     if (
       !window.confirm(
@@ -170,6 +183,15 @@
 
   {#if error}
     <p class="form-error">{error}</p>
+  {/if}
+
+  {#if chat.interfaceNotice}
+    <div class="net-banner notice" role="status">
+      <span>{chat.interfaceNotice.message}</span>
+      <button class="link-button" onclick={dismissNotice} disabled={noticeBusy}>
+        Dismiss
+      </button>
+    </div>
   {/if}
 
   {#if mode === "picker"}

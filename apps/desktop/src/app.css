@@ -2007,6 +2007,19 @@ textarea {
   font-size: 12.5px;
 }
 
+/* A settled upgrade fact, not an error: neutral information, dismissible. */
+.net-banner.notice {
+  align-items: center;
+  border-color: #2f4a7a;
+  background: #101a2b;
+  color: #a9c7f0;
+}
+
+.net-banner.notice span {
+  flex: 1;
+  min-width: 180px;
+}
+
 .network-tabs {
   display: flex;
   gap: 4px;

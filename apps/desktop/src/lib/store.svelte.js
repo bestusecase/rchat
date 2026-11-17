@@ -68,6 +68,8 @@ class ChatStore {
   /// Why interface edits are unavailable, straight from the bridge.
   interfaceReadOnly = $state(null);
   interfaceTypes = $state(null);
+  /// One derived upgrade fact, when a hand-written config won; not a toast.
+  interfaceNotice = $state(null);
   devices = $state({ serial: [], reason: null, loaded: false });
   windowFocused = $state(true);
   windowVisible = $state(true);
@@ -623,6 +625,7 @@ class ChatStore {
     this.interfaceExtra = [];
     this.interfaceReadOnly = null;
     this.interfaceTypes = null;
+    this.interfaceNotice = null;
   }
 
   receive(raw) {
@@ -974,10 +977,18 @@ class ChatStore {
       this.interfaces = data.interfaces ?? [];
       this.interfaceExtra = data.extra ?? [];
       this.interfaceReadOnly = data.read_only ?? null;
+      this.interfaceNotice = data.notice ?? null;
     } catch (err) {
       // Offline: keep whatever we had and let the page explain why edits fail.
       if (this.transport === "ready") this.toast(err?.message ?? String(err));
     }
+  }
+
+  /// Dismiss the upgrade notice for good. The engine stores the fact, so it
+  /// does not come back on the next start.
+  async dismissInterfaceNotice() {
+    await this.call({ cmd: "dismiss_interface_notice" });
+    this.interfaceNotice = null;
   }
 
   async describeInterfaces() {

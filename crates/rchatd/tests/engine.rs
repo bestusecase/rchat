@@ -4,7 +4,7 @@
 use rchatd::{BridgeMode, Engine, Options};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 fn scratch_dir(name: &str) -> PathBuf {
@@ -258,6 +258,8 @@ async fn first_run_seeds_discovery_and_carries_legacy_network_settings() {
 /// setup leaves it and the (empty) row list alone until the bridge imports it.
 #[tokio::test]
 async fn a_hand_written_config_is_not_overwritten_by_first_run_seeding() {
+    use rchat_core::store::{NetworkSource, NETWORK_IMPORTED};
+
     let dir = scratch_dir("hand-written");
     std::fs::create_dir_all(dir.join("rns")).unwrap();
     let config = "[interfaces]\n  [[Mine]]\n    type = TCPClientInterface\n    \
@@ -272,10 +274,101 @@ async fn a_hand_written_config_is_not_overwritten_by_first_run_seeding() {
         "importing the config is the bridge's job, not a reason to seed"
     );
     assert_eq!(
+        engine.store().meta(NETWORK_IMPORTED).unwrap(),
+        None,
+        "the gate stays open until the config has actually been read"
+    );
+    assert_eq!(
+        engine.store().network_source().unwrap(),
+        None,
+        "nothing has settled, so there is no source to record"
+    );
+    assert_eq!(
         std::fs::read_to_string(dir.join("rns/config")).unwrap(),
         config,
-        "the config must be byte-identical when startup is done"
+        "the config must be byte-identical before the bridge reads it"
     );
+
+    // The embedded bridge dials in and reports ready. The engine then asks it
+    // to import the hand-written config; reply with what bridge.py would parse
+    // from the file above: one TCP interface and no extra sections.
+    let bridge_port = engine
+        .endpoint()
+        .bridge_port
+        .expect("attach mode must publish a bridge port");
+    let bridge = TcpStream::connect(("127.0.0.1", bridge_port))
+        .await
+        .expect("bridge port should accept");
+    let (read, mut write) = bridge.into_split();
+    write
+        .write_all(
+            format!(
+                "{{\"ev\":\"state\",\"state\":\"ready\",\"address\":\"{}\",\"name\":\"test\"}}\n",
+                "ab".repeat(16)
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let command: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let token = command
+                .get("token")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let reply = match command.get("cmd").and_then(serde_json::Value::as_str) {
+                Some("import_config") => serde_json::json!({
+                    "ev": "bridge_reply",
+                    "token": token,
+                    "ok": true,
+                    "data": {
+                        "interfaces": [{
+                            "name": "Mine",
+                            "kind": "TCPClientInterface",
+                            "config": {"target_host": "mine.example", "target_port": 4242},
+                            "enabled": true
+                        }],
+                        "extra": [],
+                        "existed": true
+                    }
+                }),
+                _ => serde_json::json!({
+                    "ev": "bridge_reply",
+                    "token": token,
+                    "ok": true,
+                    "data": {}
+                }),
+            };
+            if write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let _ = write.flush().await;
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if engine.store().meta(NETWORK_IMPORTED).unwrap().as_deref() == Some("1") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the config import never settled the legacy gate");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        engine.store().network_source().unwrap().as_deref(),
+        Some(NetworkSource::Config.as_str())
+    );
+    let rows = engine.store().list_interfaces().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].origin, "imported");
     engine.stop();
     engine.wait().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);

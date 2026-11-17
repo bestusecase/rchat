@@ -18,7 +18,7 @@ use rchat_core::attachments::{
     REASON_MISSING, REASON_TOO_LARGE, REASON_UNREADABLE,
 };
 use rchat_core::now_ms;
-use rchat_core::store::Store;
+use rchat_core::store::{NetworkSource, Store};
 use rchat_ipc::{
     AttachmentInfo, ClientCmd, Command, IdentityInfo, InterfaceRow, MeshCounters, MeshInterface,
     MeshStatus, MessageInfo, PathEntry, PeerInfo, PeerPath, PeerReachability, ServerMsg,
@@ -354,11 +354,23 @@ impl AppState {
                     .map(|(section, raw)| json!({ "section": section, "raw": raw }))
                     .collect();
                 let read_only = self.interface_read_only(None).await;
-                Ok(json!({
+                let notice = {
+                    let legacy = self.legacy_network.read().await;
+                    self.store.upgrade_notice(legacy.as_ref())?
+                };
+                let mut reply = json!({
                     "interfaces": interfaces,
                     "extra": extra,
                     "read_only": read_only,
-                }))
+                });
+                if let Some(notice) = notice {
+                    reply["notice"] = serde_json::to_value(notice)?;
+                }
+                Ok(reply)
+            }
+            ClientCmd::DismissInterfaceNotice => {
+                self.store.dismiss_upgrade_notice()?;
+                Ok(json!({}))
             }
             ClientCmd::CreateInterface {
                 name,
@@ -1065,12 +1077,14 @@ impl AppState {
             .meta("mesh_config_imported")?
             .as_deref()
             == Some("1");
+        let mut import_failed = false;
         if !imported {
             match self
                 .bridge_request(json!({ "cmd": "import_config" }), Duration::from_secs(10))
                 .await
             {
                 Ok(data) => {
+                    let mut imported_rows = 0;
                     if let Some(items) = data.get("interfaces").and_then(Value::as_array) {
                         for item in items {
                             let name = item
@@ -1097,14 +1111,17 @@ impl AppState {
                                 .get("enabled")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(true);
-                            if let Err(err) = self.store.create_interface(
+                            match self.store.create_interface(
                                 &name,
                                 &kind,
                                 &config,
                                 enabled,
                                 "imported",
                             ) {
-                                warn!(name, error = %err, "could not import interface");
+                                Ok(_) => imported_rows += 1,
+                                Err(err) => {
+                                    warn!(name, error = %err, "could not import interface");
+                                }
                             }
                         }
                     }
@@ -1122,13 +1139,33 @@ impl AppState {
                         self.store.replace_extra_config(&extra)?;
                     }
                     self.store.set_meta("mesh_config_imported", "1")?;
+                    // The config has now actually been read. Only rows this
+                    // import created make `config` the source; a successful
+                    // call for a missing config must not claim rows that came
+                    // from somewhere else. Recording and closing the gate here
+                    // means the outcome is never re-derived on the next start.
+                    if imported_rows > 0 {
+                        self.store.settle_network_import(NetworkSource::Config)?;
+                    }
                     debug!("imported the existing Reticulum interface configuration");
                 }
-                Err(err) => warn!(error = %err, "could not import rns/config"),
+                Err(err) => {
+                    import_failed = true;
+                    warn!(error = %err, "could not import rns/config");
+                }
             }
         }
 
         let rows = self.store.list_interfaces()?;
+        if import_failed {
+            // The config was not read, so neither gate may close and no default
+            // may be seeded over it. Rows that already exist still drive this
+            // session; the next start retries the import.
+            if rows.is_empty() {
+                return Ok(());
+            }
+            return self.apply_rows(&rows).await;
+        }
         if rows.is_empty() {
             // A config that existed was authoritative until now. Once it has
             // been read (or if it had no interfaces at all), finish first-run
@@ -2060,6 +2097,7 @@ fn read_only_from_descriptor(descriptor: &Value, kind: Option<&str>) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rchat_core::store::LegacyNetwork;
     use rchat_ipc::{Caps, PathEntry};
 
     fn peer(address: &str, class: &str) -> PeerInfo {
@@ -2099,6 +2137,225 @@ mod tests {
                 }),
             })
             .await;
+    }
+
+    /// A bridge that only answers commands, so a test can drive the startup
+    /// import path without Python. Replies are plain `{ok, data, error}` maps.
+    async fn attach_fake_bridge(
+        state: &Arc<AppState>,
+        answer: impl Fn(&Value) -> Value + Send + 'static,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        state.attach_transport(tx).await;
+        let state = state.clone();
+        tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                let Ok(payload) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let token = payload
+                    .get("token")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let reply = answer(&payload);
+                let sender = state.bridge_pending.lock().unwrap().remove(&token);
+                if let Some(sender) = sender {
+                    let _ = sender.send(BridgeAnswer {
+                        ok: reply.get("ok").and_then(Value::as_bool).unwrap_or(true),
+                        data: reply.get("data").cloned(),
+                        error: reply
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                }
+            }
+        });
+    }
+
+    fn legacy_settings(discovery: Option<bool>, relay: Option<&str>) -> LegacyNetwork {
+        LegacyNetwork {
+            auto_discovery: discovery,
+            tcp_relay: relay.map(str::to_string),
+        }
+    }
+
+    /// A config-wins upgrade: startup leaves the gate open with no rows, then
+    /// the bridge import settles it in the same start and clients are told what
+    /// was skipped. Dismissal removes the notice from later replies.
+    #[tokio::test]
+    async fn a_config_winning_upgrade_tells_clients_what_was_not_imported() {
+        let state = app();
+        let legacy = legacy_settings(Some(false), Some("relay.example:4242"));
+        *state.legacy_network.write().await = Some(legacy.clone());
+
+        assert!(state
+            .store
+            .import_network_once(Some(&legacy), true)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            None,
+            "the config import has not happened yet"
+        );
+
+        attach_fake_bridge(&state, |payload| match payload["cmd"].as_str() {
+            Some("import_config") => json!({
+                "ok": true,
+                "data": {
+                    "interfaces": [{
+                        "name": "Mine",
+                        "kind": "TCPClientInterface",
+                        "config": {"target_host": "mine.example", "target_port": 4242},
+                        "enabled": true
+                    }],
+                    "extra": [],
+                    "existed": true
+                }
+            }),
+            _ => json!({ "ok": true, "data": {} }),
+        })
+        .await;
+
+        state.ensure_bridge_config().await.unwrap();
+        assert_eq!(
+            state.store.network_source().unwrap().as_deref(),
+            Some("config")
+        );
+        assert_eq!(
+            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),
+            Some("1"),
+            "the gate closes in the start that read the config"
+        );
+
+        let reply = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        assert_eq!(
+            reply["notice"]["kind"],
+            rchat_core::store::UPGRADE_NOTICE_KIND
+        );
+        let message = reply["notice"]["message"].as_str().expect("a message");
+        assert!(message.contains("relay"), "{message}");
+        assert!(message.contains("discovery"), "{message}");
+
+        state
+            .handle_command(ClientCmd::DismissInterfaceNotice)
+            .await
+            .unwrap();
+        let after = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        assert!(
+            after.get("notice").is_none(),
+            "a dismissal removes the notice from the reply"
+        );
+        state
+            .handle_command(ClientCmd::DismissInterfaceNotice)
+            .await
+            .expect("dismissal is idempotent");
+    }
+
+    #[tokio::test]
+    async fn a_failed_config_import_never_settles_the_legacy_gate() {
+        let state = app();
+        let legacy = legacy_settings(Some(false), None);
+        *state.legacy_network.write().await = Some(legacy.clone());
+        state
+            .store
+            .import_network_once(Some(&legacy), true)
+            .unwrap();
+
+        attach_fake_bridge(&state, |payload| match payload["cmd"].as_str() {
+            Some("import_config") => json!({ "ok": false, "error": "bridge refused" }),
+            _ => json!({ "ok": true, "data": {} }),
+        })
+        .await;
+
+        state.ensure_bridge_config().await.unwrap();
+        assert_eq!(
+            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            None,
+            "a failed import must not close the gate"
+        );
+        assert_eq!(state.store.network_source().unwrap(), None);
+        assert!(
+            state.store.list_interfaces().unwrap().is_empty(),
+            "no default is seeded over a config that could not be read"
+        );
+        assert_eq!(
+            state.store.meta("mesh_config_imported").unwrap(),
+            None,
+            "the next start retries the import"
+        );
+    }
+
+    /// A config that only holds extra sections has no interfaces. The import
+    /// succeeds, settles nothing, and first-run seeding still adds discovery.
+    #[tokio::test]
+    async fn a_config_with_no_interfaces_still_gets_first_run_discovery() {
+        let state = app();
+        state.store.import_network_once(None, true).unwrap();
+
+        attach_fake_bridge(&state, |payload| match payload["cmd"].as_str() {
+            Some("import_config") => json!({
+                "ok": true,
+                "data": {
+                    "interfaces": [],
+                    "extra": [["transport", "[transport]\n  enabled = Yes\n"]],
+                    "existed": true
+                }
+            }),
+            _ => json!({ "ok": true, "data": {} }),
+        })
+        .await;
+
+        state.ensure_bridge_config().await.unwrap();
+        let rows = state.store.list_interfaces().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "AutoInterface");
+        assert_eq!(
+            state.store.network_source().unwrap().as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+
+    #[tokio::test]
+    async fn a_missing_config_does_not_claim_existing_rows_as_its_source() {
+        let state = app();
+        state
+            .store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "managed",
+            )
+            .unwrap();
+
+        attach_fake_bridge(&state, |payload| match payload["cmd"].as_str() {
+            Some("import_config") => json!({
+                "ok": true,
+                "data": { "interfaces": [], "extra": [], "existed": false }
+            }),
+            _ => json!({ "ok": true, "data": {} }),
+        })
+        .await;
+
+        state.ensure_bridge_config().await.unwrap();
+        assert_eq!(
+            state.store.network_source().unwrap(),
+            None,
+            "a missing config did not produce these rows"
+        );
+        assert_eq!(
+            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            None,
+            "nothing settled the legacy gate"
+        );
     }
 
     fn transport_events(state: &AppState) -> Vec<Value> {

@@ -160,6 +160,16 @@ Bodies are `VISIBILITY_PRIVATE` with a count-only public version, checked in
 `dumpsys notification`; that device had no secure lock screen configured, so the
 locked-screen rendering itself was not exercised.
 
+Discovery has a hand pass of its own, because no script can prove that a
+particular access point forwards IPv6 multicast. Two real devices on one access
+point with no relay should find each other and exchange a message both ways;
+then put them on separate networks with one named relay and confirm delivery and
+the `degraded`/`ready` wording on the Network page. Record the result here next
+to the notification pass. `scripts/smoke-rendezvous-netns.mjs` proves the same
+code path and its assertions on one Linux machine, so the device pass is a
+confirmation rather than the only evidence. Last discovery hand pass: not yet
+run on two physical devices.
+
 Two messages sent within the same millisecond can carry equal LXMF timestamps and
 arrive out of order; the thread orders by timestamp with arrival order breaking
 ties, which is the same order the conversation view shows.
@@ -212,10 +222,27 @@ node scripts/smoke-rendezvous.mjs
 ```
 
 It proves relay delivery and a leaf restart with the other side's stored
-configuration untouched. Add `--phases=a,b,c` on two devices (or with each leaf
-in its own network namespace) to also remove the relay and fall back to local
-discovery; RNS AutoInterface uses one fixed data port per host, so two instances
-on this machine cannot both run it.
+configuration untouched. Add `--phases=a,b,c` on two devices to also remove the
+relay and fall back to local discovery; RNS AutoInterface uses one fixed data
+port per host, so two instances on this machine cannot both run it.
+
+The relay-free discovery half can still run on one Linux machine, because a
+network namespace gives the second leaf its own interfaces:
+
+```bash
+node scripts/smoke-rendezvous-netns.mjs
+```
+
+It puts leaf A on the host and leaf C in a namespace connected by a veth pair,
+with a small forwarder exposing C's loopback API on the veth address. Both use a
+per-run AutoInterface group, so a device on the physical LAN cannot make the
+test pass. When `ip netns` access, passwordless sudo or IPv6 link-local on the
+veth is unavailable, it prints the unmet requirement and exits 0 instead of
+failing. Its capability check has its own test:
+
+```bash
+node --test scripts/smoke-rendezvous-netns.test.mjs
+```
 
 ## Transports
 
@@ -232,9 +259,13 @@ pointing at a transport-enabled relay, preferably by hostname. The stored addres
 belongs to the relay, and no device ever writes another device's current address
 into its own configuration.
 
-An upgrade imports the old discovery flag and relay string once, with origin
-`legacy`; a malformed relay is kept disabled with the reason shown instead of
-being dropped.
+An upgrade carries the old discovery flag and relay string over with origin
+`legacy`, but only when no hand-written `rns/config` exists. A config that is
+already there wins: rchat does not merge the old app settings into it. When that
+happens the Network page says once which settings were skipped and where to add
+them, so a missing relay is an explained decision rather than a mystery. A
+malformed relay that *is* imported is kept disabled with the reason shown
+instead of being dropped.
 
 The environment variables below are a development seed only, and only when
 `RCHAT_RNS_ENV_SEED=1`. Production never seeds interfaces from the environment.
@@ -302,7 +333,7 @@ was removed to save space. Search indexes captions, as before.
   when the bridge is up but nothing can move, per-interface outage age, and a
   per-peer path/hop/interface/last-announce answer
 - One-shot import of the old discovery toggle, relay string and hand-written
-  `rns/config`
+  `rns/config`, with a notice when the config wins and old settings were skipped
 - Display-name changes propagate to peers
 - Reconnects automatically if the engine restarts
 - A Reticulum page with live interface, counter and path state, durable

@@ -177,8 +177,6 @@ impl Settings {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
-    auto_discovery: bool,
-    tcp_relay: String,
     muted: bool,
     autostart: bool,
 }
@@ -187,11 +185,10 @@ fn settings_view() -> SettingsView {
     let dir = data_dir();
     let settings = Settings::load(dir.as_ref());
     SettingsView {
-        // The bridge always runs AutoInterface on the phone; the relay and
-        // autostart concepts have no meaning here.
-        auto_discovery: true,
-        tcp_relay: String::new(),
         muted: settings.muted,
+        // Android has no login autostart, and saying so is more honest than a
+        // toggle that never works. Network settings are not here: the engine
+        // owns interfaces now, and the shared Network page edits them.
         autostart: false,
     }
 }
@@ -313,4 +310,41 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running rchat");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shared UI reads exactly these keys. A network field here would be
+    /// dead: the engine owns interfaces and the Network page edits them.
+    #[test]
+    fn the_settings_payload_is_muted_and_autostart_only() {
+        let value = serde_json::to_value(SettingsView {
+            muted: true,
+            autostart: false,
+        })
+        .unwrap();
+        let mut keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["autostart", "muted"]);
+        assert_eq!(value["muted"], true);
+        assert_eq!(value["autostart"], false);
+    }
+
+    /// `desktop.json` still carries the old network fields on an upgrade; that
+    /// reader is migration input, not part of the live settings shape.
+    #[test]
+    fn legacy_network_fields_stay_readable_as_migration_input() {
+        let value: LegacyNetwork =
+            serde_json::from_str(r#"{"auto_discovery":true,"tcp_relay":"relay.example:4242"}"#)
+                .unwrap();
+        assert_eq!(value.auto_discovery, Some(true));
+        assert_eq!(value.tcp_relay.as_deref(), Some("relay.example:4242"));
+    }
 }
