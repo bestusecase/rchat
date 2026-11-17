@@ -396,9 +396,11 @@ apps/mobile/src-tauri/gen/android/  Kotlin service, activity and notifications
 scripts/            smoke tests and the two-peer dev runner
 ```
 
-Tests: `cargo test --workspace`. The mobile app is a separate workspace, so its
-tests run with `cd apps/mobile/src-tauri && cargo test --lib`. The Python bridge
+Tests: `cargo test --workspace`. The shells are separate workspaces, so their
+tests run with `cd apps/mobile/src-tauri && cargo test --lib` and
+`cd apps/desktop/src-tauri && cargo test`. The Python bridge
 has its own tests, including the LXMF field format guard:
 `python3 -m unittest discover -s sidecar/tests`. Smoke tests:
 `node scripts/smoke-offline.mjs` and `node scripts/smoke-rns.mjs` (see the script
-headers for arguments).
+headers for arguments). The network-namespace discovery runner's capability
+check has its own test: `node --test scripts/smoke-rendezvous-netns.test.mjs`.

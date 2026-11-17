@@ -2267,8 +2267,8 @@ mod tests {
 
         state.ensure_bridge_config().await.unwrap();
         assert_eq!(
-            state.store.network_source().unwrap().as_deref(),
-            Some("config")
+            state.store.network_source().unwrap(),
+            Some(NetworkSource::Config)
         );
         assert_eq!(
             state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),
@@ -2359,8 +2359,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, "AutoInterface");
         assert_eq!(
-            state.store.network_source().unwrap().as_deref(),
-            Some("default")
+            state.store.network_source().unwrap(),
+            Some(NetworkSource::Default)
         );
         assert_eq!(
             state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),

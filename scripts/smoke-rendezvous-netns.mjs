@@ -150,7 +150,6 @@ export async function main({
     return 0;
   }
 
-  const prefix = uid === 0 ? [] : ["sudo", "-n"];
   const children = [];
   let namespace = false;
   let veth = false;
@@ -158,9 +157,10 @@ export async function main({
   let stopping = false;
 
   function run(argv, { ns = null, allowFail = false } = {}) {
-    const command = ns
-      ? [...prefix, "ip", "netns", "exec", ns, ...argv]
-      : [...prefix, ...argv];
+    const command = withSudo(
+      uid,
+      ns ? ["ip", "netns", "exec", ns, ...argv] : argv,
+    );
     const result = spawnSync(command[0], command.slice(1), {
       encoding: "utf8",
     });
@@ -172,9 +172,10 @@ export async function main({
   }
 
   function launch(name, argv, inNamespace) {
-    const command = inNamespace
-      ? [...prefix, "ip", "netns", "exec", NS, ...argv]
-      : [...prefix, ...argv];
+    const command = withSudo(
+      uid,
+      inNamespace ? ["ip", "netns", "exec", NS, ...argv] : argv,
+    );
     const out = fs.openSync(path.join(DEV, `${name}.log`), "a");
     const child = spawn(command[0], command.slice(1), {
       cwd: ROOT,

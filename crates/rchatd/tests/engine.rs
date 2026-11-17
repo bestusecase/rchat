@@ -365,8 +365,8 @@ async fn a_hand_written_config_is_not_overwritten_by_first_run_seeding() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        engine.store().network_source().unwrap().as_deref(),
-        Some(NetworkSource::Config.as_str())
+        engine.store().network_source().unwrap(),
+        Some(NetworkSource::Config)
     );
     let rows = engine.store().list_interfaces().unwrap();
     assert_eq!(rows.len(), 1);

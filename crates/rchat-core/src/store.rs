@@ -56,6 +56,18 @@ impl NetworkSource {
             NetworkSource::Empty => "empty",
         }
     }
+
+    /// Read a value recorded by [`Self::as_str`]. An unknown value records
+    /// nothing rather than inventing a fact.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "config" => Some(NetworkSource::Config),
+            "legacy" => Some(NetworkSource::Legacy),
+            "default" => Some(NetworkSource::Default),
+            "empty" => Some(NetworkSource::Empty),
+            _ => None,
+        }
+    }
 }
 
 /// Name given to the discovery row every install starts with.
@@ -1376,12 +1388,7 @@ impl Store {
             // Installs from before the source key already closed the gate on a
             // second start. Derive the fact once from the rows themselves so
             // the upgrade notice is not lost for exactly the cohort it targets.
-            if self.network_source()?.is_none() {
-                let rows = self.list_interfaces()?;
-                if let Some(source) = source_for_rows(&rows) {
-                    self.set_meta(NETWORK_SOURCE, source.as_str())?;
-                }
-            }
+            self.backfill_network_source()?;
             return self.list_interfaces();
         }
         let existing = self.list_interfaces()?;
@@ -1493,8 +1500,11 @@ impl Store {
     }
 
     /// Which source won the one-shot interface setup, if it has settled.
-    pub fn network_source(&self) -> Result<Option<String>> {
-        self.meta(NETWORK_SOURCE)
+    pub fn network_source(&self) -> Result<Option<NetworkSource>> {
+        Ok(self
+            .meta(NETWORK_SOURCE)?
+            .as_deref()
+            .and_then(NetworkSource::parse))
     }
 
     /// The one derived fact the upgrade produced: a hand-written `rns/config`
@@ -1504,7 +1514,7 @@ impl Store {
         if self.meta(UPGRADE_NOTICE_DISMISSED)?.as_deref() == Some("1") {
             return Ok(None);
         }
-        if self.network_source()?.as_deref() != Some(NetworkSource::Config.as_str()) {
+        if self.network_source()? != Some(NetworkSource::Config) {
             return Ok(None);
         }
         let Some(legacy) = legacy else {
@@ -1545,6 +1555,20 @@ impl Store {
     /// can never change, so a second dismissal writes the same flag.
     pub fn dismiss_upgrade_notice(&self) -> Result<()> {
         self.set_meta(UPGRADE_NOTICE_DISMISSED, "1")
+    }
+
+    /// Derive the source once for an install that closed the gate before this
+    /// key existed. Managed-only rows match none of the four facts, so they
+    /// record nothing rather than a guess.
+    fn backfill_network_source(&self) -> Result<()> {
+        if self.network_source()?.is_some() {
+            return Ok(());
+        }
+        let rows = self.list_interfaces()?;
+        if let Some(source) = source_for_rows(&rows) {
+            self.set_meta(NETWORK_SOURCE, source.as_str())?;
+        }
+        Ok(())
     }
 
     /// Record the source once. A settled source is a fact; later callers must
@@ -2639,7 +2663,7 @@ mod tests {
             Some("1"),
             "the gate closes in the start that read the config"
         );
-        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Config));
     }
 
     #[test]
@@ -2659,14 +2683,14 @@ mod tests {
         // First-run seeding still runs afterwards and records its own source.
         let rows = store.import_network_once(None, false).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(store.network_source().unwrap().as_deref(), Some("default"));
+        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Default));
     }
 
     #[test]
     fn a_second_settle_never_rewrites_the_source() {
         let store = store_after_a_config_import();
         assert!(!store.settle_network_import(NetworkSource::Legacy).unwrap());
-        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Config));
         assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
     }
 
@@ -2695,21 +2719,21 @@ mod tests {
     fn a_first_run_and_a_legacy_import_record_their_own_source() {
         let fresh = Store::open_in_memory().unwrap();
         fresh.import_network_once(None, false).unwrap();
-        assert_eq!(fresh.network_source().unwrap().as_deref(), Some("default"));
+        assert_eq!(fresh.network_source().unwrap(), Some(NetworkSource::Default));
 
         let carried = Store::open_in_memory().unwrap();
         carried
             .import_network_once(Some(&legacy(Some(true), None)), false)
             .unwrap();
-        assert_eq!(carried.network_source().unwrap().as_deref(), Some("legacy"));
+        assert_eq!(carried.network_source().unwrap(), Some(NetworkSource::Legacy));
 
         let local_only = Store::open_in_memory().unwrap();
         local_only
             .import_network_once(Some(&legacy(Some(false), None)), false)
             .unwrap();
         assert_eq!(
-            local_only.network_source().unwrap().as_deref(),
-            Some("empty")
+            local_only.network_source().unwrap(),
+            Some(NetworkSource::Empty)
         );
     }
 
@@ -2774,7 +2798,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let legacy = legacy(Some(false), Some("relay.example:4242"));
         store.import_network_once(Some(&legacy), false).unwrap();
-        assert_eq!(store.network_source().unwrap().as_deref(), Some("legacy"));
+        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Legacy));
         assert!(
             store.upgrade_notice(Some(&legacy)).unwrap().is_none(),
             "the settings were imported, so there is nothing to explain"
@@ -2830,7 +2854,7 @@ mod tests {
         assert_eq!(store.network_source().unwrap(), None);
 
         store.import_network_once(None, true).unwrap();
-        assert_eq!(store.network_source().unwrap().as_deref(), Some("config"));
+        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Config));
     }
 
     #[test]
