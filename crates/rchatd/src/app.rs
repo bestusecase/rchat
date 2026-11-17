@@ -2875,7 +2875,8 @@ mod tests {
     // ---- peer profile -----------------------------------------------------
 
     #[tokio::test]
-    async fn an_announce_republishes_the_mesh_with_the_new_peer_path() {        let state = app();
+    async fn an_announce_republishes_the_mesh_with_the_new_peer_path() {
+        let state = app();
         let alice = "aa".repeat(16);
         state
             .on_bridge_event(BridgeEvent::Mesh {

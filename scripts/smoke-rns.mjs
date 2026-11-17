@@ -37,6 +37,49 @@ await until(async () => {
 
 console.log("announces exchanged");
 
+// ---- the same link as the Network page sees it ----
+const waitForPath = (client, address, timeoutMs) =>
+  until(async () => {
+    const { mesh } = await client.call({ cmd: "mesh_status" });
+    return mesh.peer_paths.some((entry) => entry.address === address) ? mesh : null;
+  }, { timeoutMs, intervalMs: 500 });
+
+const meshA = await waitForPath(a, addrB, 30000);
+const meshB = await waitForPath(b, addrA, 30000);
+const pathA = meshA.peer_paths.find((entry) => entry.address === addrB);
+const pathB = meshB.peer_paths.find((entry) => entry.address === addrA);
+console.log(
+  "mesh: A sees B at",
+  pathA.hops,
+  "hops via",
+  pathA.interface,
+  "| B sees A at",
+  pathB.hops,
+  "hops via",
+  pathB.interface,
+);
+if (pathA.hops < 1 || pathB.hops < 1) {
+  throw new Error("a direct link must be at least one hop");
+}
+const server = meshA.interfaces.find(
+  (entry) => entry.kind === "TCPServerInterface" && entry.online,
+);
+const client = meshB.interfaces.find(
+  (entry) => entry.kind === "TCPClientInterface" && entry.online,
+);
+if (!server) throw new Error("A's TCP server interface is not online");
+if (!client) throw new Error("B's TCP client interface is not online");
+
+const byPrefix = await a.call({ cmd: "mesh_paths", query: addrB.slice(0, 8) });
+if (!byPrefix.paths.some((entry) => entry.destination === addrB)) {
+  throw new Error("mesh_paths did not match the destination prefix");
+}
+const byInterface = await a.call({ cmd: "mesh_paths", query: server.name });
+if (!byInterface.paths.some((entry) => entry.destination === addrB)) {
+  throw new Error("mesh_paths did not match the interface name");
+}
+console.log("mesh paths filter: prefix and interface name");
+
 const { conversation } = await a.call({ cmd: "open_direct", peer_id: addrB });
 const body = "reticulum says hello " + Date.now();
 await a.call({ cmd: "send_message", conversation_id: conversation.id, body });
