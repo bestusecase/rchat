@@ -1,6 +1,6 @@
 # 03 — Notification lifecycle
 
-Status: ready-for-agent
+Status: resolved
 
 ## Scope
 

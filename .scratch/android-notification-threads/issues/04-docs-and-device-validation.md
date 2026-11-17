@@ -1,6 +1,6 @@
 # 04 — Documentation and device validation
 
-Status: ready-for-agent
+Status: resolved
 
 ## Scope
 

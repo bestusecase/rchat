@@ -1,6 +1,6 @@
 # 01 — Notification state machine in the engine host
 
-Status: ready-for-agent
+Status: resolved
 
 ## Scope
 

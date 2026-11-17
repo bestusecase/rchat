@@ -1,6 +1,6 @@
 # 02 — Render the thread in Kotlin
 
-Status: ready-for-agent
+Status: resolved
 
 ## Scope
 
