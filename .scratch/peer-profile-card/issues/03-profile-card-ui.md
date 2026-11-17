@@ -1,6 +1,6 @@
 # 03 — Peer profile card interface
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 02
 
@@ -63,3 +63,14 @@ nickname can be edited and notes written, with changes saved as you type.
   do not throw; a failed write surfaces as a toast.
 - On the phone the back gesture closes the card, and the notes field is visible
   above the keyboard.
+
+## Comments
+
+- Shipped in `8f43587`: `PeerCard.svelte`, `peerCard` state and the chained notes
+  writes in `store.svelte.js`, and the wiring in `App.svelte`, `Chat.svelte`,
+  `Members.svelte`, `Icon.svelte` and `app.css`.
+- Fixed in `22623aa`: the focus effect re-ran on every draft change, so the
+  nickname input was reselected per keystroke and the notes field blurred after
+  the first character. Touch typing lost all but one letter.
+- The members list is desktop-only, so the phone has the avatar and author-name
+  surfaces only. Laptop/mobile verification is recorded in `04`.

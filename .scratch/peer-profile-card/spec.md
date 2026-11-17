@@ -1,6 +1,6 @@
 # Peer profile card: local nicknames and notes
 
-Status: ready-for-agent
+Status: resolved
 Effort: `peer-profile-card`
 
 ## Problem Statement

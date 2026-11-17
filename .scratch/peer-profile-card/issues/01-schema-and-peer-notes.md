@@ -1,6 +1,6 @@
 # 01 — Peer notes in the schema and peer payload
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -42,3 +42,11 @@ databases survive, without touching nickname or announce behaviour.
   nickname, announced name and timestamps.
 - `cargo test` for the workspace stays green; existing peer, conversation and
   announce tests are unchanged.
+
+## Comments
+
+- Shipped in `8f43587`: `peers.notes` via `ensure_column`, schema meta 5 (the tree
+  had already moved to 5 for interface notes; the guarded ALTER is the real
+  migration). `set_peer_nickname` / `set_peer_notes` / `ensure_peer_row` in
+  `crates/rchat-core/src/store.rs`, covered by the store and migration tests
+  (`peer_alias_and_notes_tests`, old-schema fixture test).

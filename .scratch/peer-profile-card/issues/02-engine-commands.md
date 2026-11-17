@@ -1,6 +1,6 @@
 # 02 — Engine commands for nickname and notes
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 01
 
@@ -41,3 +41,11 @@ seen.
   notes intact.
 - Command round-trip test for both variants in the IPC crate, matching the
   existing flattened-tag test style.
+
+## Comments
+
+- Shipped in `8f43587`: `ClientCmd::SetPeerNickname` / `SetPeerNotes`,
+  `normalise_nickname` (rejects over 48 chars instead of truncating) and
+  `normalise_notes` in `crates/rchatd/src/app.rs`, plus the announce fix that
+  sets `peer.nickname = None` before `upsert_peer` and publishes the stored row.
+  Six tests under `// ---- peer profile ----` and the IPC round-trip test.
