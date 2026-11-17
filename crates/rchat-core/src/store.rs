@@ -28,6 +28,10 @@ pub const NETWORK_IMPORTED: &str = "mesh_network_imported";
 /// Which source won the one-shot interface setup: `config`, `legacy`, `default`
 /// or `empty`. Recorded in the same start as the decision, never re-derived.
 pub const NETWORK_SOURCE: &str = "mesh_network_source";
+/// Which explicit old settings a config win skipped: `relay`, `discovery` or
+/// `both`. Recorded while the shell still has them, so rewriting
+/// `desktop.json` cannot erase the fact the notice describes.
+pub const UPGRADE_SKIPPED: &str = "mesh_upgrade_skipped";
 /// Set once the user dismisses the config-wins upgrade notice.
 pub const UPGRADE_NOTICE_DISMISSED: &str = "mesh_upgrade_notice_dismissed";
 /// Stable kind for the config-wins upgrade notice.
@@ -1507,6 +1511,34 @@ impl Store {
             .and_then(NetworkSource::parse))
     }
 
+    /// Record which explicit old settings the config win skipped, while the
+    /// shell still has them. The fact then survives `desktop.json` being
+    /// rewritten, and a dismissal stays the only way to remove the notice.
+    pub fn record_skipped_settings(&self, legacy: Option<&LegacyNetwork>) -> Result<()> {
+        if self.network_source()? != Some(NetworkSource::Config) {
+            return Ok(());
+        }
+        if self.meta(UPGRADE_SKIPPED)?.is_some() {
+            return Ok(());
+        }
+        let Some(legacy) = legacy else {
+            return Ok(());
+        };
+        let relay = legacy
+            .tcp_relay
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|spec| !spec.is_empty());
+        let discovery_off = legacy.auto_discovery == Some(false);
+        let skipped = match (relay, discovery_off) {
+            (true, true) => "both",
+            (true, false) => "relay",
+            (false, true) => "discovery",
+            (false, false) => return Ok(()),
+        };
+        self.set_meta(UPGRADE_SKIPPED, skipped)
+    }
+
     /// The one derived fact the upgrade produced: a hand-written `rns/config`
     /// won, so explicit old app settings were not imported. Names only what was
     /// actually present; a default-on discovery flag was never a saved choice.
@@ -1517,15 +1549,25 @@ impl Store {
         if self.network_source()? != Some(NetworkSource::Config) {
             return Ok(None);
         }
-        let Some(legacy) = legacy else {
-            return Ok(None);
+        let (relay, discovery_off) = match self.meta(UPGRADE_SKIPPED)?.as_deref() {
+            Some("both") => (true, true),
+            Some("relay") => (true, false),
+            Some("discovery") => (false, true),
+            Some(_) => (false, false),
+            // Before the fact has been recorded, use the live settings for this
+            // start. Engine startup records them as soon as the source is known.
+            None => match legacy {
+                Some(legacy) => (
+                    legacy
+                        .tcp_relay
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|spec| !spec.is_empty()),
+                    legacy.auto_discovery == Some(false),
+                ),
+                None => return Ok(None),
+            },
         };
-        let relay = legacy
-            .tcp_relay
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|spec| !spec.is_empty());
-        let discovery_off = legacy.auto_discovery == Some(false);
         let message = match (relay, discovery_off) {
             (true, true) => {
                 "Your hand-written Reticulum config is in use, so rchat did not \
@@ -1565,6 +1607,11 @@ impl Store {
             return Ok(());
         }
         let rows = self.list_interfaces()?;
+        // An empty row list cannot distinguish an explicit local-only choice
+        // from rows the user deleted later, so it records nothing.
+        if rows.is_empty() {
+            return Ok(());
+        }
         if let Some(source) = source_for_rows(&rows) {
             self.set_meta(NETWORK_SOURCE, source.as_str())?;
         }
@@ -2855,6 +2902,43 @@ mod tests {
 
         store.import_network_once(None, true).unwrap();
         assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Config));
+    }
+
+    #[test]
+    fn an_empty_install_is_not_backfilled_as_an_explicit_choice() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_meta(NETWORK_IMPORTED, "1").unwrap();
+        store.import_network_once(None, true).unwrap();
+        assert_eq!(
+            store.network_source().unwrap(),
+            None,
+            "deleted rows are not the same fact as choosing local-only"
+        );
+    }
+
+    #[test]
+    fn a_backfilled_config_win_keeps_the_skipped_fact_after_desktop_json_changes() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &serde_json::json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "imported",
+            )
+            .unwrap();
+        store.set_meta(NETWORK_IMPORTED, "1").unwrap();
+        let legacy = legacy(Some(false), Some("relay.example:4242"));
+
+        store.import_network_once(Some(&legacy), true).unwrap();
+        store.record_skipped_settings(Some(&legacy)).unwrap();
+        let notice = store
+            .upgrade_notice(None)
+            .unwrap()
+            .expect("the fact is stored, not re-read from desktop.json");
+        assert!(notice.message.contains("relay"), "{}", notice.message);
+        assert!(notice.message.contains("discovery"), "{}", notice.message);
     }
 
     #[test]

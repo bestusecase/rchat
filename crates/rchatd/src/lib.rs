@@ -168,6 +168,11 @@ impl Engine {
                 Ok(rows) => info!(rows = rows.len(), "network interfaces ready for the bridge"),
                 Err(err) => warn!(error = %err, "could not prepare network interfaces"),
             }
+            // A backfilled install already has a settled source. Record which
+            // old settings it skipped while the shell still supplies them.
+            if let Err(err) = store.record_skipped_settings(options.legacy_network.as_ref()) {
+                warn!(error = %err, "could not record the skipped upgrade settings");
+            }
             true
         };
         // A crash between writing a blob and committing its row leaves bytes no

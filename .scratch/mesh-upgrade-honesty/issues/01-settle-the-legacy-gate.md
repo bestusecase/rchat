@@ -47,3 +47,6 @@ hand-written `rns/config`, and record which source won, without touching
 - Covered by the store source/settle tests, `a_config_winning_upgrade_...`,
   `a_failed_config_import_...`, `a_config_with_no_interfaces_...`, and the
   startup assertion in `a_hand_written_config_is_not_overwritten_...`.
+- An install that closed the gate before `mesh_network_source` existed is
+  backfilled once from the row origins; an empty or managed-only row list is
+  not guessed into one of the four facts.

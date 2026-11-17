@@ -41,3 +41,6 @@ let them dismiss the notice permanently.
   informational banner.
 - Covered by the store notice/dismissal tests and
   `a_config_winning_upgrade_tells_clients_what_was_not_imported`.
+- Which fields were skipped is recorded in `mesh_upgrade_skipped` while
+  `desktop.json` still carries them, so a later settings save cannot erase the
+  notice. Dismissal is the only removal.

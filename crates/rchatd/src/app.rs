@@ -1162,8 +1162,11 @@ impl AppState {
                     // call for a missing config must not claim rows that came
                     // from somewhere else. Recording and closing the gate here
                     // means the outcome is never re-derived on the next start.
-                    if imported_rows > 0 {
-                        self.store.settle_network_import(NetworkSource::Config)?;
+                    if imported_rows > 0
+                        && self.store.settle_network_import(NetworkSource::Config)?
+                    {
+                        let legacy = self.legacy_network.read().await;
+                        self.store.record_skipped_settings(legacy.as_ref())?;
                     }
                     debug!("imported the existing Reticulum interface configuration");
                 }
@@ -1178,7 +1181,9 @@ impl AppState {
         if import_failed {
             // The config was not read, so neither gate may close and no default
             // may be seeded over it. Rows that already exist still drive this
-            // session; the next start retries the import.
+            // session; the next start retries the import. In managed mode the
+            // bridge falls back to the on-disk config after its configure grace
+            // period, so the session can still carry traffic meanwhile.
             if rows.is_empty() {
                 return Ok(());
             }
@@ -2403,6 +2408,51 @@ mod tests {
             None,
             "nothing settled the legacy gate"
         );
+    }
+
+    /// An install that settled before the source key existed is backfilled at
+    /// startup. The engine records what was skipped while `desktop.json` still
+    /// has it, so a later settings write cannot erase the notice.
+    #[tokio::test]
+    async fn a_backfilled_config_win_is_still_explained_after_settings_change() {
+        let state = app();
+        let legacy = legacy_settings(Some(false), Some("relay.example:4242"));
+        *state.legacy_network.write().await = Some(legacy.clone());
+        state
+            .store
+            .create_interface(
+                "Mine",
+                "TCPClientInterface",
+                &json!({"target_host": "mine.example", "target_port": 4242}),
+                true,
+                "imported",
+            )
+            .unwrap();
+        // The preceding release closed the gate on its second start.
+        state
+            .store
+            .set_meta(rchat_core::store::NETWORK_IMPORTED, "1")
+            .unwrap();
+
+        state
+            .store
+            .import_network_once(Some(&legacy), true)
+            .unwrap();
+        state
+            .store
+            .record_skipped_settings(Some(&legacy))
+            .unwrap();
+        // The shell has since saved settings without the old network fields.
+        *state.legacy_network.write().await = None;
+
+        let reply = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        assert_eq!(
+            reply["notice"]["kind"],
+            rchat_core::store::UPGRADE_NOTICE_KIND
+        );
+        let message = reply["notice"]["message"].as_str().expect("a message");
+        assert!(message.contains("relay"), "{message}");
+        assert!(message.contains("discovery"), "{message}");
     }
 
     fn transport_events(state: &AppState) -> Vec<Value> {
