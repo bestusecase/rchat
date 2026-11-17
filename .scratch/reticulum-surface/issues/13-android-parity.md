@@ -1,6 +1,6 @@
 # 13 — Android parity for interface management
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 12
 
@@ -41,15 +41,42 @@ store as desktop.
 
 <!-- outcome -->
 - Done (shared UI and bridge, so the phone uses the same page and store as desktop):
-  - the mesh rail button and the Network page work on mobile through the existing pane
-    mechanism, with back returning to the conversation list;
+  - the Network page works on mobile through the existing pane mechanism, with back
+    returning to the conversation list. The rail button is desktop-only; on the phone the
+    page is reached from the settings gear;
   - Settings gains a "Manage interfaces" entry on both desktop and mobile
     (`App.svelte`), so the Interfaces tab is reachable from the gear;
-  - graph nodes are `tabindex="0"` with Enter/Space handlers, so they work with touch and
-    keyboards;
+  - graph nodes are `tabindex="0"` with Enter/Space handlers, and every node also carries
+    a transparent 18–20 unit hit disc (`circle.map-hit`), so finger taps land on a ~24 dp
+    target rather than the 4–8 unit visible dot;
   - `do_list_devices()` returns an empty list with a reason when pyserial is absent
     (Chaquopy), and the form hides the picker instead of erroring.
-- Not done: the Pixel 8 (`39061FDJH0080U`) run. The acceptance items — fresh-install
-  AutoInterface import, toggle off/on following transport state, a TCP client reaching a
-  desktop daemon, and opening the page while the engine starts — are still unverified on
-  hardware. Ticket stays open for that.
+- Done on the Pixel 8 (`39061FDJH0080U`), 2026-11-16/17, with a debug arm64 APK built by
+  `cd apps/mobile/src-tauri && cargo tauri android build --debug --apk --target aarch64`:
+  - the engine now receives the bridge directory (`nativeStart(dataDir, configDir)`) and
+    imports a hand-written `files/rns/config` from it. That fixed a real bug: the engine
+    looked for `files/rns/config` under `files/engine/`, so every Android start seeded a
+    default row instead of importing. Verified by installing a config with
+    `group_id = rchat-testgroup` and a `[[Desktop]]` TCP row, then launching: both rows
+    came back with `origin = imported`, the custom group id intact, and no duplicate
+    seed row. A second launch reused the same two rows (marker honoured);
+  - the embedded bridge now takes `managed=True`, so it waits for the engine's
+    `configure` before starting Reticulum instead of writing a config of its own;
+  - toggling AutoInterface off detaches it and the transport reports `degraded` with the
+    banner "The bridge is up but no interface is online, so nothing can be sent or
+    received"; enabling it again restores `ready` and an online AutoInterface without a
+    restart. `degraded` is the honest word here; the older "still ready" wording in the
+    acceptance list predates the derived transport state;
+  - the imported TCP client reached a desktop rchatd over a real TCP interface and
+    messages flowed both ways (`phone sent` → `A received` → `delivered` receipt, then
+    `desktop sent` → `phone received` → `delivered`). The host's ufw blocks inbound LAN
+    TCP, so the link ran over `adb reverse tcp:4242 tcp:4242`; both ends still ran the
+    normal RNS `TCPServerInterface`/`TCPClientInterface` code;
+  - opening the Network page immediately after a cold start rendered the interface rows
+    with the degraded banner while the interfaces were still coming up, and logged no
+    crash;
+  - `list_devices { kind: "serial" }` returned `{"devices":[],"reason":"serial device
+    listing is not available on this platform"}`, and `describe` returned all 14 types.
+- Not verified on hardware: a LAN/Wi-Fi TCP link (blocked by the host firewall, not by
+  rchat), and the page while the engine is fully stopped rather than starting. Both paths
+  are the shared desktop code.

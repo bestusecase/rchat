@@ -131,6 +131,11 @@ and iOS are not packaged yet.
 in the app's own process and survives the activity going to the background, and it
 runs `bridge.py` under Chaquopy, so the APK needs no external Python.
 
+The Reticulum page is the same page as on the desktop, so the phone can see the
+mesh and the map. In v1 the phone manages **TCP** interface rows and
+**AutoInterface**; serial links and RNode/KISS radios stay desktop-only until the
+Android USB and BLE work lands.
+
 New-message notifications are posted from Rust, not from the page: a backgrounded
 WebView has its JavaScript suspended, so the engine's event stream is the only
 reliable trigger. Each conversation with unread messages gets its own
@@ -260,7 +265,8 @@ belongs to the relay, and no device ever writes another device's current address
 into its own configuration.
 
 An upgrade carries the old discovery flag and relay string over with origin
-`legacy`, but only when no hand-written `rns/config` exists. A config that is
+`legacy` when either was actually set (the first-run discovery default keeps
+origin `default`), but only when no hand-written `rns/config` exists. A config that is
 already there wins: rchat does not merge the old app settings into it. When that
 happens the Network page says once which settings were skipped and where to add
 them, so a missing relay is an explained decision rather than a mystery. A

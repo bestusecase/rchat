@@ -40,3 +40,6 @@ how far away it is, and through which interface and next hop.
   name, interface name; pages by hops then recency).
 - Known duplication: this tab and `NetworkAnnounced` both implement infinite scroll with
   slightly different guards; left alone rather than forced into one helper.
+- Post-verification fix: every destination cell now carries a copy button (also for known
+  peers, not only the non-peer popover), with `stopPropagation` so copying does not open
+  the row.

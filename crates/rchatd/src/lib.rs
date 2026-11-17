@@ -58,6 +58,9 @@ pub enum BridgeMode {
 #[derive(Debug)]
 pub struct Options {
     pub data_dir: PathBuf,
+    /// Where the bridge keeps `rns/config`. Embedded shells (Android) put the
+    /// bridge beside the engine, not inside it, so it cannot be derived.
+    pub config_dir: Option<PathBuf>,
     /// Local API port. `0` picks a free one, which is what both shells use.
     pub port: u16,
     /// Skip the bridge regardless of `bridge`. Mirrors the `--no-rns` flag.
@@ -151,9 +154,15 @@ impl Engine {
         let managed = if env_seeding || matches!(mode, BridgeMode::None) {
             false
         } else {
-            let config_dir = std::env::var("RCHAT_RNS_CONFIGDIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| data_dir.join("rns"));
+            let config_dir = options
+                .config_dir
+                .clone()
+                .or_else(|| {
+                    std::env::var("RCHAT_RNS_CONFIGDIR")
+                        .ok()
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| data_dir.join("rns"));
             let config_present = config_dir.join("config").exists();
             match store.import_network_once(options.legacy_network.as_ref(), config_present) {
                 Ok(rows) => info!(rows = rows.len(), "network interfaces ready for the bridge"),

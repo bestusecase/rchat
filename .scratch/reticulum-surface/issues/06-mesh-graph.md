@@ -56,3 +56,10 @@ transport nodes, and the interface each path uses — with no invented topology.
 - Every node is a `tabindex="0"` `role="link"` with an Enter/Space handler, so the graph
   is reachable without a pointer.
 - Visual checks only (no automated test for the layout).
+- Post-verification fixes: a peer with more than six hops keeps its true count in every
+  label, `<title>` and aria description (the sixth ring is just where it is drawn);
+  transports, unseen peers and services count against the 300-node cap; unseen and
+  service nodes moved in to `OUTER + 18`/`OUTER + 38` so their labels stay inside the
+  viewBox; every node gained a transparent hit disc for touch; the map republishes when
+  an announce creates a peer (`app.rs`), which is what stopped a fresh peer from being
+  drawn as "no live path" until the next sample.

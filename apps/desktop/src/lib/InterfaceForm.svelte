@@ -49,6 +49,16 @@
       if ((field.widget === "int" || field.widget === "port") && typeof value === "number") {
         value = value / unitFactor(field);
       }
+      // Imported radio configs keep numbers in `<select>` keys (for example
+      // `spreadingfactor = 8`); option values are strings, so match them.
+      if (
+        (field.widget === "select" || field.widget === "serial") &&
+        value !== undefined &&
+        value !== null &&
+        value !== ""
+      ) {
+        value = String(value);
+      }
       out[field.key] = value;
     }
     return out;

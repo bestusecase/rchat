@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bridge  # noqa: E402
+import RNS  # noqa: E402
 
 SAMPLE_CONFIG = """# hand written
 [reticulum]
@@ -359,6 +360,55 @@ class CatalogueTests(unittest.TestCase):
             text = bridge.read_config(os.path.join(folder, "config"))
             self.assertIn("share_instance = Yes", text)
             self.assertIn("[[Relay]]", text)
+
+
+class AspectAndServiceTests(unittest.TestCase):
+    """Announce aspects RNS cannot answer locally (it only caches our own)."""
+
+    def setUp(self):
+        bridge._learned_aspects.clear()
+        bridge._other_services.clear()
+        self.identity = RNS.Identity()
+
+    def test_lxmf_delivery_is_recovered_from_the_announced_identity(self):
+        destination = RNS.Destination.hash(self.identity, "lxmf", "delivery")
+        self.assertEqual(
+            bridge._aspect_from_identity(self.identity, destination), "lxmf.delivery"
+        )
+        self.assertEqual(
+            bridge._aspect_from_identity(self.identity, destination.hex()),
+            "lxmf.delivery",
+        )
+
+    def test_an_unknown_service_aspect_is_not_guessed(self):
+        destination = RNS.Destination.hash(self.identity, "nomadnetwork", "node")
+        self.assertIsNone(bridge._aspect_from_identity(self.identity, destination))
+
+    def test_a_learned_aspect_answers_the_path_table(self):
+        key = "ab" * 16
+        bridge._learn_aspect(bytes.fromhex(key), "lxmf.propagation")
+        self.assertEqual(bridge._aspect_for(bytes.fromhex(key)), "lxmf.propagation")
+        self.assertIsNone(bridge._aspect_for(bytes.fromhex("cd" * 16)))
+
+    def test_a_service_without_an_aspect_is_still_remembered(self):
+        bridge._remember_other_service(bytes.fromhex("ef" * 16), None, 1234)
+        self.assertEqual(len(bridge._other_services), 1)
+        self.assertNotIn("aspect", bridge._other_services[0])
+
+    def test_the_service_ring_keeps_non_lxmf_and_skips_lxmf(self):
+        handler = bridge.ServiceAnnounceHandler()
+        delivery = RNS.Destination.hash(self.identity, "lxmf", "delivery")
+        handler.received_announce(delivery, self.identity, None)
+        self.assertEqual(len(bridge._other_services), 0)
+        node = RNS.Destination.hash(self.identity, "nomadnetwork", "node")
+        handler.received_announce(node, self.identity, None)
+        self.assertEqual(len(bridge._other_services), 1)
+        self.assertEqual(
+            bridge._other_services[0]["destination"], bytes(node).hex()
+        )
+        self.assertEqual(
+            bridge._learned_aspects.get(bytes(node).hex()), None
+        )
 
 
 if __name__ == "__main__":

@@ -50,6 +50,7 @@ pub extern "system" fn Java_network_rchat_mobile_EngineBridge_nativeStart<'local
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     data_dir: JString<'local>,
+    config_dir: JString<'local>,
 ) -> jni::sys::jint {
     let dir: String = match env.get_string(&data_dir) {
         Ok(dir) => dir.to_str().unwrap_or_default().to_string(),
@@ -58,7 +59,14 @@ pub extern "system" fn Java_network_rchat_mobile_EngineBridge_nativeStart<'local
             return -1;
         }
     };
-    match crate::start_engine(PathBuf::from(dir)) {
+    let config: String = match env.get_string(&config_dir) {
+        Ok(dir) => dir.to_str().unwrap_or_default().to_string(),
+        Err(err) => {
+            crate::record_boot_error(&format!("invalid bridge config directory: {err}"));
+            return -1;
+        }
+    };
+    match crate::start_engine(PathBuf::from(dir), PathBuf::from(config)) {
         Ok(port) => port as jni::sys::jint,
         Err(err) => {
             crate::record_boot_error(&err);

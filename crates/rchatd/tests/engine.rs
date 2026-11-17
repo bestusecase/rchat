@@ -20,6 +20,7 @@ fn scratch_dir(name: &str) -> PathBuf {
 fn options(dir: &Path, bridge: BridgeMode) -> Options {
     Options {
         data_dir: dir.to_path_buf(),
+        config_dir: None,
         port: 0,
         no_rns: false,
         bridge,
@@ -217,6 +218,7 @@ async fn first_run_seeds_discovery_and_carries_legacy_network_settings() {
     let start = |dir: PathBuf, legacy: Option<LegacyNetwork>| {
         Engine::start(Options {
             data_dir: dir,
+            config_dir: None,
             port: 0,
             no_rns: false,
             bridge: BridgeMode::Attach,
@@ -385,6 +387,7 @@ async fn a_stale_lock_does_not_block_a_restart() {
         std::fs::write(dir.join("engine.lock"), contents).unwrap();
         let engine = Engine::start(Options {
             data_dir: dir.clone(),
+            config_dir: None,
             port: 0,
             no_rns: true,
             bridge: BridgeMode::None,
@@ -407,6 +410,7 @@ async fn a_stale_lock_does_not_block_a_restart() {
     // leftover lock carries our own pid and is not a competitor.
     let engine = Engine::start(Options {
         data_dir: dir.clone(),
+        config_dir: None,
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,

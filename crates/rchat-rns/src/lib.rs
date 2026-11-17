@@ -64,6 +64,8 @@ pub enum BridgeEvent {
         ok: bool,
         data: Option<serde_json::Value>,
         error: Option<String>,
+        /// The interface the bridge refused, when a configure failed.
+        name: Option<String>,
     },
     Receipt {
         id: String,
@@ -407,6 +409,7 @@ fn parse_event(line: &str) -> Option<BridgeEvent> {
             ok: value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
             data: value.get("data").cloned(),
             error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
+            name: value.get("name").and_then(|v| v.as_str()).map(str::to_string),
         }),
         "receipt" => Some(BridgeEvent::Receipt {
             id: value.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -488,6 +491,19 @@ mod tests {
             attachments[1].reason.as_deref(),
             Some("Attachment was too large to receive")
         );
+    }
+
+    #[test]
+    fn a_refused_configure_names_the_interface() {
+        let line = r#"{"ev":"bridge_reply","token":9,"ok":false,
+                        "name":"Bad Server","error":"Reticulum could not attach interface \"Bad Server\"."}"#;
+        let Some(BridgeEvent::Reply { ok, name, error, token, .. }) = parse_event(line) else {
+            panic!("expected a reply event");
+        };
+        assert!(!ok);
+        assert_eq!(token, 9);
+        assert_eq!(name.as_deref(), Some("Bad Server"));
+        assert!(error.unwrap().contains("Bad Server"));
     }
 
     #[test]

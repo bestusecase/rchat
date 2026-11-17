@@ -108,6 +108,7 @@ struct BridgeAnswer {
     ok: bool,
     data: Option<Value>,
     error: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -738,6 +739,13 @@ impl AppState {
                     Ok(None) => {}
                     Err(err) => warn!(error = %err, "could not read announced peer"),
                 }
+                // `peer_paths` is the intersection of the path cache with the
+                // peer table, so the mesh sample published before this row
+                // existed would draw the new peer as "no live path". Republish
+                // now that the row is there.
+                if let Err(err) = self.publish_mesh().await {
+                    warn!(error = %err, "could not republish mesh after an announce");
+                }
             }
             BridgeEvent::Mesh { mesh } => {
                 match serde_json::from_value::<BridgeMesh>(mesh) {
@@ -776,10 +784,16 @@ impl AppState {
                 ok,
                 data,
                 error,
+                name,
             } => {
                 let waiter = self.bridge_pending.lock().unwrap().remove(&token);
                 if let Some(waiter) = waiter {
-                    let _ = waiter.send(BridgeAnswer { ok, data, error });
+                    let _ = waiter.send(BridgeAnswer {
+                        ok,
+                        data,
+                        error,
+                        name,
+                    });
                 }
             }
             BridgeEvent::Receipt { id, state } => {
@@ -1055,11 +1069,15 @@ impl AppState {
         }
         match timeout(wait, rx).await {
             Ok(Ok(answer)) if answer.ok => Ok(answer.data.unwrap_or_else(|| json!({}))),
-            Ok(Ok(answer)) => Err(anyhow!(
-                answer
+            Ok(Ok(answer)) => {
+                let mut message = answer
                     .error
-                    .unwrap_or_else(|| "the Reticulum bridge rejected the request".into())
-            )),
+                    .unwrap_or_else(|| "the Reticulum bridge rejected the request".into());
+                if let Some(name) = answer.name.filter(|name| !message.contains(name.as_str())) {
+                    message = format!("{name}: {message}");
+                }
+                Err(anyhow!(message))
+            }
             Ok(Err(_)) => bail!("the Reticulum bridge dropped the request"),
             Err(_) => {
                 self.bridge_pending.lock().unwrap().remove(&token);
@@ -1235,13 +1253,14 @@ impl AppState {
         .await
     }
 
-    async fn create_interface(&self, name: String, kind: String, config: Value) -> Result<Value> {
+    async fn create_interface(&self, name: String, kind: String, mut config: Value) -> Result<Value> {
         validate_interface_name(&name)?;
         let kind = kind.trim().to_string();
         if kind.is_empty() {
             bail!("choose an interface type");
         }
         check_config(&config)?;
+        let enabled = take_interface_enabled(&mut config).unwrap_or(true);
         validate_interface_config(&kind, &config)?;
         let name = name.trim().to_string();
         if let Some(reason) = self.interface_read_only(Some(&kind)).await {
@@ -1256,7 +1275,7 @@ impl AppState {
             name,
             kind,
             config,
-            enabled: true,
+            enabled,
             origin: "managed".into(),
             note: None,
         };
@@ -1267,8 +1286,9 @@ impl AppState {
         Ok(json!({ "interface": row }))
     }
 
-    async fn update_interface(&self, id: &str, config: Value) -> Result<Value> {
+    async fn update_interface(&self, id: &str, mut config: Value) -> Result<Value> {
         check_config(&config)?;
+        let enabled = take_interface_enabled(&mut config);
         let existing = self
             .store
             .interface(id)?
@@ -1280,6 +1300,7 @@ impl AppState {
         let name = existing.name.clone();
         let candidate = InterfaceRow {
             config: config.clone(),
+            enabled: enabled.unwrap_or(existing.enabled),
             ..existing
         };
         let rows: Vec<InterfaceRow> = self
@@ -1289,6 +1310,9 @@ impl AppState {
             .map(|row| if row.id == id { candidate.clone() } else { row })
             .collect();
         self.apply_or_report(&rows, &name).await?;
+        if let Some(enabled) = enabled {
+            self.store.set_interface_enabled(id, enabled)?;
+        }
         let saved = self.store.update_interface_config(id, &config)?;
         self.publish("interface.changed", json!({ "interface": saved }))?;
         Ok(json!({ "interface": saved }))
@@ -1339,7 +1363,10 @@ impl AppState {
             .collect();
         self.apply_or_report(&rows, &existing.name).await?;
         self.store.delete_interface(id)?;
-        self.publish("interface.changed", json!({ "deleted": id }))?;
+        self.publish(
+            "interface.changed",
+            json!({ "interface": existing, "deleted": id }),
+        )?;
         Ok(json!({ "deleted": id, "interface": existing }))
     }
 
@@ -1942,8 +1969,17 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn validate_interface_name(name: &str) -> Result<()> {
-    let name = name.trim();
+/// The interface form may carry the row's enable switch in its config object.
+/// `interface_enabled` is not an RNS key the engine stores: the renderer writes
+/// it from `row.enabled`, and the store owns that column.
+fn take_interface_enabled(config: &mut Value) -> Option<bool> {
+    config
+        .as_object_mut()
+        .and_then(|map| map.remove("interface_enabled"))
+        .and_then(|value| value.as_bool())
+}
+
+fn validate_interface_name(name: &str) -> Result<()> {    let name = name.trim();
     if name.is_empty() {
         bail!("give the interface a name");
     }
@@ -1958,8 +1994,7 @@ fn validate_interface_name(name: &str) -> Result<()> {
 
 /// Refuse the shapes Reticulum would only reject later, while the form still
 /// has the user's text. The bridge stays authoritative for everything else.
-fn validate_interface_config(kind: &str, config: &Value) -> Result<()> {
-    let Some(map) = config.as_object() else {
+fn validate_interface_config(kind: &str, config: &Value) -> Result<()> {    let Some(map) = config.as_object() else {
         bail!("interface settings must be a JSON object");
     };
     for (key, value) in map {
@@ -2100,6 +2135,14 @@ mod tests {
     use rchat_core::store::LegacyNetwork;
     use rchat_ipc::{Caps, PathEntry};
 
+    #[test]
+    fn the_form_enable_switch_is_not_stored_as_an_rns_key() {
+        let mut config = json!({"interface_enabled": false, "group_id": "reticulum"});
+        assert_eq!(take_interface_enabled(&mut config), Some(false));
+        assert_eq!(config, json!({"group_id": "reticulum"}));
+        assert_eq!(take_interface_enabled(&mut config), None);
+    }
+
     fn peer(address: &str, class: &str) -> PeerInfo {
         PeerInfo {
             id: address.to_string(),
@@ -2165,6 +2208,10 @@ mod tests {
                         data: reply.get("data").cloned(),
                         error: reply
                             .get("error")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        name: reply
+                            .get("name")
                             .and_then(Value::as_str)
                             .map(str::to_string),
                     });
@@ -2826,6 +2873,96 @@ mod tests {
     }
 
     // ---- peer profile -----------------------------------------------------
+
+    #[tokio::test]
+    async fn an_announce_republishes_the_mesh_with_the_new_peer_path() {        let state = app();
+        let alice = "aa".repeat(16);
+        state
+            .on_bridge_event(BridgeEvent::Mesh {
+                mesh: json!({
+                    "transport": "ready",
+                    "address": "ab".repeat(16),
+                    "interfaces": [],
+                    "counters": {},
+                    "paths": [{
+                        "destination": alice.clone(),
+                        "hops": 1,
+                        "next_hop": alice.clone(),
+                        "interface": "LAN",
+                        "state": "responsive",
+                        "age": 1.0,
+                    }],
+                    "other_services": [],
+                }),
+            })
+            .await;
+        assert!(
+            state.mesh_status().await.unwrap().peer_paths.is_empty(),
+            "the path cache does not know this address yet"
+        );
+
+        state
+            .on_bridge_event(BridgeEvent::Announce {
+                address: alice.clone(),
+                name: Some("Alice".into()),
+                aspect: Some("lxmf.delivery".into()),
+                interface: Some("LAN".into()),
+                hops: Some(1),
+            })
+            .await;
+
+        let events = state.store.events_since(0).unwrap();
+        let mesh = events
+            .iter()
+            .rev()
+            .find(|event| event.name == "mesh.updated")
+            .expect("an announce republishes the mesh");
+        assert_eq!(mesh.data["mesh"]["peer_paths"][0]["address"], alice);
+    }
+
+    #[tokio::test]
+    async fn a_valid_announce_is_recorded_once_and_an_invalid_one_creates_nothing() {
+        let state = app();
+        let alice = "aa".repeat(16);
+
+        state
+            .on_bridge_event(BridgeEvent::Announce {
+                address: alice.clone(),
+                name: Some("Alice".into()),
+                aspect: Some("lxmf.delivery".into()),
+                interface: Some("LAN".into()),
+                hops: Some(1),
+            })
+            .await;
+        state
+            .on_bridge_event(BridgeEvent::Announce {
+                address: "not-a-destination".into(),
+                name: Some("Nobody".into()),
+                aspect: None,
+                interface: None,
+                hops: None,
+            })
+            .await;
+
+        let events = state.store.events_since(0).unwrap();
+        let received = events
+            .iter()
+            .filter(|event| event.name == "announce.received")
+            .count();
+        assert_eq!(received, 1, "one sighting, one event");
+        assert!(
+            state.store.peer_by_address(&alice).unwrap().is_some(),
+            "the valid announce became a peer"
+        );
+        assert!(
+            state
+                .store
+                .peer_by_address("not-a-destination")
+                .unwrap()
+                .is_none(),
+            "a short address is not a destination"
+        );
+    }
 
     fn published_peer_events(state: &AppState) -> Vec<Value> {
         state

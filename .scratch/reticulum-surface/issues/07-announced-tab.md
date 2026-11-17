@@ -38,3 +38,5 @@ it announces, and over what.
   `announceTimer`/`flushAnnounces`, so an announce storm is one render and the list's
   scroll position and filter survive.
 - `disconnect()` clears the pending map and the timer.
+- Post-verification fix: the address cell gained the copy affordance the spec asks for
+  (`⧉` / `✓`, with an aria-label naming the full destination).

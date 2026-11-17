@@ -2453,7 +2453,7 @@ textarea {
   outline: none;
 }
 
-.map-node:focus-visible circle,
+.map-node:focus-visible circle:not(.map-hit),
 .map-node:focus-visible rect {
   stroke: #fff;
   stroke-width: 2;
@@ -2490,6 +2490,13 @@ textarea {
 
 .map-node.unseen .map-node-label {
   fill: #7c869c;
+}
+
+/* A transparent disc so a phone finger (or a keyboard focus ring) does not have
+   to hit a 4–8 unit circle. Drawn last so the visible shapes stay small. */
+.map-node circle.map-hit {
+  fill: transparent;
+  stroke: none;
 }
 
 .net-map-more {

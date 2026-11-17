@@ -61,6 +61,7 @@ async fn the_real_bridge_connects_over_the_socket() {
 
     let engine = Engine::start(Options {
         data_dir: dir.clone(),
+        config_dir: None,
         port: 0,
         no_rns: false,
         bridge: BridgeMode::Attach,

@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
 
     let engine = Engine::start(Options {
         data_dir: data_dir.clone(),
+        config_dir: None,
         port: cli.port,
         no_rns: cli.no_rns,
         bridge: if cli.no_rns {

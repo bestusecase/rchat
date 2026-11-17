@@ -141,7 +141,21 @@
                 }
               }}
             >
-              <td class="mono">{shortHash(path.destination)}</td>
+              <td class="mono">
+                <span>{shortHash(path.destination)}</span>
+                <button
+                  class="icon-button"
+                  title="Copy address"
+                  aria-label={`Copy ${path.destination}`}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    copy(path.destination);
+                  }}
+                  onkeydown={(event) => event.stopPropagation()}
+                >
+                  ⧉
+                </button>
+              </td>
               <td>{labelFor(path) ?? "—"}</td>
               <td>{path.hops}</td>
               <td class="mono">{shortHash(path.next_hop)}</td>

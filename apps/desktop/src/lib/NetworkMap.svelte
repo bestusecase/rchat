@@ -54,28 +54,37 @@
     const spokes = new Map();
     for (const path of live) {
       const angle = hashAngle(path.address + ":" + path.hops);
-      const hops = Math.min(path.hops, maxHops);
-      peers.push({ ...path, angle, hops, radius: ringFor(hops) });
+      peers.push({ ...path, angle, hops: path.hops, radius: ringFor(path.hops) });
       if (path.hops > 1) {
-        if (!spokes.has(path.next_hop)) spokes.set(path.next_hop, []);
-        spokes.get(path.next_hop).push(angle);
+        if (!spokes.has(path.next_hop)) {
+          spokes.set(path.next_hop, { angles: [], newest: null });
+        }
+        const spoke = spokes.get(path.next_hop);
+        spoke.angles.push(angle);
+        const seen = (path.age ?? 0) * -1000;
+        if (spoke.newest === null || seen > spoke.newest) spoke.newest = seen;
       }
     }
     // A first-hop transport is one hop away, so it sits on the hop-1 ring, on
     // the spoke its peers use. Sharing the next hop shares the diamond.
     const transports = new Map();
-    for (const [address, angles] of spokes) {
+    for (const [address, spoke] of spokes) {
       transports.set(address, {
         address,
-        angle: meanAngle(angles),
+        angle: meanAngle(spoke.angles),
         radius: ringFor(1),
+        last_seen: spoke.newest === null ? null : Date.now() + spoke.newest,
       });
     }
     // Stable order: radius then angle, so a refresh never reorders the picture.
     peers.sort((a, b) => a.hops - b.hops || a.angle - b.angle);
-    const overflow = Math.max(0, peers.length - MAX_NODES);
-    const drawnPeers = peers.slice(0, MAX_NODES);
+    // The cap counts every drawn node: peers, their transports, unseen peers
+    // and services. Peers keep their spokes even when sharing the outer ring.
+    const transportBudget = Math.min(transports.size, MAX_NODES);
+    const drawnPeers = peers.slice(0, Math.max(0, MAX_NODES - transportBudget));
+    const overflow = peers.length - drawnPeers.length;
     const liveAddresses = new Set(live.map((path) => path.address));
+    const peersLeft = Math.max(0, MAX_NODES - drawnPeers.length - transportBudget);
 
     const unseen = chat.peers
       .filter((peer) => peer.address && !liveAddresses.has(peer.address))
@@ -84,20 +93,22 @@
         return {
           ...peer,
           angle: hashAngle(peer.address),
-          radius: OUTER + 34,
+          radius: OUTER + 18,
           hops: deadPath?.hops ?? null,
           interface: deadPath?.interface ?? null,
           state: deadPath ? "unresponsive" : "unseen",
         };
       })
-      .slice(0, Math.max(0, MAX_NODES - drawnPeers.length));
+      .slice(0, peersLeft);
 
     const services = showServices
-      ? (mesh?.other_services ?? []).map((service) => ({
-          ...service,
-          angle: hashAngle(service.destination),
-          radius: OUTER + 64,
-        }))
+      ? (mesh?.other_services ?? [])
+          .map((service) => ({
+            ...service,
+            angle: hashAngle(service.destination),
+            radius: OUTER + 38,
+          }))
+          .slice(0, Math.max(0, MAX_NODES - drawnPeers.length - transportBudget - unseen.length))
       : [];
 
     const edges = [];
@@ -173,6 +184,7 @@
       interface: peer?.interface ?? null,
       state: "relayed",
       age: peer?.age ?? null,
+      last_seen: transport.last_seen,
     };
   }
 
@@ -263,6 +275,7 @@
           transform={`translate(${position.x} ${position.y})`}
         >
           <rect x="-6" y="-6" width="12" height="12" transform="rotate(45)" />
+          <circle class="map-hit" r="18" />
           <title>Transport {shortHash(transport.address)}</title>
           <text class="map-node-label" y="-10">{shortHash(transport.address, 4)}</text>
         </g>
@@ -280,6 +293,7 @@
           transform={`translate(${position.x} ${position.y})`}
         >
           <circle r="8" />
+          <circle class="map-hit" r="20" />
           <title>{peerName(peer.address)} · {peer.hops} hops · {peer.interface}</title>
           <text class="map-node-label" y="-13">{peerName(peer.address)}</text>
         </g>
@@ -297,8 +311,13 @@
           transform={`translate(${position.x} ${position.y})`}
         >
           <circle r="7" />
+          <circle class="map-hit" r="20" />
           <title>{peerName(peer.address)} · {peer.state === "unresponsive" ? "path is down" : "no live path"}</title>
-          <text class="map-node-label" y="-12">{peerName(peer.address)}</text>
+          <text
+            class="map-node-label"
+            x={-Math.cos(peer.angle) * 14}
+            y={-Math.sin(peer.angle) * 14}
+          >{peerName(peer.address)}</text>
         </g>
       {/each}
 
@@ -314,7 +333,13 @@
           transform={`translate(${position.x} ${position.y})`}
         >
           <circle r="4" />
+          <circle class="map-hit" r="18" />
           <title>{service.aspect || shortHash(service.destination)}</title>
+          <text
+            class="map-node-label"
+            x={-Math.cos(service.angle) * 14}
+            y={-Math.sin(service.angle) * 14}
+          >{service.aspect || shortHash(service.destination, 4)}</text>
         </g>
       {/each}
     </svg>

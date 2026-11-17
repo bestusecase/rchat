@@ -67,6 +67,7 @@ impl Harness {
         let dir = scratch_dir(name);
         let engine = Engine::start(Options {
             data_dir: dir.clone(),
+            config_dir: None,
             port: 0,
             no_rns: false,
             bridge: BridgeMode::Attach,
@@ -649,6 +650,7 @@ async fn the_startup_sweep_keeps_referenced_blobs_and_drops_the_rest() {
 
     let engine = Engine::start(Options {
         data_dir: dir.clone(),
+        config_dir: None,
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,
@@ -681,6 +683,7 @@ async fn an_upload_that_was_never_sent_does_not_survive_a_restart() {
 
     let engine = Engine::start(Options {
         data_dir: dir.clone(),
+        config_dir: None,
         port: 0,
         no_rns: true,
         bridge: BridgeMode::None,

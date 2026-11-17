@@ -54,7 +54,7 @@ object EngineBridge {
   fun bridgeDir(context: Context) = java.io.File(context.filesDir, "rns")
 
   /** Start the engine; returns the loopback bridge port, or -1 on failure. */
-  @JvmStatic external fun nativeStart(dataDir: String): Int
+  @JvmStatic external fun nativeStart(dataDir: String, configDir: String): Int
 
   @JvmStatic external fun nativeStop()
 

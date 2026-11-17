@@ -77,7 +77,7 @@ class RchatService : Service() {
     val engineDir = EngineBridge.engineDir(this).apply { mkdirs() }
     val bridgeDir = EngineBridge.bridgeDir(this).apply { mkdirs() }
 
-    val port = EngineBridge.nativeStart(engineDir.absolutePath)
+    val port = EngineBridge.nativeStart(engineDir.absolutePath, bridgeDir.absolutePath)
     if (port <= 0) {
       Log.e(TAG, "the engine did not start; see the boot error in the UI")
       return
@@ -89,7 +89,7 @@ class RchatService : Service() {
             try {
               Python.getInstance()
                 .getModule("bridge")
-                .callAttr("main", port, bridgeDir.absolutePath, displayName)
+                .callAttr("main", port, bridgeDir.absolutePath, displayName, true)
             } catch (error: Throwable) {
               Log.e(TAG, "the Python bridge stopped", error)
             }

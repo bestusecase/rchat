@@ -230,6 +230,14 @@ _commands_closed = threading.Event()
 _other_services = collections.deque(maxlen=OTHER_SERVICES_LIMIT)
 _other_services_lock = threading.Lock()
 
+# Aspects learned from announces, keyed by destination hex. RNS only caches the
+# aspects of *local* destinations, so a remote announce's aspect has to be
+# matched against its identity; this keeps the answer for the path table.
+_learned_aspects = {}
+_learned_aspects_lock = threading.Lock()
+LEARNED_ASPECTS_LIMIT = 5000
+LXMF_ASPECTS = ("lxmf.delivery", "lxmf.propagation")
+
 # When each interface was first seen down, so an outage has an age.
 _interface_down_since = {}
 
@@ -893,6 +901,9 @@ def interface_catalogue():
             "Discover peers on the local network link.",
             "Local",
             [
+                _field("interface_enabled", "Enabled", "bool", default=True,
+                       common=True,
+                       help="Attach this interface when the configuration is applied."),
                 _field("group_id", "Group id", "text", default="reticulum",
                        common=True,
                        help="Interfaces with the same group id find each other."),
@@ -903,6 +914,7 @@ def interface_catalogue():
                     default="link",
                     choices=["link", "admin", "site", "organisation", "global"],
                     common=True,
+                    help="How far discovery multicasts travel. \"link\" stays on the local link.",
                 ),
                 _field("discovery_port", "Discovery port", "port"),
                 _field("data_port", "Data port", "port"),
@@ -1077,9 +1089,9 @@ def interface_catalogue():
                 _field("txpower", "TX power", "int", default=17,
                        units="dBm", common=True),
                 _field("airtime_limit_short", "Airtime limit, short (%)",
-                       "int", default=33),
+                       "int", default=33, common=True),
                 _field("airtime_limit_long", "Airtime limit, long (%)",
-                       "int", default=1),
+                       "int", default=1, common=True),
                 _field("id_callsign", "ID callsign", "text"),
                 _field("id_interval", "ID interval (s)", "int"),
             ],
@@ -1128,17 +1140,62 @@ def do_describe(token):
 # ---- mesh observability ----------------------------------------------------
 
 
+def _destination_key(destination_hash):
+    if isinstance(destination_hash, (bytes, bytearray)):
+        return bytes(destination_hash).hex()
+    return str(destination_hash)
+
+
 def _aspect_for(destination_hash):
+    """The aspect of a destination, when RNS or an announce told us.
+
+    ``Transport.destinations_map`` only holds destinations registered locally,
+    so remote peers are resolved through what their announces taught us.
+    """
     try:
         destination = RNS.Transport.destinations_map.get(destination_hash)
     except Exception:
         destination = None
-    if destination is None:
+    if destination is not None:
+        name = str(getattr(destination, "name", "") or "")
+        parts = name.split(".")
+        if len(parts) > 1:
+            return ".".join(parts[:-1])
+    with _learned_aspects_lock:
+        return _learned_aspects.get(_destination_key(destination_hash))
+
+
+def _learn_aspect(destination_hash, aspect):
+    if not aspect:
+        return
+    key = _destination_key(destination_hash)
+    with _learned_aspects_lock:
+        _learned_aspects[key] = aspect
+        while len(_learned_aspects) > LEARNED_ASPECTS_LIMIT:
+            _learned_aspects.pop(next(iter(_learned_aspects)))
+
+
+def _aspect_from_identity(announced_identity, destination_hash):
+    """Match an announced destination against aspects rchat knows by name.
+
+    Reticulum announces carry a destination hash and an identity, not an app
+    name, so the aspect is recovered by recomputing the hash. Anything outside
+    this list stays unknown rather than guessed; the UI labels it by hash.
+    """
+    if announced_identity is None:
         return None
-    name = str(getattr(destination, "name", "") or "")
-    parts = name.split(".")
-    if len(parts) > 1:
-        return ".".join(parts[:-1])
+    try:
+        if isinstance(destination_hash, str):
+            destination_hash = bytes.fromhex(destination_hash)
+    except ValueError:
+        return None
+    for full_name in LXMF_ASPECTS:
+        parts = full_name.split(".")
+        try:
+            if RNS.Destination.hash(announced_identity, parts[0], *parts[1:]) == destination_hash:
+                return full_name
+        except Exception:
+            continue
     return None
 
 
@@ -1297,7 +1354,9 @@ def mesh_snapshot():
         paths.append(entry)
 
     path_total = len(paths)
-    paths.sort(key=lambda item: (item["hops"], -item["age"]))
+    # Nearest hops first so a capped table never drops the peers we know, and
+    # most recently used first within a hop count, matching the engine's order.
+    paths.sort(key=lambda item: (item["hops"], item["age"]))
     truncated = path_total > MESH_PATH_CAP
     if truncated:
         paths = paths[:MESH_PATH_CAP]
@@ -1446,9 +1505,12 @@ class AnnounceHandler:
                 name = LXMF.display_name_from_app_data(app_data)
             except Exception:
                 name = None
-            # Only report an aspect RNS still has cached; the spec allows
-            # omitting it rather than guessing.
-            aspect = _aspect_for(destination_hash)
+            # This handler is filtered to lxmf.delivery, so an identity match is
+            # the normal path and the filter itself is the fallback.
+            aspect = _aspect_from_identity(announced_identity, destination_hash)
+            if aspect not in LXMF_ASPECTS:
+                aspect = self.aspect_filter
+            _learn_aspect(destination_hash, aspect)
             interface, hops = _announce_context(destination_hash)
             payload = {"ev": "announce", "address": address, "name": name,
                        "aspect": aspect}
@@ -1475,8 +1537,16 @@ class ServiceAnnounceHandler:
 
     def received_announce(self, destination_hash, announced_identity, app_data):
         try:
-            aspect = _aspect_for(destination_hash)
-            if not aspect or aspect == "lxmf.delivery":
+            if local_destination is not None:
+                try:
+                    if bytes(destination_hash) == bytes(local_destination.hash):
+                        return
+                except Exception:
+                    pass
+            aspect = _aspect_from_identity(announced_identity, destination_hash)
+            if aspect in LXMF_ASPECTS:
+                # Still worth remembering: the path table uses the aspect too.
+                _learn_aspect(destination_hash, aspect)
                 return
             _remember_other_service(destination_hash, aspect, now_ms())
             _mesh_wake.set()
@@ -1894,7 +1964,7 @@ def _prestart(deferred):
         deferred.append(line)
 
 
-def main(socket_spec=None, data_dir=None, display_name=None):
+def main(socket_spec=None, data_dir=None, display_name=None, managed=False):
     """Start Reticulum and talk to the daemon until it goes away.
 
     With no arguments this is the stdio bridge the desktop daemon spawns.
@@ -1902,14 +1972,17 @@ def main(socket_spec=None, data_dir=None, display_name=None):
     listener instead. ``data_dir`` and ``display_name`` override the
     environment, which an embedded interpreter (Chaquopy) cannot always set.
     ``data_dir`` is the bridge's own directory — identity, configurations and
-    LXMF storage — not the daemon's data directory.
+    LXMF storage — not the daemon's data directory. ``managed`` says the engine
+    owns the interface rows and will send a configure before Reticulum starts.
     """
-    global DATA_DIR, DISPLAY_NAME, CONFIG_DIR, _socket
+    global DATA_DIR, DISPLAY_NAME, CONFIG_DIR, MANAGED, _socket
 
     if data_dir:
         DATA_DIR = os.path.abspath(os.path.expanduser(str(data_dir)))
     if display_name:
         DISPLAY_NAME = str(display_name)
+    if managed:
+        MANAGED = True
     # Re-derive: the module-level value was computed before the override.
     CONFIG_DIR = os.environ.get("RCHAT_RNS_CONFIGDIR") or DATA_DIR
 

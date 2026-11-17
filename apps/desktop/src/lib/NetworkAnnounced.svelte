@@ -6,6 +6,19 @@
   let filter = $state("");
   let scrollBox = $state();
   let mounted = false;
+  let copied = $state("");
+
+  async function copy(value) {
+    try {
+      await navigator.clipboard.writeText(value);
+      copied = value;
+      setTimeout(() => {
+        if (copied === value) copied = "";
+      }, 1600);
+    } catch {
+      chat.toast("Could not access the clipboard.");
+    }
+  }
 
   const rows = $derived.by(() => {
     const needle = filter.trim().toLowerCase();
@@ -91,7 +104,17 @@
           {#each rows as row (row.address + ":" + row.bucket)}
             <tr class="net-row-static">
               <td>{row.name || "—"}</td>
-              <td class="mono">{shortHash(row.address)}</td>
+              <td class="mono">
+                <span>{shortHash(row.address)}</span>
+                <button
+                  class="icon-button"
+                  title="Copy address"
+                  aria-label={`Copy ${row.address}`}
+                  onclick={() => copy(row.address)}
+                >
+                  {copied === row.address ? "✓" : "⧉"}
+                </button>
+              </td>
               <td>{row.aspect || "—"}</td>
               <td>{row.interface || "—"}</td>
               <td>{row.hops ?? "—"}</td>

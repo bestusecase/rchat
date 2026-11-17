@@ -294,20 +294,25 @@
               <button
                 class="link-button"
                 onclick={() => startEdit(row)}
-                disabled={busy === row.id || !!locked || !!chat.interfaceReadOnly}
-                title={locked ?? chat.interfaceReadOnly ?? ""}
+                disabled={!chat.meshUp || busy === row.id || !!locked || !!chat.interfaceReadOnly}
+                title={!chat.meshUp ? "The bridge is offline." : (locked ?? chat.interfaceReadOnly ?? "")}
               >
                 Edit
               </button>
               <button
                 class="link-button"
                 onclick={() => toggle(row)}
-                disabled={busy === row.id || !!locked || !!chat.interfaceReadOnly}
-                title={locked ?? chat.interfaceReadOnly ?? ""}
+                disabled={!chat.meshUp || busy === row.id || !!locked || !!chat.interfaceReadOnly}
+                title={!chat.meshUp ? "The bridge is offline." : (locked ?? chat.interfaceReadOnly ?? "")}
               >
                 {row.enabled ? "Disable" : "Enable"}
               </button>
-              <button class="link-button danger" onclick={() => remove(row)} disabled={busy === row.id}>
+              <button
+                class="link-button danger"
+                onclick={() => remove(row)}
+                disabled={!chat.meshUp || busy === row.id}
+                title={!chat.meshUp ? "The bridge is offline." : ""}
+              >
                 Delete
               </button>
             </div>

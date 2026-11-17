@@ -56,3 +56,12 @@ the UI can render: interfaces, counters and the path table.
   `test_fingerprint_ignores_byte_counters_but_sees_structure`) and a live run of
   `scripts/dev-mesh.sh` on 2026-11-15.
 - `rns/config` rendering is untouched: `render_config()` is only called from apply/import.
+- Post-verification fix: RNS `Transport.destinations_map` only holds *locally
+  registered* destinations, so the original `_aspect_for()` returned `None` for every
+  remote announce and the non-LXMF service ring stayed empty. Aspects are now recovered
+  from the announced identity (`RNS.Destination.hash(identity, "lxmf", "delivery")`)
+  and cached in a bounded map; `ServiceAnnounceHandler` keeps non-LXMF destinations even
+  when the aspect is unknown. `sidecar/tests/test_bridge.py` covers the identity match,
+  the learned-map lookup, and the service ring.
+- The 2000-path cap now sorts `(hops, age)` so it keeps the *most* recently used entries
+  within a hop count, matching the engine's order.

@@ -41,7 +41,7 @@ static BOOT_ERROR: Mutex<Option<String>> = Mutex::new(None);
 ///
 /// Idempotent: a second call while an engine is running returns the same bridge
 /// port, which is what a service restart wants.
-pub fn start_engine(data_dir: PathBuf) -> Result<u16, String> {
+pub fn start_engine(data_dir: PathBuf, config_dir: PathBuf) -> Result<u16, String> {
     if let Some(running) = RUNNING.lock().unwrap().as_ref() {
         if let Some(port) = running.engine.endpoint().bridge_port {
             return Ok(port);
@@ -58,6 +58,7 @@ pub fn start_engine(data_dir: PathBuf) -> Result<u16, String> {
 
     let options = Options {
         data_dir: data_dir.clone(),
+        config_dir: Some(config_dir),
         port: 0,
         no_rns: false,
         bridge: BridgeMode::Attach,
