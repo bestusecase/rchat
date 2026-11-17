@@ -26,6 +26,10 @@ pub const REASON_EVICTED: &str = "Attachment removed to save space";
 pub const REASON_TOO_LARGE: &str = "Attachment was too large to receive";
 /// Recorded on a row whose bytes arrived but could not be stored.
 pub const REASON_UNREADABLE: &str = "Attachment could not be read";
+
+/// Inbound files past the per-message limit. The message is kept; the extra
+/// files are reported instead of vanishing silently.
+pub const REASON_EXTRA: &str = "Attachment was not received: a message can carry at most four";
 /// Reported for a row whose blob is gone without a recorded reason (a file
 /// removed by hand, or a store restored without its blobs).
 pub const REASON_MISSING: &str = "Attachment is no longer on this device";

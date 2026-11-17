@@ -3,6 +3,19 @@ import { boot, hasTauri, isDesktop, invoke, listen, loadBoot } from "./desktop.j
 
 const BASE_KEY = "rchat.base";
 const TOKEN_KEY = "rchat.token";
+/// How long a peer-card draft waits for the next keystroke before it is saved.
+const PEER_CARD_SAVE_DELAY_MS = 500;
+
+/// A closed card. Drafts live here so they can be debounced and flushed.
+function emptyPeerCard() {
+  return {
+    peerId: null,
+    nickname: "",
+    notes: "",
+    editing: false,
+    save: "idle", // idle | saving | saved | error
+  };
+}
 
 class ChatStore {
   status = $state(boot ? "starting" : "idle"); // idle | starting | connecting | connected | error
@@ -27,6 +40,9 @@ class ChatStore {
   activeId = $state(null);
   toasts = $state([]);
   lastSeq = $state(0);
+  /// The peer profile card. Drafts live here, so a write can be debounced and
+  /// flushed on close; the peer itself is always read live from `peers`.
+  peerCard = $state(emptyPeerCard());
   // The Reticulum surface. `mesh` is the engine's last known picture and stays
   // visible while the bridge is down; tabs fetch their own larger lists.
   mesh = $state(null);
@@ -75,6 +91,10 @@ class ChatStore {
   pending = new Map();
   retryTimer = null;
   updateTimer = null;
+  peerSaveTimer = null;
+  /// Pending notes writes, chained so they cannot reorder and so closing can
+  /// wait for the last keystroke to land.
+  peerNotesChain = null;
   desktopWired = false;
   mobileWired = false;
   bootWired = false;
@@ -684,6 +704,13 @@ class ChatStore {
         this.updateMessageState(data.id, data.state, data.route);
         break;
       }
+      case "attachment.evicted": {
+        this.markAttachmentMissing(
+          data.hash,
+          data.reason ?? "Attachment removed to save space",
+        );
+        break;
+      }
       case "conversation.updated": {
         this.upsertConversation(data.conversation);
         if (this.shell && (!this.windowFocused || !this.windowVisible)) {
@@ -758,6 +785,30 @@ class ChatStore {
         if (message.id !== id) return message;
         changed = true;
         return { ...message, state, route: route ?? message.route };
+      });
+    }
+    if (changed) this.messages = next;
+  }
+
+  /// The engine dropped a blob. Replace every mention with its reason so the
+  /// bubble says so instead of showing a broken image.
+  markAttachmentMissing(hash, reason) {
+    if (!hash) return;
+    let changed = false;
+    const next = {};
+    for (const [conversationId, list] of Object.entries(this.messages)) {
+      next[conversationId] = list.map((message) => {
+        const attachments = message.attachments ?? [];
+        if (!attachments.some((item) => item.hash === hash)) return message;
+        changed = true;
+        return {
+          ...message,
+          attachments: attachments.map((item) =>
+            item.hash === hash
+              ? { ...item, hash: "", thumbnail: null, reason }
+              : item,
+          ),
+        };
       });
     }
     if (changed) this.messages = next;
@@ -1108,20 +1159,18 @@ class ChatStore {
   /// The download route, with the token this client already holds. `variant`
   /// is "thumb" for the display cache and unset for the original.
   attachmentUrl(attachment, variant = null) {
-    const hash = typeof attachment === "string" ? attachment : attachment?.hash;
+    const hash = attachment?.hash;
     if (!hash) return "";
     const base = this.base.replace(/\/+$/, "");
-    const thumb =
-      variant === "thumb" && typeof attachment === "object" && attachment?.thumbnail
-        ? attachment.thumbnail
-        : hash;
+    const target =
+      variant === "thumb" && attachment.thumbnail ? attachment.thumbnail : hash;
     let url =
       base +
       "/attachments/" +
-      encodeURIComponent(thumb) +
+      encodeURIComponent(target) +
       "?token=" +
       encodeURIComponent(this.token);
-    if (variant === "thumb" && !attachment?.thumbnail) url += "&variant=thumb";
+    if (variant === "thumb" && !attachment.thumbnail) url += "&variant=thumb";
     return url;
   }
 
@@ -1172,7 +1221,9 @@ class ChatStore {
   peerLabel(peerId) {
     if (!peerId) return "unknown";
     const peer = this.peerById(peerId);
-    return peer?.nickname || peer?.announced_name || peerId.slice(0, 8);
+    return (
+      peer?.nickname || peer?.announced_name || shortAddress(peer?.address ?? peerId)
+    );
   }
 
   peerById(peerId) {
@@ -1180,6 +1231,193 @@ class ChatStore {
     return (
       this.peers.find((item) => item.id === peerId || item.address === peerId) ?? null
     );
+  }
+
+  // ---- peer profile card --------------------------------------------------
+
+  /// The peer the card is showing, read live so an announce that renames them
+  /// while the card is open is reflected at once.
+  get cardPeer() {
+    return this.peerById(this.peerCard.peerId);
+  }
+
+  get cardHeadline() {
+    const id = this.peerCard.peerId;
+    if (!id) return "";
+    return this.peerLabel(id);
+  }
+
+  get cardSubtitle() {
+    const peer = this.cardPeer;
+    const id = this.peerCard.peerId;
+    if (!id) return "";
+    return peer?.announced_name || shortAddress(peer?.address ?? id);
+  }
+
+  get cardReachable() {
+    return peerReachable(
+      this.cardPeer,
+      this.transport,
+      this.peerReachability(this.cardPeer),
+    );
+  }
+
+  /// Open the card for another peer. Returns false for your own identity,
+  /// which the caller answers with the profile dialog.
+  openPeerCard(peerId) {
+    const peer = this.peerById(peerId);
+    const id = peer?.id ?? peerId;
+    if (!id || id === this.identity?.id) return false;
+    this.clearPeerSaveTimer();
+    this.peerCard = {
+      ...emptyPeerCard(),
+      peerId: id,
+      nickname: peer?.nickname ?? "",
+      notes: peer?.notes ?? "",
+    };
+    return true;
+  }
+
+  /// Close the card once its last draft lands. A failed write keeps the card
+  /// (and the draft) open, so closing never silently drops notes.
+  async closePeerCard() {
+    if (!(await this.flushPeerCard())) return false;
+    this.clearPeerSaveTimer();
+    this.peerCard = emptyPeerCard();
+    return true;
+  }
+
+  /// Save anything pending. Returns false when a write failed, so the caller
+  /// can keep the drafts instead of losing them.
+  async flushPeerCard() {
+    if (!this.peerCard.peerId) return true;
+    this.clearPeerSaveTimer();
+    const nickname = this.peerCard.editing
+      ? this.commitPeerNickname()
+      : Promise.resolve(true);
+    const [nicknameSaved, notesSaved] = await Promise.all([
+      nickname,
+      this.writePeerNotes(),
+    ]);
+    return nicknameSaved && notesSaved;
+  }
+
+  startPeerNicknameEdit() {
+    if (!this.peerCard.peerId) return;
+    this.peerCard = {
+      ...this.peerCard,
+      nickname: this.cardPeer?.nickname ?? "",
+      editing: true,
+      save: "idle",
+    };
+  }
+
+  draftPeerNickname(value) {
+    if (!this.peerCard.peerId) return;
+    this.peerCard = { ...this.peerCard, nickname: value, save: "idle" };
+  }
+
+  /// Enter or clicking away: keep the alias, or drop it when the field is empty.
+  /// The field stays open until the write lands, so a failure keeps the draft.
+  async commitPeerNickname() {
+    const { peerId, editing, nickname } = this.peerCard;
+    if (!peerId || !editing) return true;
+    const alias = nickname.replace(/[\r\n]+/g, " ").trim();
+    if (alias === (this.cardPeer?.nickname ?? "")) {
+      this.peerCard = { ...this.peerCard, editing: false, nickname: alias };
+      return true;
+    }
+    if (!(await this.writePeerNickname(peerId, alias))) return false;
+    if (this.peerCard.peerId !== peerId) return true;
+    this.peerCard = { ...this.peerCard, editing: false, nickname: alias };
+    return true;
+  }
+
+  /// Esc: back out without touching the stored alias.
+  cancelPeerNicknameEdit() {
+    this.peerCard = {
+      ...this.peerCard,
+      nickname: this.cardPeer?.nickname ?? "",
+      editing: false,
+      save: "idle",
+    };
+  }
+
+  async writePeerNickname(peerId, alias) {
+    this.peerCard = { ...this.peerCard, save: "saving" };
+    try {
+      const { peer } = await this.call({
+        cmd: "set_peer_nickname",
+        peer_id: peerId,
+        nickname: alias || null,
+      });
+      this.upsertPeer(peer);
+      this.markPeerCard(this.peerCard.peerId === peerId ? "saved" : null);
+      return true;
+    } catch (err) {
+      this.markPeerCard(this.peerCard.peerId === peerId ? "error" : null);
+      this.toast(err?.message ?? String(err));
+      return false;
+    }
+  }
+
+  draftPeerNotes(value) {
+    if (!this.peerCard.peerId) return;
+    this.peerCard = { ...this.peerCard, notes: value, save: "idle" };
+    this.clearPeerSaveTimer();
+    this.peerSaveTimer = setTimeout(() => {
+      this.peerSaveTimer = null;
+      void this.writePeerNotes();
+    }, PEER_CARD_SAVE_DELAY_MS);
+  }
+
+  async writePeerNotes() {
+    const { peerId, notes } = this.peerCard;
+    if (!peerId) return true;
+    const text = notes.trimEnd();
+    if (text === (this.peerById(peerId)?.notes ?? "")) return true;
+    // Serialise writes: typing through a slow save must not reorder them, and
+    // awaiting this promise waits for every write queued before it too.
+    const previous = this.peerNotesChain ?? Promise.resolve(true);
+    const chain = previous.then(
+      () => this.sendPeerNotes(peerId, text),
+      () => this.sendPeerNotes(peerId, text),
+    );
+    this.peerNotesChain = chain;
+    void chain.finally(() => {
+      if (this.peerNotesChain === chain) this.peerNotesChain = null;
+    });
+    return chain;
+  }
+
+  async sendPeerNotes(peerId, text) {
+    this.peerCard = { ...this.peerCard, save: "saving" };
+    try {
+      const { peer } = await this.call({
+        cmd: "set_peer_notes",
+        peer_id: peerId,
+        notes: text || null,
+      });
+      this.upsertPeer(peer);
+      this.markPeerCard(this.peerCard.peerId === peerId ? "saved" : null);
+      return true;
+    } catch (err) {
+      this.markPeerCard(this.peerCard.peerId === peerId ? "error" : null);
+      this.toast(err?.message ?? String(err));
+      return false;
+    }
+  }
+
+  markPeerCard(save) {
+    if (!save) return;
+    this.peerCard = { ...this.peerCard, save };
+  }
+
+  clearPeerSaveTimer() {
+    if (this.peerSaveTimer) {
+      clearTimeout(this.peerSaveTimer);
+      this.peerSaveTimer = null;
+    }
   }
 
   conversationTitle(conversation) {

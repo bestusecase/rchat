@@ -46,12 +46,102 @@ const received = await b.waitFor(
   45000,
 );
 console.log("B received:", received.data.message.body, "state:", received.data.message.state);
+if (received.data.message.attachments?.length) {
+  throw new Error("a plain text message must not carry attachments");
+}
 
 const delivered = await a.waitFor(
   (event) => event.name === "message.state" && event.data.state === "delivered",
   45000,
 );
 console.log("A receipt:", delivered.data.state);
+
+// ---- attachments ----
+// One image with a caption, in the standard LXMF image field, over the same
+// real link. This is the only check that runs bridge -> LXMF -> Reticulum ->
+// bridge, so it is what catches a field shape the engine seam cannot see.
+const photo = fs.readFileSync(
+  new URL("../apps/desktop/src-tauri/icons/32x32.png", import.meta.url),
+);
+const caption = "a photo over the mesh " + Date.now();
+const uploadUrl =
+  baseA.replace(/\/+$/, "") +
+  "/attachments?token=" +
+  encodeURIComponent(fs.readFileSync(tokenA, "utf8").trim());
+const upload = await fetch(uploadUrl, {
+  method: "POST",
+  headers: {
+    "content-type": "image/png",
+    "x-rchat-filename": encodeURIComponent("mesh.png"),
+  },
+  body: photo,
+});
+if (!upload.ok) {
+  throw new Error(`upload failed: ${upload.status} ${await upload.text()}`);
+}
+const { attachment: uploaded } = await upload.json();
+if (!uploaded?.hash) throw new Error("the engine did not accept the image");
+
+const tokenBValue = fs.readFileSync(tokenB, "utf8").trim();
+const download = async (base, hash, variant) => {
+  const url =
+    base.replace(/\/+$/, "") +
+    "/attachments/" +
+    encodeURIComponent(hash) +
+    "?token=" +
+    encodeURIComponent(tokenBValue) +
+    (variant ? "&variant=thumb" : "");
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`download failed: ${response.status} for ${url}`);
+  }
+  return Buffer.from(await response.arrayBuffer());
+};
+
+// ---- the receiving side sees the image and the same bytes ----
+await a.call({
+  cmd: "send_message",
+  conversation_id: conversation.id,
+  body: caption,
+  attachments: [uploaded.hash],
+});
+const arrivedEvent = await b.waitFor(
+  (event) =>
+    event.name === "message.new" && event.data.message.body === caption,
+  45000,
+);
+const arrived = arrivedEvent.data.message;
+if (arrived.kind !== "image") {
+  throw new Error("B stored the message as " + arrived.kind + ", not image");
+}
+if (arrived.attachments?.length !== 1) {
+  throw new Error("B stored " + (arrived.attachments?.length ?? 0) + " attachments");
+}
+const [row] = arrived.attachments;
+if (row.hash !== uploaded.hash) {
+  throw new Error("hash drifted: " + row.hash + " vs " + uploaded.hash);
+}
+if (row.size !== photo.length) {
+  throw new Error("byte count drifted: " + row.size + " vs " + photo.length);
+}
+const original = await download(baseB, row.hash);
+if (!original.equals(photo)) {
+  throw new Error("B's copy of the image differs from A's");
+}
+if (!row.thumbnail) throw new Error("B did not generate a display thumbnail");
+const thumbnail = await download(baseB, row.thumbnail, "thumb");
+if (thumbnail.length === 0) throw new Error("B's thumbnail is empty");
+if (thumbnail.equals(photo)) {
+  throw new Error("the thumbnail is the original, not a resized cache");
+}
+console.log(
+  "attachments: image arrived as",
+  row.name,
+  row.size,
+  "bytes, thumbnail",
+  thumbnail.length,
+  "bytes",
+);
 
 a.close();
 b.close();

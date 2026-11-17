@@ -14,6 +14,8 @@
 //! reference to `EngineBridge` while the app loader is still current.
 
 use jni::objects::{GlobalRef, JClass, JString, JValue};
+#[cfg(target_os = "android")]
+use jni::objects::JValueOwned;
 use jni::{JNIEnv, JavaVM};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -162,6 +164,56 @@ pub fn clear_activity() -> Result<(), String> {
 
 pub fn open_background_settings() -> Result<(), String> {
     call_engine_bridge("openBackgroundSettings", "()V", &[])
+}
+
+/// Write one attachment into the system media store.
+///
+/// Kotlin answers with an empty string on success and the platform's reason on
+/// failure, so a denied permission or a full disk can be shown as it is. Off
+/// Android there is no media store, and this is a phone-only command.
+pub fn save_attachment(name: &str, bytes: &[u8]) -> Result<bool, String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (name, bytes);
+        Err("Saving to the media store is only available on Android.".to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let reason = with_engine_bridge(|env, class| {
+            let name = env.new_string(name).map_err(|err| err.to_string())?;
+            let payload = env
+                .byte_array_from_slice(bytes)
+                .map_err(|err| err.to_string())?;
+            let answer = env.call_static_method(
+                class,
+                "saveAttachment",
+                "(Ljava/lang/String;[B)Ljava/lang/String;",
+                &[
+                    JValue::Object(name.as_ref()),
+                    JValue::Object(payload.as_ref()),
+                ],
+            );
+            match answer {
+                Ok(JValueOwned::Object(value)) => {
+                    let text: String = env
+                        .get_string(&JString::from(value))
+                        .map(|text| text.into())
+                        .unwrap_or_default();
+                    Ok(text)
+                }
+                Ok(_) => Err("saveAttachment did not return a string".to_string()),
+                Err(err) => {
+                    let _ = env.exception_clear();
+                    Err(err.to_string())
+                }
+            }
+        })?;
+        if reason.is_empty() {
+            Ok(true)
+        } else {
+            Err(reason)
+        }
+    }
 }
 
 fn with_engine_bridge<T>(

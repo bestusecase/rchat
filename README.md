@@ -253,9 +253,45 @@ The environment variables below are a development seed only, and only when
 Other process settings: `RCHAT_PORT`, `RCHAT_DATA_DIR`, `RCHAT_TOKEN`,
 `RCHAT_PYTHON`, `RCHAT_SIDECAR`.
 
+## Attachments
+
+The plus next to the message field attaches photos and files to a message.
+Choose up to four at once; they appear as chips, the message field becomes the
+caption, and sending stays explicit. On a phone the plus also offers the camera.
+Removing a chip before sending costs nothing because nothing is uploaded until
+the moment you send.
+
+Attachments travel inside the LXMF message in the standard image and
+file-attachments fields, so a Sideband user sees rchat's photos and rchat sees
+theirs. In the thread, a single photo is shown at up to 320 px tall, several
+arrive as a grid, and tapping one opens a full-screen viewer with a save action.
+Anything that is not an image is a card with its name, type and size, plus one
+save action that hands the file to the platform — desktop asks where to put it,
+Android writes it to Downloads.
+
+Because an attachment is part of the message, its cost is part of the message.
+The engine refuses a send that is unreasonable for the peer's link, and names
+the limit and the actual size:
+
+| Peer's link | Largest total attachment bytes per message |
+| --- | --- |
+| LAN or relay | 8 MB |
+| Unknown path | 1 MB |
+| Radio (LoRa) | 64 KB |
+
+The cap is on the sum of a message's attachments, not on each file. Received
+attachments are capped the same way: an oversized one still leaves the message
+and its caption in place, with a note that the attachment did not arrive.
+Attachments share a 500 MB budget on the device. When it fills, the oldest
+received files are removed first and only then the oldest sent ones; the message,
+its time and its receipt state stay untouched, and its bubble says the attachment
+was removed to save space. Search indexes captions, as before.
+
 ## What works
 
 - 1:1 conversations over LXMF, direct and opportunistic delivery
+- Photos and files from the plus button, in standard LXMF fields so Sideband
+  interoperates both ways, with per-link size limits and a device-wide budget
 - Zero-config LAN discovery on by default, and a named relay for devices on
   different networks
 - Peer discovery from announces, plus manual add by address
@@ -280,11 +316,20 @@ Other process settings: `RCHAT_PORT`, `RCHAT_DATA_DIR`, `RCHAT_TOKEN`,
 ## Not built yet
 
 - Group conversations exist in the protocol and store, but there is no UI for them
-- Attachments, voice notes, live voice
+- Voice notes and live voice
 - iOS, and notifications without a running engine (Reticulum has no push, so
   Android keeps a foreground service alive instead)
 - Tapping a conversation's notification opens the app, not that conversation
 - Multi-device sync
+
+## Known limitations
+
+- Attachments have not had a device acceptance pass yet. Camera capture, saving
+  through the Android media store and the attachment notification line are
+  implemented, and their logic is covered by tests, but they have not been
+  exercised on a phone by hand.
+- Attachments over a slow link can still hit LXMF's own delivery timeout. There
+  is no resumable transfer: a message is whole or it is not there.
 
 ## Voice plan (so the current design does not block it)
 
@@ -292,8 +337,8 @@ Other process settings: `RCHAT_PORT`, `RCHAT_DATA_DIR`, `RCHAT_TOKEN`,
    discovery, identity and signalling. Opus at 6–16 kbps.
 2. **Reticulum over TCP:** unreliable single packets (not Links — retransmits
    would stall audio), 60 ms Opus frames bundled under the 500-byte MTU.
-3. **LoRa and radio:** live audio is not realistic. Codec2 voice notes as LXMF
-   attachments are, and that is the honest UX.
+3. **LoRa and radio:** live audio is not realistic. Short voice notes carried as
+   files are, and that is the honest UX.
 
 The pieces already in place for this: per-peer bandwidth class and `last_seen`
 on every peer, capability flags on the wire, a versioned event stream for state,
@@ -315,6 +360,8 @@ scripts/            smoke tests and the two-peer dev runner
 ```
 
 Tests: `cargo test --workspace`. The mobile app is a separate workspace, so its
-tests run with `cd apps/mobile/src-tauri && cargo test --lib`. Smoke tests:
+tests run with `cd apps/mobile/src-tauri && cargo test --lib`. The Python bridge
+has its own tests, including the LXMF field format guard:
+`python3 -m unittest discover -s sidecar/tests`. Smoke tests:
 `node scripts/smoke-offline.mjs` and `node scripts/smoke-rns.mjs` (see the script
 headers for arguments).

@@ -100,6 +100,71 @@ pub struct AppState {
     last_chime: Mutex<Option<Instant>>,
 }
 
+/// Copy one attachment blob to a path the user picks.
+///
+/// The interface names a hash and never touches the bytes. A cancelled dialog
+/// is not an error: it answers `false` and nothing is written.
+///
+/// The blob layout is the engine's, so the shell mirrors it: a hash is
+/// validated before it is used as a path component, and the filename is only a
+/// suggested name.
+#[tauri::command]
+fn save_attachment(
+    state: State<'_, AppState>,
+    hash: String,
+    name: String,
+) -> Result<bool, String> {
+    let source = attachment_path(&state.data_dir, &hash)?;
+    let bytes = std::fs::read(&source).map_err(|err| {
+        format!("This attachment is no longer on this device: {err}")
+    })?;
+    let suggested = suggested_name(&name);
+    let Some(target) = rfd::FileDialog::new()
+        .set_file_name(&suggested)
+        .save_file()
+    else {
+        return Ok(false);
+    };
+    std::fs::write(&target, &bytes)
+        .map_err(|err| format!("Could not save to {}: {err}", target.display()))?;
+    Ok(true)
+}
+
+/// The blob file for a content hash, refusing anything that is not one.
+fn attachment_path(data_dir: &std::path::Path, hash: &str) -> Result<PathBuf, String> {
+    let valid = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid {
+        return Err("That is not an attachment hash.".to_string());
+    }
+    Ok(data_dir
+        .join("attachments")
+        .join(&hash[..2])
+        .join(hash))
+}
+
+/// A suggested save name: one path component, never empty, never a traversal.
+fn suggested_name(name: &str) -> String {
+    let trimmed = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('.');
+    let cleaned: String = trimmed
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(120)
+        .collect();
+    if cleaned.is_empty() {
+        "attachment".to_string()
+    } else {
+        cleaned
+    }
+}
+
 fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -113,6 +178,7 @@ fn main() {
             notify_activity,
             clear_activity,
             restart_engine,
+            save_attachment,
             updates::check_for_update,
             updates::install_update,
             updates::update_state,

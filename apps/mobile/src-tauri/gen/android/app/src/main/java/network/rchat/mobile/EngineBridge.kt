@@ -89,6 +89,19 @@ object EngineBridge {
     Notifications.postThreads(context, payload)
   }
 
+  /**
+   * Write one attachment into the user's Downloads.
+   *
+   * Returns an empty string on success and the platform's reason otherwise, so
+   * Rust can show a legible failure instead of a silent no-op. Called from
+   * [save_attachment] in the engine shell, which owns the bytes.
+   */
+  @JvmStatic
+  fun saveAttachment(name: String, data: ByteArray): String {
+    val context = appContext ?: return "rchat is not ready to save files yet."
+    return AttachmentStore.save(context, name, data)
+  }
+
   @JvmStatic
   fun clearActivity() {
     // Drop what the engine accumulated as well as what is in the shade: the

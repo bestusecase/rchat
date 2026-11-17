@@ -335,17 +335,42 @@ impl Incoming {
         Some(Self {
             conversation_id: message.get("conversation_id")?.as_str()?.to_string(),
             author_id: author_id.to_string(),
-            body: message
-                .get("body")
-                .and_then(|body| body.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            body: line_body(message),
             // A missing clock would sort the message to the head of its thread
             // and get it trimmed first while still counted, so treat it like
             // any other malformed event and ignore it.
             ts: message.get("ts")?.as_i64()?,
         })
     }
+}
+
+/// The line a notification thread shows for a message.
+///
+/// A caption stays the line; an attachment-only message would otherwise be
+/// blank, so it reads as its kind — or its filename when there is exactly one
+/// file. The wording matches the conversation-list preview the engine derives,
+/// so the shade and the list never disagree.
+fn line_body(message: &serde_json::Value) -> String {
+    let body = message
+        .get("body")
+        .and_then(|body| body.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !body.trim().is_empty() {
+        return body;
+    }
+    attachment_line(message).unwrap_or(body)
+}
+
+/// One line for a notification thread, taken from the engine's own preview rule
+/// so the shade and the conversation list cannot drift apart.
+fn attachment_line(message: &serde_json::Value) -> Option<String> {
+    let items: Vec<rchat_ipc::AttachmentInfo> = message
+        .get("attachments")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    rchat_core::store::preview_text(&items)
 }
 
 /// What Kotlin renders. One payload per event, so the two sides cannot disagree
@@ -447,6 +472,7 @@ mod tests {
                     last_seen: None,
                     bandwidth_class: "unknown".to_string(),
                     caps: Caps::default(),
+                    notes: None,
                 })
                 .unwrap();
         }
@@ -527,6 +553,17 @@ mod tests {
     }
 
     fn event(conversation: &str, author: &str, body: &str, ts: i64) -> String {
+        event_with(conversation, author, body, ts, serde_json::json!([]))
+    }
+
+    /// An event carrying attachment descriptors, as the engine publishes them.
+    fn event_with(
+        conversation: &str,
+        author: &str,
+        body: &str,
+        ts: i64,
+        attachments: serde_json::Value,
+    ) -> String {
         serde_json::json!({
             "type": "event",
             "seq": 7,
@@ -539,6 +576,7 @@ mod tests {
                 "body": body,
                 "kind": "text",
                 "state": "delivered",
+                "attachments": attachments,
             }},
         })
         .to_string()
@@ -577,6 +615,58 @@ mod tests {
                 ts: 1_000,
             }]
         );
+    }
+
+    #[test]
+    fn an_attachment_only_message_reads_as_its_kind() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+
+        let photo = serde_json::json!([{
+            "name": "shot.jpg",
+            "mime": "image/jpeg",
+            "size": 2048,
+            "hash": "aa",
+        }]);
+        let snapshot = case
+            .observe_event(&event_with(&chat, "alice", "", 1_000, photo), false, || false)
+            .unwrap();
+        assert_eq!(bodies(&snapshot, 0), ["Photo"]);
+
+        let pdf = serde_json::json!([{
+            "name": "statement.pdf",
+            "mime": "application/pdf",
+            "size": 4096,
+            "hash": "bb",
+        }]);
+        let snapshot = case
+            .observe_event(&event_with(&chat, "alice", "", 2_000, pdf), false, || false)
+            .unwrap();
+        // Exactly one file names that file; the same rule as the list preview.
+        assert_eq!(bodies(&snapshot, 0), ["Photo", "statement.pdf"]);
+    }
+
+    #[test]
+    fn a_caption_stays_the_notification_line() {
+        let mut case = Case::new();
+        case.peer("alice", Some("Alice"), None);
+        let chat = case.direct("alice");
+
+        let photo = serde_json::json!([{
+            "name": "shot.jpg",
+            "mime": "image/jpeg",
+            "size": 2048,
+            "hash": "aa",
+        }]);
+        let snapshot = case
+            .observe_event(
+                &event_with(&chat, "alice", "look at this", 1_000, photo),
+                false,
+                || false,
+            )
+            .unwrap();
+        assert_eq!(bodies(&snapshot, 0), ["look at this"]);
     }
 
     #[test]

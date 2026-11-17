@@ -20,6 +20,9 @@ serde_json = "1"
 libc = "0.2"
 getrandom = "0.2"
 tauri-plugin-updater = "2"
+# The save dialog for attachments. The xdg-desktop-portal backend avoids
+# running GTK from a worker thread, which is what `gtk3` would do.
+rfd = "0.15"
 
 [profile.release]
 codegen-units = 1

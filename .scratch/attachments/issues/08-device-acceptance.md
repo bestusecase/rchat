@@ -1,6 +1,6 @@
 # 08 — Device acceptance pass
 
-Status: ready-for-agent
+Status: blocked (no device available; documented as a known limitation)
 
 ## Scope
 

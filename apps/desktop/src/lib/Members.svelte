@@ -4,6 +4,8 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
+  let { onPeer = null } = $props();
+
   const peers = $derived(chat.peers);
 </script>
 
@@ -15,19 +17,22 @@
 
   <div class="members-scroll">
     {#each peers as peer (peer.id)}
-      <div class="member">
+      <button
+        class="member"
+        type="button"
+        title="Open {chat.peerLabel(peer.id)}'s profile"
+        onclick={() => onPeer?.(peer.id)}
+      >
         <Avatar
           id={peer.id}
-          label={peer.nickname || peer.announced_name || peer.id}
+          label={chat.peerLabel(peer.id)}
           size={32}
           status={peerReachable(peer, chat.transport, chat.peerReachability(peer))
             ? "online"
             : "offline"}
         />
         <div class="member-text">
-          <span class="member-name">
-            {peer.nickname || peer.announced_name || peer.id.slice(0, 8)}
-          </span>
+          <span class="member-name">{chat.peerLabel(peer.id)}</span>
           <span class="member-sub">
             {shortAddress(peer.address)}
             {#if peer.bandwidth_class && peer.bandwidth_class !== "unknown"}
@@ -37,7 +42,7 @@
             {/if}
           </span>
         </div>
-      </div>
+      </button>
     {:else}
       <p class="members-empty">
         Peers show up here when they announce themselves on the mesh. You can also

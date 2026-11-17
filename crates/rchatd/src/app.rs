@@ -14,8 +14,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use rchat_core::attachments::{
-    ingest_bytes, BlobStore, Ingested, MAX_ATTACHMENTS, REASON_EVICTED, REASON_MISSING,
-    REASON_TOO_LARGE, REASON_UNREADABLE,
+    ingest_bytes, BlobStore, Ingested, MAX_ATTACHMENTS, REASON_EVICTED, REASON_EXTRA,
+    REASON_MISSING, REASON_TOO_LARGE, REASON_UNREADABLE,
 };
 use rchat_core::now_ms;
 use rchat_core::store::Store;
@@ -277,8 +277,29 @@ impl AppState {
                     last_seen: Some(now_ms()),
                     bandwidth_class: "unknown".into(),
                     caps: Default::default(),
+                    notes: None,
                 };
                 self.store.upsert_peer(&peer)?;
+                self.publish("peer.updated", json!({ "peer": peer }))?;
+                Ok(json!({ "peer": peer }))
+            }
+            ClientCmd::SetPeerNickname { peer_id, nickname } => {
+                let peer_id = peer_id.trim().to_string();
+                if peer_id.is_empty() {
+                    bail!("a peer id is required");
+                }
+                let nickname = normalise_nickname(nickname)?;
+                let peer = self.store.set_peer_nickname(&peer_id, nickname.as_deref())?;
+                self.publish("peer.updated", json!({ "peer": peer }))?;
+                Ok(json!({ "peer": peer }))
+            }
+            ClientCmd::SetPeerNotes { peer_id, notes } => {
+                let peer_id = peer_id.trim().to_string();
+                if peer_id.is_empty() {
+                    bail!("a peer id is required");
+                }
+                let notes = normalise_notes(notes);
+                let peer = self.store.set_peer_notes(&peer_id, notes.as_deref())?;
                 self.publish("peer.updated", json!({ "peer": peer }))?;
                 Ok(json!({ "peer": peer }))
             }
@@ -664,7 +685,7 @@ impl AppState {
                 }
                 // Keep the existing bandwidth class: it comes from the path
                 // table, not from this announce.
-                let peer = match self.store.peer_by_address(&address) {
+                let mut peer = match self.store.peer_by_address(&address) {
                     Ok(Some(mut peer)) => {
                         if name.is_some() {
                             peer.announced_name = name;
@@ -680,17 +701,31 @@ impl AppState {
                         last_seen: Some(ts),
                         bandwidth_class: "unknown".into(),
                         caps: Default::default(),
+                        notes: None,
                     },
                     Err(err) => {
                         warn!(error = %err, "could not read announced peer");
                         return;
                     }
                 };
+                // An announce never carries the user's alias: writing back the
+                // value read above would let an announce resurrect a nickname
+                // the user cleared in between. `upsert_peer` keeps the stored
+                // one when this is null.
+                peer.nickname = None;
                 if let Err(err) = self.store.upsert_peer(&peer) {
                     warn!(error = %err, "could not store announced peer");
                     return;
                 }
-                let _ = self.publish("peer.updated", json!({ "peer": peer }));
+                // Publish the stored row, not the one built above: that one has
+                // no nickname, and the interface reads the peer's alias from it.
+                match self.store.peer(&peer.id) {
+                    Ok(Some(stored)) => {
+                        let _ = self.publish("peer.updated", json!({ "peer": stored }));
+                    }
+                    Ok(None) => {}
+                    Err(err) => warn!(error = %err, "could not read announced peer"),
+                }
             }
             BridgeEvent::Mesh { mesh } => {
                 match serde_json::from_value::<BridgeMesh>(mesh) {
@@ -1366,6 +1401,7 @@ impl AppState {
                     last_seen: Some(now_ms()),
                     bandwidth_class: "unknown".into(),
                     caps: Default::default(),
+                    notes: None,
                 };
                 self.store.upsert_peer(&peer)?;
                 let _ = self.publish("peer.updated", json!({ "peer": peer }));
@@ -1390,14 +1426,25 @@ impl AppState {
         let mut attachments = Vec::new();
         let limit = inbound_limit();
         for (index, item) in staged.iter().enumerate() {
-            let ordinal = item.ordinal as usize;
-            let _ = ordinal;
             let name = if item.name.is_empty() {
                 format!("attachment-{}", index + 1)
             } else {
                 item.name.clone()
             };
             if index >= MAX_ATTACHMENTS {
+                // Keep the message whole: an entry past the limit still gets a
+                // row so the bubble can say the file did not arrive.
+                let mime = rchat_core::attachments::sniff_mime(&name, &[], None);
+                attachments.push(AttachmentInfo {
+                    name,
+                    mime,
+                    size: item.size,
+                    hash: String::new(),
+                    width: None,
+                    height: None,
+                    thumbnail: None,
+                    reason: Some(REASON_EXTRA.to_string()),
+                });
                 self.discard_staged(std::slice::from_ref(item));
                 continue;
             }
@@ -1444,7 +1491,7 @@ impl AppState {
         }
 
         let kind = message_kind(&attachments);
-        let msg = MessageInfo {
+        let mut msg = MessageInfo {
             id,
             conversation_id: conv.id.clone(),
             author_id: peer.id.clone(),
@@ -1460,6 +1507,13 @@ impl AppState {
         self.store
             .insert_message_with_attachments(&msg, true, &attachments)?;
         self.enforce_attachment_budget();
+        // Budget enforcement may have taken this very attachment's bytes. Publish
+        // what the store now says, not the descriptors built before eviction, so
+        // the live bubble carries the reason instead of a broken image.
+        if let Some(stored) = self.store.get_message(&msg.id)? {
+            msg = stored;
+        }
+        self.present(&mut msg);
         self.publish("message.new", json!({ "message": msg }))?;
         self.publish(
             "conversation.updated",
@@ -1956,6 +2010,32 @@ fn check_config(config: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The local alias as it will be stored: trimmed, line breaks flattened to
+/// spaces, and refused above the shared name limit. An empty alias is `None`,
+/// which is what "clear the override" means.
+fn normalise_nickname(nickname: Option<String>) -> Result<Option<String>> {
+    let Some(raw) = nickname else {
+        return Ok(None);
+    };
+    let flattened = raw.replace(['\r', '\n'], " ");
+    let trimmed = flattened.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > MAX_NAME_CHARS {
+        bail!("a nickname can be at most {MAX_NAME_CHARS} characters");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// A note keeps its newlines and its leading whitespace; only trailing
+/// whitespace goes, and an empty note clears the column.
+fn normalise_notes(notes: Option<String>) -> Option<String> {
+    notes
+        .map(|text| text.trim_end().to_string())
+        .filter(|text| !text.is_empty())
+}
+
 /// Why the page cannot edit interfaces while the bridge is down.
 const BRIDGE_OFFLINE_REASON: &str =
     "The Reticulum bridge is offline, so interface changes wait until it reconnects.";
@@ -1991,6 +2071,7 @@ mod tests {
             last_seen: Some(1),
             bandwidth_class: class.into(),
             caps: Caps::default(),
+            notes: None,
         }
     }
 
@@ -2486,4 +2567,171 @@ mod tests {
         assert_eq!(read_only_from_descriptor(&embedded, Some("Unknown")), None);
         assert_eq!(read_only_from_descriptor(&embedded, None), None);
     }
+
+    // ---- peer profile -----------------------------------------------------
+
+    fn published_peer_events(state: &AppState) -> Vec<Value> {
+        state
+            .store
+            .events_since(0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.name == "peer.updated")
+            .map(|event| event.data["peer"].clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn renaming_a_peer_returns_it_and_publishes_the_event() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+        assert_eq!(published_peer_events(&state).len(), 0);
+
+        let reply = state
+            .handle_command(ClientCmd::SetPeerNickname {
+                peer_id: alice.clone(),
+                nickname: Some("  Radio\nnet  ".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["peer"]["nickname"], "Radio net");
+
+        let stored = state.store.peer(&alice).unwrap().unwrap();
+        assert_eq!(stored.nickname.as_deref(), Some("Radio net"));
+        assert_eq!(stored.announced_name.as_deref(), Some("Alice"), "the announced name is untouched");
+
+        let events = published_peer_events(&state);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"], alice);
+        assert_eq!(events[0]["nickname"], "Radio net");
+    }
+
+    #[tokio::test]
+    async fn an_over_long_nickname_is_refused_and_nothing_is_written() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+
+        let error = state
+            .handle_command(ClientCmd::SetPeerNickname {
+                peer_id: alice.clone(),
+                nickname: Some("n".repeat(MAX_NAME_CHARS + 1)),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("48"), "the refusal names the limit");
+
+        let stored = state.store.peer(&alice).unwrap().unwrap();
+        assert_eq!(stored.nickname.as_deref(), Some("Alice"), "the stored alias is unchanged");
+        assert!(
+            published_peer_events(&state).is_empty(),
+            "a refused rename is not published"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_nickname_clears_the_alias() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+
+        let reply = state
+            .handle_command(ClientCmd::SetPeerNickname {
+                peer_id: alice.clone(),
+                nickname: Some(" \n\t ".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["peer"]["nickname"], Value::Null);
+
+        let stored = state.store.peer(&alice).unwrap().unwrap();
+        assert_eq!(stored.nickname, None, "the alias is gone, not blank");
+        assert_eq!(stored.label(), "Alice", "the announced name shows through");
+    }
+
+    #[tokio::test]
+    async fn notes_persist_with_newlines_and_publish() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+
+        let reply = state
+            .handle_command(ClientCmd::SetPeerNotes {
+                peer_id: alice.clone(),
+                notes: Some("Met on the Tuesday net.\nLives across town.\n\n".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["peer"]["notes"], "Met on the Tuesday net.\nLives across town.");
+
+        let stored = state.store.peer(&alice).unwrap().unwrap();
+        assert_eq!(
+            stored.notes.as_deref(),
+            Some("Met on the Tuesday net.\nLives across town.")
+        );
+        assert_eq!(published_peer_events(&state).len(), 1);
+
+        // An empty note clears it.
+        state
+            .handle_command(ClientCmd::SetPeerNotes {
+                peer_id: alice.clone(),
+                notes: Some("\n  \n".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.store.peer(&alice).unwrap().unwrap().notes, None);
+    }
+
+    #[tokio::test]
+    async fn a_profile_write_for_an_unknown_peer_creates_the_record() {
+        let state = app();
+        let stranger = "cd".repeat(16);
+
+        let reply = state
+            .handle_command(ClientCmd::SetPeerNotes {
+                peer_id: stranger.clone(),
+                notes: Some("who is this?".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply["peer"]["id"], stranger);
+
+        let stored = state.store.peer(&stranger).unwrap().unwrap();
+        assert_eq!(stored.address.as_deref(), Some(stranger.as_str()));
+        assert_eq!(stored.notes.as_deref(), Some("who is this?"));
+        assert_eq!(stored.nickname, None);
+    }
+
+    #[tokio::test]
+    async fn an_announce_keeps_a_cleared_alias_cleared() {
+        let state = app();
+        let alice = "aa".repeat(16);
+        state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
+        state.store.set_peer_nickname(&alice, Some("Radio net")).unwrap();
+        state.store.set_peer_notes(&alice, Some("a note")).unwrap();
+        // The user clears the alias; the announce must not carry it back.
+        state.store.set_peer_nickname(&alice, None).unwrap();
+
+        state
+            .on_bridge_event(BridgeEvent::Announce {
+                address: alice.clone(),
+                name: Some("Alice-2".into()),
+                aspect: Some("lxmf".into()),
+                interface: Some("lan".into()),
+                hops: Some(1),
+            })
+            .await;
+
+        let stored = state.store.peer(&alice).unwrap().unwrap();
+        assert_eq!(stored.nickname, None, "the clear survived the announce");
+        assert_eq!(stored.announced_name.as_deref(), Some("Alice-2"));
+        assert_eq!(stored.notes.as_deref(), Some("a note"));
+
+        let events = published_peer_events(&state);
+        let last = events.last().expect("an announce publishes the peer");
+        assert_eq!(last["nickname"], Value::Null, "the stored row is published");
+        assert_eq!(last["notes"], "a note", "notes travel with the peer");
+    }
 }
+

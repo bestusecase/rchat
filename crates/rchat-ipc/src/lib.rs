@@ -91,6 +91,11 @@ pub struct PeerInfo {
     /// One of: lan, relay, radio, unknown.
     pub bandwidth_class: String,
     pub caps: Caps,
+    /// What the user wrote about this peer. Local only: never sent over the
+    /// mesh, never overwritten by an announce, and not part of message search.
+    /// Defaulted so payloads from an older engine still parse.
+    #[serde(default)]
+    pub notes: Option<String>,
 }
 
 impl PeerInfo {
@@ -508,6 +513,17 @@ pub enum ClientCmd {
     AddPeer {
         address: String,
         nickname: Option<String>,
+    },
+    /// Set the private alias for a peer. `None` clears it, so the headline
+    /// follows the peer's announced name again.
+    SetPeerNickname {
+        peer_id: String,
+        nickname: Option<String>,
+    },
+    /// Replace the private note kept for a peer. `None` clears it.
+    SetPeerNotes {
+        peer_id: String,
+        notes: Option<String>,
     },
     SetDisplayName {
         name: String,

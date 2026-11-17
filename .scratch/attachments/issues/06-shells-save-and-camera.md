@@ -1,6 +1,6 @@
 # 06 — Shells: saving files, and the camera path a QR scanner will reuse
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 

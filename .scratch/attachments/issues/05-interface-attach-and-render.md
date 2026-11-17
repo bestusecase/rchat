@@ -1,6 +1,6 @@
 # 05 — Interface: attach, pending chips, rendering and viewer
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 

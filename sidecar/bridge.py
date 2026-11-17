@@ -1484,9 +1484,6 @@ class ServiceAnnounceHandler:
             pass
 
 
-# ---- message handling ------------------------------------------------------
-
-
 # ---- attachments -----------------------------------------------------------
 #
 # Bytes never cross the JSON channel. The engine hands the bridge `{name, path}`
@@ -1671,6 +1668,9 @@ def stage_attachments(fields):
             item["reason"] = REASON_UNREADABLE
         staged.append(item)
     return staged
+
+
+# ---- message handling ------------------------------------------------------
 
 
 def on_delivery(message):

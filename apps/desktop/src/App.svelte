@@ -6,6 +6,7 @@
   import Chat from "./lib/Chat.svelte";
   import Members from "./lib/Members.svelte";
   import Network from "./lib/Network.svelte";
+  import PeerCard from "./lib/PeerCard.svelte";
   import Icon from "./lib/Icon.svelte";
 
   let dialog = $state(null);
@@ -49,6 +50,10 @@
       return;
     }
     if (guardDepth > 0) guardDepth -= 1;
+    if (chat.peerCard.peerId) {
+      void chat.closePeerCard();
+      return;
+    }
     if (dialog) {
       dialog = null;
       dialogError = "";
@@ -132,7 +137,24 @@
 
   function close() {
     if (busy || chat.needsName) return;
+    if (chat.peerCard.peerId) {
+      void closePeerCard();
+      return;
+    }
     if (dialog) dismissDialog();
+  }
+
+  /// Other people get the card; your own identity keeps the profile dialog.
+  function openPeerCard(peerId) {
+    if (!chat.openPeerCard(peerId)) {
+      openProfile();
+      return;
+    }
+    pushGuard();
+  }
+
+  async function closePeerCard() {
+    if (await chat.closePeerCard()) releaseGuard();
   }
 
   function handleKey(event) {
@@ -226,7 +248,7 @@
     {#if chat.networkPane}
       <Network onBack={closeNetwork} />
     {:else if chat.activeConversation}
-      <Chat onBack={backFromConversation} />
+      <Chat onBack={backFromConversation} onPeer={openPeerCard} />
     {:else if !chat.mobile}
       <section class="chat placeholder">
         <div class="chat-empty-mark"><Icon name="wave" size={30} /></div>
@@ -240,7 +262,7 @@
     {/if}
 
     {#if !chat.mobile}
-      <Members />
+      <Members onPeer={openPeerCard} />
     {/if}
   </div>
 {/if}
@@ -545,6 +567,10 @@
       </div>
     </div>
   </div>
+{/if}
+
+{#if chat.peerCard.peerId}
+  <PeerCard onClose={closePeerCard} />
 {/if}
 
 <div class="toasts">

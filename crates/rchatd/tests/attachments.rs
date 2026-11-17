@@ -10,7 +10,7 @@
 //! deterministic at the cost of running one engine test at a time.
 
 use futures_util::{SinkExt, StreamExt};
-use rchat_core::attachments::{REASON_EVICTED, REASON_MISSING, REASON_TOO_LARGE};
+use rchat_core::attachments::{REASON_EVICTED, REASON_EXTRA, REASON_MISSING, REASON_TOO_LARGE};
 use rchat_ipc::{Caps, PeerInfo};
 use rchatd::{BridgeMode, Engine, Options};
 use serde_json::{json, Value};
@@ -199,6 +199,7 @@ impl Harness {
             last_seen: Some(1),
             bandwidth_class: class.into(),
             caps: Caps::default(),
+            notes: None,
         };
         self.store().upsert_peer(&peer).unwrap();
         let reply = self
@@ -277,6 +278,30 @@ impl Harness {
             let value: Value = serde_json::from_str(&line).unwrap();
             // Startup housekeeping (`import_config`) may precede the message.
             if value.get("cmd").and_then(Value::as_str) == Some("send") {
+                return value;
+            }
+        }
+    }
+
+    /// The next published event with this name, skipping the rest. Only for use
+    /// when no command reply is outstanding: replies are skipped here.
+    async fn next_event(&mut self, name: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "the {name} event never arrived");
+            let frame = tokio::time::timeout(left, self.ws.next())
+                .await
+                .expect("the engine published nothing")
+                .expect("websocket closed")
+                .expect("websocket error");
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value.get("type").and_then(Value::as_str) == Some("event")
+                && value.get("name").and_then(Value::as_str) == Some(name)
+            {
                 return value;
             }
         }
@@ -887,6 +912,98 @@ async fn an_oversized_inbound_attachment_becomes_a_placeholder() {
     assert_eq!(row["hash"].as_str(), Some(""));
     assert!(harness.store().attachment_usage().unwrap() == 0);
     assert!(files_under(&blobs(&harness.dir)).is_empty());
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_inbound_attachment_evicted_on_arrival_still_reads_with_a_reason() {
+    let _env = env_lock().lock().await;
+    // The budget is smaller than the one file, so the same ingest that writes
+    // the blob has to take it away again.
+    let mut harness = Harness::start_with("inbound-evict", 64, INBOUND).await;
+    let bytes = vec![7u8; 1024];
+    let path = staged(&harness.dir, "clip.bin", &bytes);
+
+    harness
+        .bridge_event(json!({
+            "ev": "message",
+            "id": "evicted",
+            "from": "ee".repeat(16),
+            "body": "watch this",
+            "ts": 12,
+            "attachments": [
+                {"path": path.to_string_lossy(), "name": "clip.bin", "ordinal": 0, "size": bytes.len()}
+            ]
+        }))
+        .await;
+
+    // The live event, not a later reload: a bubble must not show an image whose
+    // bytes were already gone when the message arrived.
+    let event = harness.next_event("message.new").await;
+    let message = &event["data"]["message"];
+    assert_eq!(message["body"], "watch this");
+    let row = attachment(message);
+    assert_eq!(row["name"], "clip.bin");
+    assert!(row["hash"].as_str().is_some_and(|hash| !hash.is_empty()));
+    assert_eq!(row["reason"].as_str(), Some(REASON_EVICTED));
+    assert!(row.get("thumbnail").is_none());
+    assert!(files_under(&blobs(&harness.dir)).is_empty());
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn attachments_past_the_fourth_arrive_as_a_placeholder() {
+    let _env = env_lock().lock().await;
+    let mut harness = Harness::start("inbound-extras").await;
+    let mut entries = Vec::new();
+    for index in 0..5 {
+        let name = format!("part-{index}.bin");
+        let bytes = vec![index as u8; 32];
+        let path = staged(&harness.dir, &name, &bytes);
+        entries.push(json!({
+            "path": path.to_string_lossy(),
+            "name": name,
+            "ordinal": index,
+            "size": bytes.len(),
+        }));
+    }
+
+    harness
+        .bridge_event(json!({
+            "ev": "message",
+            "id": "five",
+            "from": "ef".repeat(16),
+            "body": "a burst",
+            "ts": 13,
+            "attachments": entries,
+        }))
+        .await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while harness.store().get_message("rns-five").unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the inbound message never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let conversation = harness.conversation_with_peer(&"ef".repeat(16));
+    let messages = harness.list(&conversation).await;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["body"], "a burst");
+    let rows = messages[0]["attachments"].as_array().unwrap();
+    assert_eq!(rows.len(), 5, "the extras keep their place in the message");
+    for row in &rows[..4] {
+        assert!(row["hash"].as_str().is_some_and(|hash| !hash.is_empty()));
+        assert!(row.get("reason").is_none());
+    }
+    let extra = &rows[4];
+    assert_eq!(extra["name"], "part-4.bin");
+    assert_eq!(extra["hash"].as_str(), Some(""));
+    assert_eq!(extra["reason"].as_str(), Some(REASON_EXTRA));
+    assert_eq!(files_under(&blobs(&harness.dir)).len(), 4);
 
     harness.stop().await;
 }

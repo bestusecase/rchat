@@ -5,15 +5,20 @@
   import Avatar from "./Avatar.svelte";
   import Icon from "./Icon.svelte";
 
-  let { onBack = null } = $props();
+  /// The engine's own ceiling; the picker stops at it so an over-limit send is
+  /// never the way a user finds out.
+  const MAX_ATTACHMENTS = 4;
+  const TOO_MANY = "A message can carry at most four attachments.";
+
+  let { onBack = null, onPeer = null } = $props();
   let viewport = $state();
   let input = $state();
   let draft = $state("");
   let sending = $state(false);
   let uploading = $state(false);
   let attachError = $state(null);
-  /// Chosen but unsent: `{id, file, name, size, preview}`. Uploads happen at
-  /// send time, so removing a chip costs nothing.
+  /// Chosen but unsent: `{id, file, name, size, mime, preview}`. Uploads happen
+  /// at send time, so removing a chip costs nothing.
   let chips = $state([]);
   /// The mobile two-choice sheet. A desktop has no camera, so it never opens.
   let attachMenu = $state(false);
@@ -111,6 +116,18 @@
     }
   }
 
+  function authorLabel(message) {
+    return chat.isMine(message)
+      ? chat.identity?.display_name || "you"
+      : chat.peerLabel(message.author_id);
+  }
+
+  function profileTitle(message) {
+    return chat.isMine(message)
+      ? "Open your profile"
+      : `Open ${chat.peerLabel(message.author_id)}'s profile`;
+  }
+
   function stateLabel(state) {
     switch (state) {
       case "queued":
@@ -173,6 +190,17 @@
     viewer = attachment;
   }
 
+  /// A short human label for a file's kind, from its extension: "PDF", "ZIP".
+  /// Falls back to the MIME subtype, then to "File".
+  function fileKind(attachment) {
+    const dot = attachment.name?.lastIndexOf(".") ?? -1;
+    if (dot > 0 && dot < attachment.name.length - 1) {
+      return attachment.name.slice(dot + 1).toUpperCase().slice(0, 6);
+    }
+    const subtype = attachment.mime?.split("/")[1];
+    return subtype ? subtype.toUpperCase() : "File";
+  }
+
   function closeViewer() {
     viewer = null;
   }
@@ -198,13 +226,13 @@
     const incoming = Array.from(list ?? []).filter(Boolean);
     if (incoming.length === 0) return;
     attachError = null;
-    const room = 4 - chips.length;
+    const room = MAX_ATTACHMENTS - chips.length;
     if (room <= 0) {
-      attachError = "A message can carry at most four attachments.";
+      attachError = TOO_MANY;
       return;
     }
     if (incoming.length > room) {
-      attachError = "A message can carry at most four attachments.";
+      attachError = TOO_MANY;
     }
     const added = incoming.slice(0, room).map((file) => ({
       id: Math.random().toString(36).slice(2),
@@ -323,6 +351,7 @@
 <section
   class="chat"
   class:dragging
+  aria-label="Conversation"
   ondragover={onDragOver}
   ondragleave={onDragLeave}
   ondrop={onDrop}
@@ -415,19 +444,32 @@
             {#if row.grouped}
               <span class="message-time-hover">{formatTime(row.message.ts)}</span>
             {:else}
-              <Avatar
-                id={row.message.author_id}
-                label={chat.isMine(row.message) ? chat.identity?.display_name : chat.peerLabel(row.message.author_id)}
-                size={40}
-              />
+              <button
+                class="avatar-button"
+                type="button"
+                title={profileTitle(row.message)}
+                aria-label={profileTitle(row.message)}
+                onclick={() => onPeer?.(row.message.author_id)}
+              >
+                <Avatar
+                  id={row.message.author_id}
+                  label={authorLabel(row.message)}
+                  size={40}
+                />
+              </button>
             {/if}
 
             <div class="message-body">
               {#if !row.grouped}
                 <div class="message-meta">
-                  <span class="message-author">
-                    {chat.isMine(row.message) ? chat.identity?.display_name || "you" : chat.peerLabel(row.message.author_id)}
-                  </span>
+                  <button
+                    class="message-author peer-link"
+                    type="button"
+                    title={profileTitle(row.message)}
+                    onclick={() => onPeer?.(row.message.author_id)}
+                  >
+                    {authorLabel(row.message)}
+                  </button>
                   <span class="message-time">{formatTime(row.message.ts)}</span>
                   {#if row.message.route === "reticulum"}
                     <span class="route-chip">mesh</span>
@@ -479,7 +521,7 @@
                     </div>
                   {/if}
 
-                  {#each docs as attachment (attachment.hash + attachment.name + attachment.ordinal)}
+                  {#each docs as attachment, index (attachment.hash || attachment.name + "-" + index)}
                     {#if attachment.reason}
                       <div class="attach-missing" role="note">
                         <Icon name="alert" size={15} />
@@ -495,7 +537,7 @@
                         </span>
                         <span class="attach-meta">
                           <span class="attach-name">{attachment.name}</span>
-                          <span class="attach-size">{formatBytes(attachment.size)}</span>
+                          <span class="attach-size">{fileKind(attachment)} · {formatBytes(attachment.size)}</span>
                         </span>
                         <button
                           type="button"
@@ -544,6 +586,7 @@
             class="chip-remove"
             title="Remove {chip.name}"
             aria-label="Remove {chip.name}"
+            disabled={uploading}
             onclick={() => removeChip(chip)}
           >
             <Icon name="close" size={13} />
@@ -633,8 +676,14 @@
       class="viewer"
       role="dialog"
       aria-modal="true"
+      tabindex="-1"
       aria-label={viewer.name ? `Image: ${viewer.name}` : "Image"}
-      onclick={closeViewer}
+      onclick={(event) => {
+        if (event.target === event.currentTarget) closeViewer();
+      }}
+      onkeydown={(event) => {
+        if (event.key === "Escape") closeViewer();
+      }}
     >
       <button
         type="button"
@@ -649,7 +698,6 @@
         class="viewer-image"
         src={chat.attachmentUrl(viewer)}
         alt={viewer.name ? `Image: ${viewer.name}` : "Image"}
-        onclick={(event) => event.stopPropagation()}
       />
       <button
         type="button"

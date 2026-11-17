@@ -61,6 +61,7 @@ pub fn start_engine(data_dir: PathBuf) -> Result<u16, String> {
         port: 0,
         no_rns: false,
         bridge: BridgeMode::Attach,
+        legacy_network: legacy_network(&data_dir),
     };
     let engine = runtime
         .block_on(Engine::start(options))
@@ -127,6 +128,28 @@ fn data_dir() -> Option<PathBuf> {
 }
 
 // ---- persisted settings ----------------------------------------------------
+
+/// The network fields `desktop.json` carried before interfaces moved into the
+/// engine. Read-only: the engine imports them once on upgrade.
+#[derive(Debug, Default, Deserialize)]
+struct LegacyNetwork {
+    #[serde(default)]
+    auto_discovery: Option<bool>,
+    #[serde(default)]
+    tcp_relay: Option<String>,
+}
+
+fn legacy_network(dir: &PathBuf) -> Option<rchat_core::store::LegacyNetwork> {
+    let text = std::fs::read_to_string(dir.join("desktop.json")).ok()?;
+    let legacy: LegacyNetwork = serde_json::from_str(&text).ok()?;
+    if legacy.auto_discovery.is_none() && legacy.tcp_relay.is_none() {
+        return None;
+    }
+    Some(rchat_core::store::LegacyNetwork {
+        auto_discovery: legacy.auto_discovery,
+        tcp_relay: legacy.tcp_relay,
+    })
+}
 
 /// The subset of the desktop settings file that means something on a phone.
 /// `desktop.json` is reused so the file format does not fork.
@@ -261,6 +284,21 @@ fn open_background_settings() -> Result<(), String> {
     android::open_background_settings()
 }
 
+/// Save one attachment into the system media store so it shows up in Downloads.
+///
+/// The bytes are read here, from the engine's blob store, and cross into Kotlin
+/// only for the write: the webview never holds a file larger than a thumbnail.
+/// Returns false when the platform refused, with the reason in the error.
+#[tauri::command]
+fn save_attachment(hash: String, name: String) -> Result<bool, String> {
+    let dir = data_dir().ok_or_else(|| "the engine is not running".to_string())?;
+    let blobs = rchat_core::attachments::BlobStore::new(dir.join("attachments"));
+    let bytes = blobs
+        .read(&hash)
+        .map_err(|err| format!("This attachment is no longer on this device: {err:#}"))?;
+    android::save_attachment(&name, &bytes)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     android::init_logging();
@@ -270,7 +308,8 @@ pub fn run() {
             get_desktop_settings,
             set_muted,
             clear_activity,
-            open_background_settings
+            open_background_settings,
+            save_attachment
         ])
         .run(tauri::generate_context!())
         .expect("error while running rchat");

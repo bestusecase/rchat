@@ -1,6 +1,6 @@
 # 02 — Size limits, refusal, placeholder and two-pass eviction
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 

@@ -1,6 +1,6 @@
 # 01 — Attachment rows, blob store and the shared ingest path
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 

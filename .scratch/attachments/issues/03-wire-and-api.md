@@ -1,6 +1,6 @@
 # 03 — Wire types, send command and blob HTTP routes
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 

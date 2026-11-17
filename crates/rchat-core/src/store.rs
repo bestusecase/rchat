@@ -150,7 +150,8 @@ impl Store {
                 last_seen       INTEGER,
                 bandwidth_class TEXT NOT NULL DEFAULT 'unknown',
                 caps            TEXT NOT NULL,
-                created_at      INTEGER NOT NULL
+                created_at      INTEGER NOT NULL,
+                notes           TEXT
             );
 
             CREATE TABLE IF NOT EXISTS conversations (
@@ -266,6 +267,7 @@ impl Store {
         // exists, so columns added after the first release need their own
         // guarded migration. Checking the column list makes it safe on every
         // startup.
+        ensure_column(&conn, "peers", "notes", "TEXT")?;
         // Schema 5 adds the reason an imported row cannot be used as written.
         ensure_column(&conn, "mesh_interfaces", "note", "TEXT")?;
         conn.execute(
@@ -273,7 +275,8 @@ impl Store {
             [],
         )?;
         // An install that predates attachments carries schema 1 or 2; schema 3
-        // added attachments and the mesh tables; 5 adds interface import notes.
+        // added attachments and the mesh tables; 4 adds peer notes; 5 adds
+        // interface import notes.
         conn.execute("UPDATE meta SET value = '5' WHERE key = 'schema'", [])?;
         Ok(())
     }
@@ -359,6 +362,8 @@ impl Store {
     pub fn upsert_peer(&self, peer: &PeerInfo) -> Result<()> {
         let caps = serde_json::to_string(&peer.caps)?;
         let conn = self.conn.lock().unwrap();
+        // `notes` is deliberately absent from both halves of this statement: an
+        // announce must never erase what the user wrote about a peer.
         conn.execute(
             r#"INSERT INTO peers(id, address, nickname, announced_name, last_seen,
                                  bandwidth_class, caps, created_at)
@@ -388,7 +393,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let peer = conn
             .query_row(
-                "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps
+                "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps, notes
                  FROM peers WHERE id = ?1",
                 [id],
                 map_peer,
@@ -401,7 +406,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let peer = conn
             .query_row(
-                "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps
+                "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps, notes
                  FROM peers WHERE address = ?1",
                 [address],
                 map_peer,
@@ -413,11 +418,58 @@ impl Store {
     pub fn list_peers(&self) -> Result<Vec<PeerInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps
+            "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps, notes
              FROM peers ORDER BY coalesce(last_seen, created_at) DESC",
         )?;
         let rows = stmt.query_map([], map_peer)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Set the local alias. `None` clears it, so the announced name shows
+    /// through again.
+    pub fn set_peer_nickname(&self, id: &str, nickname: Option<&str>) -> Result<PeerInfo> {
+        self.ensure_peer_row(id)?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE peers SET nickname = ?2 WHERE id = ?1",
+                params![id, nickname],
+            )?;
+        }
+        self.peer(id)?.context("peer vanished right after a rename")
+    }
+
+    /// Replace the private note. `None` clears it.
+    pub fn set_peer_notes(&self, id: &str, notes: Option<&str>) -> Result<PeerInfo> {
+        self.ensure_peer_row(id)?;
+        {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE peers SET notes = ?2 WHERE id = ?1",
+                params![id, notes],
+            )?;
+        }
+        self.peer(id)?.context("peer vanished right after a note")
+    }
+
+    /// Give a write a row to land in when the client names a peer this
+    /// database has never stored, mirroring incoming-message handling. A note
+    /// about an unrecognised author is kept rather than silently dropped.
+    fn ensure_peer_row(&self, id: &str) -> Result<()> {
+        if self.peer(id)?.is_some() {
+            return Ok(());
+        }
+        let address = (id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| id.to_ascii_lowercase());
+        let caps = serde_json::to_string(&Caps::default())?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO peers(id, address, nickname, announced_name, last_seen,
+                                         bandwidth_class, caps, created_at, notes)
+             VALUES (?1, ?2, NULL, NULL, NULL, 'unknown', ?3, ?4, NULL)",
+            params![id, address, caps, crate::now_ms()],
+        )?;
+        Ok(())
     }
 
     /// Set the coarse link class derived from the path table. Returns whether
@@ -852,18 +904,26 @@ impl Store {
 
     /// Hashes eligible for eviction, oldest first. `received` selects the first
     /// pass; sent blobs are only considered once no received blob remains.
+    ///
+    /// Unclaimed uploads count as local bytes in the second pass: a file chosen
+    /// but never sent still occupies the budget, and it is the safest thing to
+    /// drop.
     pub fn evictable_hashes(&self, received: bool) -> Result<Vec<(String, u64)>> {
         let me = self
             .identity()?
             .map(|identity| identity.id)
             .unwrap_or_default();
-        let comparison = if received { "<>" } else { "=" };
+        let select = if received {
+            "m.author_id IS NOT NULL AND m.author_id <> ?1"
+        } else {
+            "(m.author_id IS NULL OR m.author_id = ?1)"
+        };
         let sql = format!(
             "SELECT a.hash, max(a.size)
-             FROM attachments a JOIN messages m ON m.id = a.message_id
-             WHERE a.reason IS NULL AND a.hash <> '' AND m.author_id {comparison} ?1
+             FROM attachments a LEFT JOIN messages m ON m.id = a.message_id
+             WHERE a.reason IS NULL AND a.hash <> '' AND {select}
              GROUP BY a.hash
-             ORDER BY min(m.ts) ASC, a.hash ASC"
+             ORDER BY min(coalesce(m.ts, 0)) ASC, a.hash ASC"
         );
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
@@ -1376,6 +1436,7 @@ fn map_peer(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerInfo> {
         last_seen: r.get(4)?,
         bandwidth_class: r.get(5)?,
         caps: serde_json::from_str(&caps).unwrap_or_else(|_| Caps::default()),
+        notes: r.get(7)?,
     })
 }
 
@@ -1453,8 +1514,11 @@ fn map_attachment(r: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentInfo> {
     })
 }
 
-/// The conversation-list line for a message whose body is only a caption.
-fn preview_text(attachments: &[AttachmentInfo]) -> Option<String> {
+/// One line for the conversation list. An attachment-only message still
+/// says something: an image reads as a photo, a lone file is named. Public so a
+/// shell that renders its own thread line (the Android notification shade) uses
+/// the same words.
+pub fn preview_text(attachments: &[AttachmentInfo]) -> Option<String> {
     if attachments.is_empty() {
         return None;
     }
@@ -1525,12 +1589,27 @@ mod tests {
         }
     }
 
+    fn peer_row(id: &str, nickname: Option<&str>, announced: Option<&str>) -> PeerInfo {
+        PeerInfo {
+            id: id.to_string(),
+            address: Some(id.to_string()),
+            nickname: nickname.map(str::to_string),
+            announced_name: announced.map(str::to_string),
+            last_seen: Some(1),
+            bandwidth_class: "unknown".into(),
+            caps: Caps::default(),
+            notes: None,
+        }
+    }
+
     /// What the announce path does: read the stored peer, change what the
-    /// announce carried, and upsert the whole row back.
+    /// announce carried, and upsert the row back. It drops the nickname rather
+    /// than carrying it, so a clear that raced the announce cannot be undone.
     fn announce(store: &Store, id: &str, name: Option<&str>, ts: i64) {
         let peer = store.peer(id).unwrap().expect("a peer to announce");
         store
             .upsert_peer(&PeerInfo {
+                nickname: None,
                 announced_name: name.map(str::to_string),
                 last_seen: Some(ts),
                 ..peer
@@ -1568,6 +1647,151 @@ mod tests {
         store.set_display_name("you").unwrap();
         assert!(store.display_name_set().unwrap());
         assert_eq!(store.identity().unwrap().unwrap().display_name, "you");
+    }
+
+    #[test]
+    fn a_nickname_is_stored_and_read_back() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "aa".repeat(16);
+        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+
+        let peer = store.set_peer_nickname(&id, Some("Radio net")).unwrap();
+        assert_eq!(peer.nickname.as_deref(), Some("Radio net"));
+        assert_eq!(store.peer(&id).unwrap().unwrap().label(), "Radio net");
+    }
+
+    #[test]
+    fn clearing_a_nickname_falls_back_to_the_announced_name() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "aa".repeat(16);
+        store
+            .upsert_peer(&peer_row(&id, Some("Radio net"), Some("Alice")))
+            .unwrap();
+
+        let cleared = store.set_peer_nickname(&id, None).unwrap();
+        assert_eq!(cleared.nickname, None);
+        assert_eq!(cleared.label(), "Alice");
+    }
+
+    #[test]
+    fn notes_round_trip_including_newlines() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "aa".repeat(16);
+        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+        let notes = "Met at the Tuesday radio net.\nLives across town.\n\nOwes me a coffee.";
+
+        let peer = store.set_peer_notes(&id, Some(notes)).unwrap();
+        assert_eq!(peer.notes.as_deref(), Some(notes));
+        assert_eq!(
+            store.peer(&id).unwrap().unwrap().notes.as_deref(),
+            Some(notes)
+        );
+
+        let cleared = store.set_peer_notes(&id, None).unwrap();
+        assert_eq!(cleared.notes, None);
+    }
+
+    #[test]
+    fn a_reopened_database_keeps_nicknames_and_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rchat.db");
+        let id = "aa".repeat(16);
+        {
+            let store = Store::open(&path).unwrap();
+            store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+            store.set_peer_nickname(&id, Some("Radio net")).unwrap();
+            store
+                .set_peer_notes(&id, Some("first line\nsecond line"))
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let peer = store.peer(&id).unwrap().unwrap();
+        assert_eq!(peer.nickname.as_deref(), Some("Radio net"));
+        assert_eq!(peer.notes.as_deref(), Some("first line\nsecond line"));
+    }
+
+    #[test]
+    fn an_announce_never_touches_a_nickname_or_a_note() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "aa".repeat(16);
+        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+        store.set_peer_nickname(&id, Some("Radio net")).unwrap();
+        store.set_peer_notes(&id, Some("a note")).unwrap();
+
+        announce(&store, &id, Some("Alice-2"), 50);
+        let peer = store.peer(&id).unwrap().unwrap();
+        assert_eq!(peer.nickname.as_deref(), Some("Radio net"));
+        assert_eq!(peer.announced_name.as_deref(), Some("Alice-2"));
+        assert_eq!(peer.notes.as_deref(), Some("a note"));
+        assert_eq!(peer.last_seen, Some(50));
+
+        // A cleared alias stays cleared: the announce brings nothing to copy in.
+        store.set_peer_nickname(&id, None).unwrap();
+        announce(&store, &id, Some("Alice-3"), 60);
+        let peer = store.peer(&id).unwrap().unwrap();
+        assert_eq!(peer.nickname, None);
+        assert_eq!(peer.notes.as_deref(), Some("a note"));
+    }
+
+    #[test]
+    fn an_older_database_gains_the_notes_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rchat.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES ('schema', '3');
+                CREATE TABLE peers (
+                    id              TEXT PRIMARY KEY,
+                    address         TEXT UNIQUE,
+                    nickname        TEXT,
+                    announced_name  TEXT,
+                    last_seen       INTEGER,
+                    bandwidth_class TEXT NOT NULL DEFAULT 'unknown',
+                    caps            TEXT NOT NULL,
+                    created_at      INTEGER NOT NULL
+                );
+                INSERT INTO peers(id, address, nickname, announced_name, last_seen,
+                                  bandwidth_class, caps, created_at)
+                VALUES ('aa', 'aa', 'ali', 'Alice', 5, 'lan', '{}', 1);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let peer = store.peer("aa").unwrap().unwrap();
+        assert_eq!(peer.nickname.as_deref(), Some("ali"));
+        assert_eq!(peer.announced_name.as_deref(), Some("Alice"));
+        assert_eq!(peer.last_seen, Some(5));
+        assert_eq!(peer.bandwidth_class, "lan");
+        assert_eq!(peer.notes, None);
+        assert_eq!(store.meta("schema").unwrap().as_deref(), Some("5"));
+
+        // The new column is real, and the guard makes a second open harmless.
+        store.set_peer_notes("aa", Some("kept")).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.peer("aa").unwrap().unwrap().notes.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn writing_to_a_peer_with_no_row_creates_one() {
+        let store = Store::open_in_memory().unwrap();
+        let id = "ab".repeat(16);
+
+        let peer = store.set_peer_nickname(&id, Some("Stranger")).unwrap();
+        assert_eq!(peer.id, id);
+        assert_eq!(peer.address.as_deref(), Some(id.as_str()));
+        assert_eq!(peer.nickname.as_deref(), Some("Stranger"));
+        assert_eq!(peer.announced_name, None);
+
+        let peer = store.set_peer_notes(&id, Some("met once")).unwrap();
+        assert_eq!(peer.notes.as_deref(), Some("met once"));
+        assert_eq!(store.list_peers().unwrap().len(), 1);
     }
 
     #[test]
@@ -1896,6 +2120,34 @@ mod tests {
         );
         assert!(store.attachment_usage().unwrap() == 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unclaimed_upload_is_evictable_when_the_budget_fills() {
+        let store = Store::open_in_memory().unwrap();
+        store.ensure_identity().unwrap();
+        let upload = attachment("chosen.pdf", "application/pdf", 10, &"cc".repeat(32));
+        store.insert_upload(&upload).unwrap();
+
+        // Nobody received it, so it is not in the first pass; it is local bytes,
+        // so the second pass must be able to take it.
+        assert!(store.evictable_hashes(true).unwrap().is_empty());
+        assert_eq!(
+            store.evictable_hashes(false).unwrap(),
+            [(upload.hash.clone(), 10)]
+        );
+        assert_eq!(store.attachment_usage().unwrap(), 10);
+
+        let dir = std::env::temp_dir().join(format!(
+            "rchat-unclaimed-{}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        let blobs = crate::attachments::BlobStore::new(&dir);
+        assert!(store
+            .evict_attachment(&blobs, &upload.hash, crate::attachments::REASON_EVICTED)
+            .unwrap());
+        assert_eq!(store.attachment_usage().unwrap(), 0);
     }
 
     #[test]

@@ -22,17 +22,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rchatd = { path = "../../../crates/rchatd" }
 rchat-core = { path = "../../../crates/rchat-core" }
+rchat-ipc = { path = "../../../crates/rchat-ipc" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 jni = "0.21"
 anyhow = "1"
 log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-
-[dev-dependencies]
-# The notification tests seed a real in-memory store with peers and
-# conversations, so they need the protocol types the store speaks.
-rchat-ipc = { path = "../../../crates/rchat-ipc" }
 
 [profile.release]
 codegen-units = 1

@@ -1,6 +1,6 @@
 # 04 — Bridge: standard LXMF fields in both directions
 
-Status: ready-for-agent
+Status: done
 
 ## Scope
 
