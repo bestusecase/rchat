@@ -224,3 +224,5 @@ the API reports about itself; never that a particular internal call was made.
   one-host port reason; the engine imports it and owns it from then on.
 - Transport derivation, per-interface outage age and per-peer reachability are computed in
   `rchatd` from the cached mesh sample, so the UI never infers reachability from receipts.
+- Follow-up: `.scratch/mesh-upgrade-honesty/spec.md` closes the config-wins upgrade notice,
+  the dead mobile settings fields, and the namespace runner for phase (c).
