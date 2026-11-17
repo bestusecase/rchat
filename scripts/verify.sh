@@ -50,6 +50,42 @@ step() {
   "$@"
 }
 
+# The shell's tauri-build refuses to compile when a packaged input is missing.
+# `runtime/`, `resources/rchatd` and `dist/` are release-build outputs and are
+# gitignored, so a clean checkout has none of them. The gate compiles and tests
+# the Rust shells but does not package the app or build the frontend, so it
+# satisfies the existence checks with placeholders and removes only what it
+# created.
+stub_runtime=0
+stub_rchatd=0
+stub_dist=0
+stub_dist_dir=0
+if [ ! -e apps/desktop/src-tauri/runtime ]; then
+  mkdir -p apps/desktop/src-tauri/runtime
+  stub_runtime=1
+fi
+if [ ! -e apps/desktop/src-tauri/resources/rchatd ]; then
+  mkdir -p apps/desktop/src-tauri/resources
+  : > apps/desktop/src-tauri/resources/rchatd
+  chmod +x apps/desktop/src-tauri/resources/rchatd
+  stub_rchatd=1
+fi
+if [ ! -e apps/desktop/dist ]; then
+  mkdir -p apps/desktop/dist
+  stub_dist_dir=1
+fi
+if [ ! -e apps/desktop/dist/index.html ]; then
+  printf '<!doctype html><title>verify</title>\n' > apps/desktop/dist/index.html
+  stub_dist=1
+fi
+cleanup() {
+  if [ "$stub_dist" = 1 ]; then rm -f apps/desktop/dist/index.html; fi
+  if [ "$stub_dist_dir" = 1 ]; then rm -rf apps/desktop/dist; fi
+  if [ "$stub_rchatd" = 1 ]; then rm -f apps/desktop/src-tauri/resources/rchatd; fi
+  if [ "$stub_runtime" = 1 ]; then rm -rf apps/desktop/src-tauri/runtime; fi
+}
+trap cleanup EXIT
+
 step "format: engine" cargo fmt --all -- --check
 step "format: desktop shell" \
   cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --all -- --check
