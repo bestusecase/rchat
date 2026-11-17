@@ -14,13 +14,20 @@
     if (!dialog) return;
     if (card.editing) {
       // Select what is there: typing replaces the alias, clearing resets it.
-      input?.focus();
-      input?.select();
+      // Only when the field is not already focused: this effect also runs on
+      // every draft change, and re-selecting mid-word would make each keystroke
+      // overwrite the last one.
+      if (document.activeElement !== input) {
+        input?.focus();
+        input?.select();
+      }
       return;
     }
     // Announcing the card on open, and returning focus when editing ends, so
-    // an Esc-cancel does not strand focus at the top of the page.
-    dialog.focus();
+    // an Esc-cancel does not strand focus at the top of the page. Only pull
+    // focus in from outside the card: a notes draft re-runs this too, and
+    // grabbing it back would blur the field on every typed character.
+    if (!dialog.contains(document.activeElement)) dialog.focus();
   });
 
   function startEdit() {
