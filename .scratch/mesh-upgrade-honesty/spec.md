@@ -1,6 +1,6 @@
 # Make the mesh upgrade and discovery edges honest
 
-Status: ready-for-agent
+Status: resolved
 Effort: `mesh-upgrade-honesty`
 Prerequisite: `peer-rendezvous`. That effort made interfaces authoritative,
 added `degraded`, per-interface health and per-peer reachability, and left three

@@ -1,6 +1,6 @@
 # Attachments
 
-Status: ready-for-agent
+Status: blocked (device acceptance; see issues/08)
 
 ## Problem Statement
 

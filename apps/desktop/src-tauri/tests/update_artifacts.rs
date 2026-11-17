@@ -31,7 +31,10 @@ fn find_artifact(dir: &Path, suffix: &str) -> Option<PathBuf> {
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().ends_with(suffix)))
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(suffix))
+        })
 }
 
 #[test]
@@ -44,9 +47,12 @@ fn appimage_signature_verifies_against_pinned_key() {
     let sig_path = appimage.with_extension("AppImage.sig");
     // Tauri stores both the key and the signature base64-encoded so they can be
     // embedded in JSON; decode exactly like the runtime verifier does.
-    let signature_text =
-        String::from_utf8(BASE64.decode(fs::read_to_string(&sig_path).unwrap().trim()).unwrap())
-            .unwrap();
+    let signature_text = String::from_utf8(
+        BASE64
+            .decode(fs::read_to_string(&sig_path).unwrap().trim())
+            .unwrap(),
+    )
+    .unwrap();
     let signature = minisign_verify::Signature::decode(&signature_text).expect("signature parses");
     let key_text = String::from_utf8(BASE64.decode(pubkey()).unwrap()).unwrap();
     let key = minisign_verify::PublicKey::decode(&key_text).expect("public key parses");
@@ -77,9 +83,13 @@ fn latest_json_matches_the_staged_artifact() {
         "unexpected asset url: {url}"
     );
     assert!(
-        String::from_utf8(BASE64.decode(platform["signature"].as_str().unwrap()).unwrap())
-            .unwrap()
-            .starts_with("untrusted comment: signature from tauri secret key"),
+        String::from_utf8(
+            BASE64
+                .decode(platform["signature"].as_str().unwrap())
+                .unwrap()
+        )
+        .unwrap()
+        .starts_with("untrusted comment: signature from tauri secret key"),
         "signature is not a tauri minisign signature"
     );
 

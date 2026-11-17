@@ -198,10 +198,12 @@ pub fn spawn(python: &str, script: &Path, envs: &[(&str, String)]) -> Result<Bri
             if line.trim().is_empty() {
                 continue;
             }
-            if evt_tx.send(BridgeEvent::Log {
-                level: "debug".into(),
-                message: line,
-            }).is_err()
+            if evt_tx
+                .send(BridgeEvent::Log {
+                    level: "debug".into(),
+                    message: line,
+                })
+                .is_err()
             {
                 break;
             }
@@ -381,46 +383,112 @@ fn parse_event(line: &str) -> Option<BridgeEvent> {
             };
             Some(BridgeEvent::State {
                 state,
-                address: value.get("address").and_then(|v| v.as_str()).map(str::to_string),
-                name: value.get("name").and_then(|v| v.as_str()).map(str::to_string),
-                detail: value.get("detail").and_then(|v| v.as_str()).map(str::to_string),
+                address: value
+                    .get("address")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                name: value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                detail: value
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             })
         }
         "message" => Some(BridgeEvent::Message {
-            id: value.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            from: value.get("from").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            body: value.get("body").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            ts: value.get("ts").and_then(|v| v.as_i64()).unwrap_or_else(crate_now_ms),
+            id: value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            from: value
+                .get("from")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            body: value
+                .get("body")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            ts: value
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(crate_now_ms),
             attachments: parse_attachments(&value),
         }),
         "announce" => Some(BridgeEvent::Announce {
-            address: value.get("address").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: value.get("name").and_then(|v| v.as_str()).map(str::to_string),
-            aspect: value.get("aspect").and_then(|v| v.as_str()).map(str::to_string),
-            interface: value.get("interface").and_then(|v| v.as_str()).map(str::to_string),
+            address: value
+                .get("address")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            aspect: value
+                .get("aspect")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            interface: value
+                .get("interface")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             hops: value
                 .get("hops")
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u32::try_from(v).ok()),
         }),
-        "mesh" => value.get("mesh").cloned().map(|mesh| BridgeEvent::Mesh { mesh }),
+        "mesh" => value
+            .get("mesh")
+            .cloned()
+            .map(|mesh| BridgeEvent::Mesh { mesh }),
         "bridge_reply" => Some(BridgeEvent::Reply {
             token: value.get("token").and_then(|v| v.as_u64()).unwrap_or(0),
             ok: value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
             data: value.get("data").cloned(),
-            error: value.get("error").and_then(|v| v.as_str()).map(str::to_string),
-            name: value.get("name").and_then(|v| v.as_str()).map(str::to_string),
+            error: value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            name: value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         }),
         "receipt" => Some(BridgeEvent::Receipt {
-            id: value.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            state: value.get("state").and_then(|v| v.as_str()).unwrap_or("failed").to_string(),
+            id: value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            state: value
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed")
+                .to_string(),
         }),
         "error" => Some(BridgeEvent::Error {
-            message: value.get("message").and_then(|v| v.as_str()).unwrap_or("unknown bridge error").to_string(),
+            message: value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown bridge error")
+                .to_string(),
         }),
         "log" => Some(BridgeEvent::Log {
-            level: value.get("level").and_then(|v| v.as_str()).unwrap_or("debug").to_string(),
-            message: value.get("message").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            level: value
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("debug")
+                .to_string(),
+            message: value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         }),
         _ => None,
     }
@@ -477,7 +545,10 @@ mod tests {
                           {"path":"/tmp/stage/one","name":"one.png","ordinal":0,"size":12},
                           {"name":"big.pdf","ordinal":1,"size":999,
                            "reason":"Attachment was too large to receive"}]}"#;
-        let Some(BridgeEvent::Message { attachments, body, .. }) = parse_event(line) else {
+        let Some(BridgeEvent::Message {
+            attachments, body, ..
+        }) = parse_event(line)
+        else {
             panic!("expected a message event");
         };
         assert_eq!(body, "look");
@@ -497,7 +568,14 @@ mod tests {
     fn a_refused_configure_names_the_interface() {
         let line = r#"{"ev":"bridge_reply","token":9,"ok":false,
                         "name":"Bad Server","error":"Reticulum could not attach interface \"Bad Server\"."}"#;
-        let Some(BridgeEvent::Reply { ok, name, error, token, .. }) = parse_event(line) else {
+        let Some(BridgeEvent::Reply {
+            ok,
+            name,
+            error,
+            token,
+            ..
+        }) = parse_event(line)
+        else {
             panic!("expected a reply event");
         };
         assert!(!ok);

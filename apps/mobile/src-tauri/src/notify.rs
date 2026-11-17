@@ -630,7 +630,9 @@ mod tests {
             "hash": "aa",
         }]);
         let snapshot = case
-            .observe_event(&event_with(&chat, "alice", "", 1_000, photo), false, || false)
+            .observe_event(&event_with(&chat, "alice", "", 1_000, photo), false, || {
+                false
+            })
             .unwrap();
         assert_eq!(bodies(&snapshot, 0), ["Photo"]);
 

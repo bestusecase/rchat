@@ -93,7 +93,12 @@ async fn the_real_bridge_connects_over_the_socket() {
         .spawn()
         .expect("spawning python");
 
-    let body = wait_for(|body| body.contains("\"transport\":\"ready\""), endpoint.port, 90).await;
+    let body = wait_for(
+        |body| body.contains("\"transport\":\"ready\""),
+        endpoint.port,
+        90,
+    )
+    .await;
     println!("ready: {body}");
     // Reticulum must have stored the LXMF address for this bridge instance.
     let address = body
@@ -103,7 +108,10 @@ async fn the_real_bridge_connects_over_the_socket() {
         .expect("health should carry the address")
         .to_string();
     assert_eq!(address.len(), 32, "not a hex LXMF address: {address}");
-    assert!(rns_dir.join("identity").exists(), "bridge identity was not stored");
+    assert!(
+        rns_dir.join("identity").exists(),
+        "bridge identity was not stored"
+    );
     assert!(
         rns_dir.join("config").exists(),
         "bridge config was not written"
@@ -112,7 +120,12 @@ async fn the_real_bridge_connects_over_the_socket() {
     // Losing the bridge must surface as offline, not as a hang.
     child.start_kill().unwrap();
     let _ = child.wait().await;
-    let body = wait_for(|body| body.contains("\"transport\":\"offline\""), endpoint.port, 10).await;
+    let body = wait_for(
+        |body| body.contains("\"transport\":\"offline\""),
+        endpoint.port,
+        10,
+    )
+    .await;
     println!("after kill: {body}");
 
     engine.stop();

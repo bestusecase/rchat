@@ -125,6 +125,17 @@ pub struct Store {
     last_announce_prune: Mutex<Option<i64>>,
 }
 
+/// One conversation row as selected by [`Store::list_conversations`], before it
+/// is expanded with its preview and members.
+struct ConversationRow {
+    id: String,
+    kind: String,
+    title: Option<String>,
+    created_at: i64,
+    last_message_at: Option<i64>,
+    unread: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct IdentityRow {
     pub id: String,
@@ -375,7 +386,10 @@ impl Store {
 
     pub fn set_display_name(&self, name: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE identity SET display_name = ?1 WHERE slot = 'me'", [name])?;
+        conn.execute(
+            "UPDATE identity SET display_name = ?1 WHERE slot = 'me'",
+            [name],
+        )?;
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('display_name_set', '1')
              ON CONFLICT(key) DO UPDATE SET value = '1'",
@@ -390,9 +404,11 @@ impl Store {
     pub fn display_name_set(&self) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let value: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'display_name_set'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'display_name_set'",
+                [],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(value.as_deref() == Some("1"))
     }
@@ -470,7 +486,9 @@ impl Store {
             "SELECT id, address, nickname, announced_name, last_seen, bandwidth_class, caps, notes
              FROM peers ORDER BY coalesce(last_seen, created_at) DESC",
         )?;
-        let rows = stmt.query_map([], map_peer)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([], map_peer)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -615,7 +633,7 @@ impl Store {
     }
 
     pub fn list_conversations(&self) -> Result<Vec<ConversationInfo>> {
-        let rows: Vec<(String, String, Option<String>, i64, Option<i64>, i64)> = {
+        let rows: Vec<ConversationRow> = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT c.id, c.kind, c.title, c.created_at, c.last_message_at, c.unread
@@ -624,30 +642,30 @@ impl Store {
             )?;
             let collected = stmt
                 .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
+                    Ok(ConversationRow {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        title: r.get(2)?,
+                        created_at: r.get(3)?,
+                        last_message_at: r.get(4)?,
+                        unread: r.get(5)?,
+                    })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             collected
         };
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, kind, title, created_at, last_message_at, unread) in rows {
-            let peer_ids = self.members(&id)?;
+        for row in rows {
+            let peer_ids = self.members(&row.id)?;
             out.push(ConversationInfo {
-                preview: self.preview(&id)?,
-                id,
-                kind,
-                title,
-                created_at,
-                last_message_at,
-                unread,
+                preview: self.preview(&row.id)?,
+                id: row.id,
+                kind: row.kind,
+                title: row.title,
+                created_at: row.created_at,
+                last_message_at: row.last_message_at,
+                unread: row.unread,
                 peer_ids,
             });
         }
@@ -680,8 +698,8 @@ impl Store {
 
     pub fn members(&self, conversation_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT peer_id FROM members WHERE conversation_id = ?1 ORDER BY joined_at")?;
+        let mut stmt = conn
+            .prepare("SELECT peer_id FROM members WHERE conversation_id = ?1 ORDER BY joined_at")?;
         let rows = stmt
             .query_map([conversation_id], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -794,13 +812,19 @@ impl Store {
 
     pub fn update_message_state(&self, id: &str, state: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE messages SET state = ?2 WHERE id = ?1", params![id, state])?;
+        conn.execute(
+            "UPDATE messages SET state = ?2 WHERE id = ?1",
+            params![id, state],
+        )?;
         Ok(())
     }
 
     pub fn set_message_route(&self, id: &str, route: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE messages SET route = ?2 WHERE id = ?1", params![id, route])?;
+        conn.execute(
+            "UPDATE messages SET route = ?2 WHERE id = ?1",
+            params![id, route],
+        )?;
         Ok(())
     }
 
@@ -1177,11 +1201,7 @@ impl Store {
     }
 
     /// Newest first, paged by `last_seen` so a live prepend cannot shift a page.
-    pub fn list_announces(
-        &self,
-        before: Option<i64>,
-        limit: u32,
-    ) -> Result<Vec<AnnounceSighting>> {
+    pub fn list_announces(&self, before: Option<i64>, limit: u32) -> Result<Vec<AnnounceSighting>> {
         let limit = limit.clamp(1, 500) as i64;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1542,7 +1562,10 @@ impl Store {
     /// The one derived fact the upgrade produced: a hand-written `rns/config`
     /// won, so explicit old app settings were not imported. Names only what was
     /// actually present; a default-on discovery flag was never a saved choice.
-    pub fn upgrade_notice(&self, legacy: Option<&LegacyNetwork>) -> Result<Option<InterfaceNotice>> {
+    pub fn upgrade_notice(
+        &self,
+        legacy: Option<&LegacyNetwork>,
+    ) -> Result<Option<InterfaceNotice>> {
         if self.meta(UPGRADE_NOTICE_DISMISSED)?.as_deref() == Some("1") {
             return Ok(None);
         }
@@ -1874,7 +1897,9 @@ mod tests {
     fn a_nickname_is_stored_and_read_back() {
         let store = Store::open_in_memory().unwrap();
         let id = "aa".repeat(16);
-        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+        store
+            .upsert_peer(&peer_row(&id, None, Some("Alice")))
+            .unwrap();
 
         let peer = store.set_peer_nickname(&id, Some("Radio net")).unwrap();
         assert_eq!(peer.nickname.as_deref(), Some("Radio net"));
@@ -1898,7 +1923,9 @@ mod tests {
     fn notes_round_trip_including_newlines() {
         let store = Store::open_in_memory().unwrap();
         let id = "aa".repeat(16);
-        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+        store
+            .upsert_peer(&peer_row(&id, None, Some("Alice")))
+            .unwrap();
         let notes = "Met at the Tuesday radio net.\nLives across town.\n\nOwes me a coffee.";
 
         let peer = store.set_peer_notes(&id, Some(notes)).unwrap();
@@ -1919,7 +1946,9 @@ mod tests {
         let id = "aa".repeat(16);
         {
             let store = Store::open(&path).unwrap();
-            store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+            store
+                .upsert_peer(&peer_row(&id, None, Some("Alice")))
+                .unwrap();
             store.set_peer_nickname(&id, Some("Radio net")).unwrap();
             store
                 .set_peer_notes(&id, Some("first line\nsecond line"))
@@ -1936,7 +1965,9 @@ mod tests {
     fn an_announce_never_touches_a_nickname_or_a_note() {
         let store = Store::open_in_memory().unwrap();
         let id = "aa".repeat(16);
-        store.upsert_peer(&peer_row(&id, None, Some("Alice"))).unwrap();
+        store
+            .upsert_peer(&peer_row(&id, None, Some("Alice")))
+            .unwrap();
         store.set_peer_nickname(&id, Some("Radio net")).unwrap();
         store.set_peer_notes(&id, Some("a note")).unwrap();
 
@@ -1996,7 +2027,10 @@ mod tests {
         store.set_peer_notes("aa", Some("kept")).unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.peer("aa").unwrap().unwrap().notes.as_deref(), Some("kept"));
+        assert_eq!(
+            store.peer("aa").unwrap().unwrap().notes.as_deref(),
+            Some("kept")
+        );
     }
 
     #[test]
@@ -2032,12 +2066,21 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.ensure_identity().unwrap();
         let conv = store.open_direct("peer-1").unwrap();
-        store.insert_message(&msg(&conv.id, "peer-1", "one", 10), true).unwrap();
-        store.insert_message(&msg(&conv.id, "peer-1", "two", 20), true).unwrap();
-        store.insert_message(&msg(&conv.id, "me", "three", 30), false).unwrap();
+        store
+            .insert_message(&msg(&conv.id, "peer-1", "one", 10), true)
+            .unwrap();
+        store
+            .insert_message(&msg(&conv.id, "peer-1", "two", 20), true)
+            .unwrap();
+        store
+            .insert_message(&msg(&conv.id, "me", "three", 30), false)
+            .unwrap();
 
         let list = store.list_messages(&conv.id, None, 50).unwrap();
-        assert_eq!(list.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), ["one", "two", "three"]);
+        assert_eq!(
+            list.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
 
         let fresh = store.get_conversation(&conv.id).unwrap();
         assert_eq!(fresh.unread, 2);
@@ -2050,8 +2093,12 @@ mod tests {
     #[test]
     fn event_log_is_monotonic() {
         let store = Store::open_in_memory().unwrap();
-        let a = store.record_event("a", &serde_json::json!({"x":1})).unwrap();
-        let b = store.record_event("b", &serde_json::json!({"x":2})).unwrap();
+        let a = store
+            .record_event("a", &serde_json::json!({"x":1}))
+            .unwrap();
+        let b = store
+            .record_event("b", &serde_json::json!({"x":2}))
+            .unwrap();
         assert!(b > a);
         let rows = store.events_since(a).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2063,8 +2110,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.ensure_identity().unwrap();
         let conv = store.open_direct("peer-1").unwrap();
-        store.insert_message(&msg(&conv.id, "peer-1", "the quick brown fox", 1), true).unwrap();
-        store.insert_message(&msg(&conv.id, "peer-1", "lazy dog", 2), true).unwrap();
+        store
+            .insert_message(&msg(&conv.id, "peer-1", "the quick brown fox", 1), true)
+            .unwrap();
+        store
+            .insert_message(&msg(&conv.id, "peer-1", "lazy dog", 2), true)
+            .unwrap();
         let hits = store.search("quick", 10).unwrap();
         assert_eq!(hits.len(), 1);
     }
@@ -2129,10 +2180,16 @@ mod tests {
             .expect("an upload leaves a row a send can name");
         assert_eq!(found.name, "draft.png");
         assert_eq!(store.attachment_usage().unwrap(), 5);
-        assert!(store.evictable_hashes(true).unwrap().is_empty(), "unclaimed rows have no author");
+        assert!(
+            store.evictable_hashes(true).unwrap().is_empty(),
+            "unclaimed rows have no author"
+        );
 
         store.forget_unclaimed(&[found.hash]).unwrap();
-        assert!(store.attachment_by_hash(&"dd".repeat(32)).unwrap().is_none());
+        assert!(store
+            .attachment_by_hash(&"dd".repeat(32))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2201,12 +2258,18 @@ mod tests {
 
         let received_first = store.evictable_hashes(true).unwrap();
         assert_eq!(
-            received_first.iter().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(),
+            received_first
+                .iter()
+                .map(|(hash, _)| hash.as_str())
+                .collect::<Vec<_>>(),
             [received.as_str()]
         );
         let sent_after = store.evictable_hashes(false).unwrap();
         assert_eq!(
-            sent_after.iter().map(|(hash, _)| hash.as_str()).collect::<Vec<_>>(),
+            sent_after
+                .iter()
+                .map(|(hash, _)| hash.as_str())
+                .collect::<Vec<_>>(),
             [sent_old.as_str(), sent_new.as_str()],
             "oldest sent blob goes first"
         );
@@ -2243,7 +2306,11 @@ mod tests {
             item.reason.as_deref(),
             Some(crate::attachments::REASON_EVICTED)
         );
-        assert_eq!(store.attachment_usage().unwrap(), 0, "evicted bytes stop counting");
+        assert_eq!(
+            store.attachment_usage().unwrap(),
+            0,
+            "evicted bytes stop counting"
+        );
         assert!(
             store.evictable_hashes(true).unwrap().is_empty(),
             "an evicted blob is not evicted twice"
@@ -2276,7 +2343,12 @@ mod tests {
             .insert_message_with_attachments(
                 &pdf,
                 true,
-                &[attachment("statement.pdf", "application/pdf", 2, &"66".repeat(32))],
+                &[attachment(
+                    "statement.pdf",
+                    "application/pdf",
+                    2,
+                    &"66".repeat(32),
+                )],
             )
             .unwrap();
         assert_eq!(
@@ -2329,7 +2401,9 @@ mod tests {
             .insert_message_with_attachments(&message, true, &[ingested.descriptor()])
             .unwrap();
 
-        assert!(store.evict_attachment(&blobs, &ingested.hash, crate::attachments::REASON_EVICTED).unwrap());
+        assert!(store
+            .evict_attachment(&blobs, &ingested.hash, crate::attachments::REASON_EVICTED)
+            .unwrap());
         assert!(!blobs.contains(&ingested.hash));
         assert!(!blobs.contains_thumbnail(&thumbnail));
         let read = store.get_message(&message.id).unwrap().unwrap();
@@ -2411,7 +2485,14 @@ mod tests {
         let base = 1_760_000_000_000i64;
         for i in 0..1000 {
             store
-                .record_announce("ab".repeat(16).as_str(), Some("alice"), None, Some("LAN"), Some(1), base + i)
+                .record_announce(
+                    "ab".repeat(16).as_str(),
+                    Some("alice"),
+                    None,
+                    Some("LAN"),
+                    Some(1),
+                    base + i,
+                )
                 .unwrap();
         }
         let rows = store.list_announces(None, 100).unwrap();
@@ -2423,7 +2504,14 @@ mod tests {
 
         // A new ten-minute bucket is a new row.
         store
-            .record_announce("ab".repeat(16).as_str(), None, None, None, None, base + 600_000)
+            .record_announce(
+                "ab".repeat(16).as_str(),
+                None,
+                None,
+                None,
+                None,
+                base + 600_000,
+            )
             .unwrap();
         assert_eq!(store.list_announces(None, 100).unwrap().len(), 2);
     }
@@ -2433,7 +2521,14 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let now = 1_760_000_000_000i64;
         store
-            .record_announce("aa".repeat(16).as_str(), None, None, None, Some(1), now - 8 * 24 * HOUR)
+            .record_announce(
+                "aa".repeat(16).as_str(),
+                None,
+                None,
+                None,
+                Some(1),
+                now - 8 * 24 * HOUR,
+            )
             .unwrap();
         let pruned = store.prune_announces(now).unwrap();
         assert_eq!(pruned, 1);
@@ -2512,7 +2607,10 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.meta("mesh_config_imported").unwrap(), None);
         store.set_meta("mesh_config_imported", "1").unwrap();
-        assert_eq!(store.meta("mesh_config_imported").unwrap().as_deref(), Some("1"));
+        assert_eq!(
+            store.meta("mesh_config_imported").unwrap().as_deref(),
+            Some("1")
+        );
 
         let config = serde_json::json!({"target_host": "relay.example", "target_port": 4242});
         let row = store
@@ -2520,7 +2618,10 @@ mod tests {
             .unwrap();
         assert_eq!(row.config, config);
         assert_eq!(store.list_interfaces().unwrap().len(), 1);
-        assert_eq!(store.interface_by_name("Relay").unwrap().unwrap().id, row.id);
+        assert_eq!(
+            store.interface_by_name("Relay").unwrap().unwrap().id,
+            row.id
+        );
 
         let edited = store
             .update_interface_config(&row.id, &serde_json::json!({"target_port": 4243}))
@@ -2538,8 +2639,14 @@ mod tests {
     fn extra_config_round_trips_in_order() {
         let store = Store::open_in_memory().unwrap();
         let blocks = vec![
-            ("transport".to_string(), "[transport]\n  enabled = Yes\n".to_string()),
-            ("logging".to_string(), "[logging]\n  loglevel = 3\n".to_string()),
+            (
+                "transport".to_string(),
+                "[transport]\n  enabled = Yes\n".to_string(),
+            ),
+            (
+                "logging".to_string(),
+                "[logging]\n  loglevel = 3\n".to_string(),
+            ),
         ];
         store.replace_extra_config(&blocks).unwrap();
         assert_eq!(store.extra_config().unwrap(), blocks);
@@ -2565,10 +2672,7 @@ mod tests {
         assert!(row.enabled, "discovery is on from first run");
         assert_eq!(row.origin, "default");
         assert_eq!(row.config["group_id"], "reticulum");
-        assert_eq!(
-            store.meta(NETWORK_IMPORTED).unwrap().as_deref(),
-            Some("1")
-        );
+        assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
 
         // A second start returns the same row instead of seeding another.
         let again = store.import_network_once(None, false).unwrap();
@@ -2595,7 +2699,11 @@ mod tests {
         assert_eq!(relay.config["target_host"], "relay.example");
         assert_eq!(relay.config["target_port"], 4242);
         assert!(
-            relay.note.as_deref().unwrap_or("").contains("old relay setting"),
+            relay
+                .note
+                .as_deref()
+                .unwrap_or("")
+                .contains("old relay setting"),
             "the row is labelled as carried over, so it can be retired deliberately"
         );
     }
@@ -2606,17 +2714,27 @@ mod tests {
         let rows = store
             .import_network_once(Some(&legacy(Some(false), Some("relay.example"))), false)
             .unwrap();
-        assert_eq!(rows.len(), 1, "discovery was explicitly off and there is no default");
+        assert_eq!(
+            rows.len(),
+            1,
+            "discovery was explicitly off and there is no default"
+        );
         let relay = &rows[0];
         assert_eq!(relay.name, LEGACY_RELAY_NAME);
-        assert!(!relay.enabled, "a value rchat cannot read must not be dialled");
+        assert!(
+            !relay.enabled,
+            "a value rchat cannot read must not be dialled"
+        );
         assert_eq!(relay.origin, "legacy");
         assert_eq!(
             relay.config["target_host"], "relay.example",
             "the user's text is kept so it can be fixed, not retyped"
         );
         let note = relay.note.as_deref().expect("the row explains itself");
-        assert!(note.contains("no port"), "the reason names the problem: {note}");
+        assert!(
+            note.contains("no port"),
+            "the reason names the problem: {note}"
+        );
     }
 
     #[test]
@@ -2634,7 +2752,11 @@ mod tests {
         let rows = store
             .import_network_once(Some(&legacy(Some(true), Some("relay.example:4242"))), false)
             .unwrap();
-        assert_eq!(rows.len(), 1, "rows already exist, so the import is skipped");
+        assert_eq!(
+            rows.len(),
+            1,
+            "rows already exist, so the import is skipped"
+        );
         assert_eq!(rows[0].id, existing.id);
         assert_eq!(rows[0].config["target_host"], "mine.example");
         assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
@@ -2676,7 +2798,10 @@ mod tests {
         let rows = store
             .import_network_once(Some(&legacy(Some(false), None)), false)
             .unwrap();
-        assert!(rows.is_empty(), "the user's choice to stay local-only is kept");
+        assert!(
+            rows.is_empty(),
+            "the user's choice to stay local-only is kept"
+        );
         assert_eq!(store.meta(NETWORK_IMPORTED).unwrap().as_deref(), Some("1"));
     }
 
@@ -2730,7 +2855,10 @@ mod tests {
         // First-run seeding still runs afterwards and records its own source.
         let rows = store.import_network_once(None, false).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(store.network_source().unwrap(), Some(NetworkSource::Default));
+        assert_eq!(
+            store.network_source().unwrap(),
+            Some(NetworkSource::Default)
+        );
     }
 
     #[test]
@@ -2766,13 +2894,19 @@ mod tests {
     fn a_first_run_and_a_legacy_import_record_their_own_source() {
         let fresh = Store::open_in_memory().unwrap();
         fresh.import_network_once(None, false).unwrap();
-        assert_eq!(fresh.network_source().unwrap(), Some(NetworkSource::Default));
+        assert_eq!(
+            fresh.network_source().unwrap(),
+            Some(NetworkSource::Default)
+        );
 
         let carried = Store::open_in_memory().unwrap();
         carried
             .import_network_once(Some(&legacy(Some(true), None)), false)
             .unwrap();
-        assert_eq!(carried.network_source().unwrap(), Some(NetworkSource::Legacy));
+        assert_eq!(
+            carried.network_source().unwrap(),
+            Some(NetworkSource::Legacy)
+        );
 
         let local_only = Store::open_in_memory().unwrap();
         local_only
@@ -2975,9 +3109,16 @@ mod tests {
             parse_relay("[fd00::1]:4242").unwrap(),
             ("fd00::1".into(), 4242)
         );
-        for bad in ["", "relay.example", "relay.example:", "relay.example:0",
-                    "relay.example:70000", "tcp://relay.example:4242",
-                    "relay.example:port", "two words:42"] {
+        for bad in [
+            "",
+            "relay.example",
+            "relay.example:",
+            "relay.example:0",
+            "relay.example:70000",
+            "tcp://relay.example:4242",
+            "relay.example:port",
+            "two words:42",
+        ] {
             assert!(parse_relay(bad).is_err(), "{bad:?} should be refused");
         }
     }

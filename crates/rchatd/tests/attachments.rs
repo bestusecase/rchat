@@ -535,11 +535,11 @@ async fn the_same_bytes_cost_one_blob_however_many_messages_use_them() {
     let hash = descriptor["hash"].as_str().unwrap().to_string();
 
     harness
-        .send(&conversation, "first", &[hash.clone()])
+        .send(&conversation, "first", std::slice::from_ref(&hash))
         .await
         .unwrap();
     harness
-        .send(&conversation, "second", &[hash.clone()])
+        .send(&conversation, "second", std::slice::from_ref(&hash))
         .await
         .unwrap();
     let _ = harness.bridge_command().await;
@@ -634,7 +634,7 @@ async fn the_startup_sweep_keeps_referenced_blobs_and_drops_the_rest() {
         .await;
     let kept = descriptor["hash"].as_str().unwrap().to_string();
     harness
-        .send(&conversation, "keep", &[kept.clone()])
+        .send(&conversation, "keep", std::slice::from_ref(&kept))
         .await
         .unwrap();
     let _ = harness.bridge_command().await;
@@ -716,7 +716,7 @@ async fn a_message_whose_blob_vanished_reads_back_with_a_reason() {
         .await;
     let hash = descriptor["hash"].as_str().unwrap().to_string();
     harness
-        .send(&conversation, "look", &[hash.clone()])
+        .send(&conversation, "look", std::slice::from_ref(&hash))
         .await
         .unwrap();
     let _ = harness.bridge_command().await;
@@ -1259,7 +1259,7 @@ async fn messages_carry_descriptors_and_plain_text_omits_them() {
         .await;
     let hash = descriptor["hash"].as_str().unwrap().to_string();
     harness
-        .send(&conversation, "the doc", &[hash.clone()])
+        .send(&conversation, "the doc", std::slice::from_ref(&hash))
         .await
         .unwrap();
     let _ = harness.bridge_command().await;

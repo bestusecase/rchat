@@ -63,9 +63,7 @@ impl Engine {
 
         let runtime = find_asset(app, "runtime")
             .or_else(|| dev_path("runtime"))
-            .ok_or_else(|| {
-                "the bundled Python runtime is missing; reinstall rchat".to_string()
-            })?;
+            .ok_or_else(|| "the bundled Python runtime is missing; reinstall rchat".to_string())?;
         let python = runtime.join("py/bin/python3");
         let site_packages = runtime.join("site-packages");
         if !python.exists() {
@@ -174,12 +172,9 @@ impl Engine {
             command.env("PYTHONHOME", home);
         }
 
-        let child = command.spawn().map_err(|err| {
-            format!(
-                "could not start {}: {err}",
-                self.rchatd.display()
-            )
-        })?;
+        let child = command
+            .spawn()
+            .map_err(|err| format!("could not start {}: {err}", self.rchatd.display()))?;
         let pid = child.id();
         *self.child.lock().unwrap() = Some(child);
 
@@ -237,16 +232,13 @@ impl Engine {
     /// Terminate the engine cleanly with SIGTERM, then wait for it to exit.
     pub fn stop(&self) {
         let mut child = self.child.lock().unwrap().take();
-        let pid = child
-            .as_ref()
-            .map(|child| child.id())
-            .or_else(|| {
-                self.endpoint
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|endpoint| endpoint.pid)
-            });
+        let pid = child.as_ref().map(|child| child.id()).or_else(|| {
+            self.endpoint
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|endpoint| endpoint.pid)
+        });
 
         if let Some(pid) = pid {
             signal(pid, libc::SIGTERM);
@@ -266,11 +258,7 @@ impl Engine {
     }
 
     pub fn base(&self) -> Option<String> {
-        self.endpoint
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Endpoint::base)
+        self.endpoint.lock().unwrap().as_ref().map(Endpoint::base)
     }
 
     pub fn token(&self) -> String {
@@ -316,9 +304,8 @@ fn health_ok(endpoint: &Endpoint) -> bool {
         Err(_) => return false,
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
@@ -364,10 +351,7 @@ fn process_alive(pid: u32) -> bool {
 
 fn find_asset(app: &AppHandle, relative: &str) -> Option<PathBuf> {
     let dir = app.path().resource_dir().ok()?;
-    let candidates = [
-        dir.join(relative),
-        dir.join("_up_").join(relative),
-    ];
+    let candidates = [dir.join(relative), dir.join("_up_").join(relative)];
     candidates.into_iter().find(|path| path.exists())
 }
 

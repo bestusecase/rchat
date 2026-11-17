@@ -1,6 +1,6 @@
 # Make peers reachable across network changes
 
-Status: ready-for-agent
+Status: resolved
 Effort: `peer-rendezvous`
 Prerequisite: `reticulum-surface`. That effort moves interface configuration into
 `rchat.db`, renders `rns/config` as an artifact, and publishes the mesh status feed.

@@ -301,7 +301,8 @@ pub struct PeerReachability {
 
 /// One row of the full Reticulum path table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PathEntry {    pub destination: String,
+pub struct PathEntry {
+    pub destination: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub hops: u32,
@@ -597,11 +598,17 @@ mod tests {
 
     #[test]
     fn command_roundtrip_with_flattened_tag() {
-        let raw = r#"{"id":7,"cmd":"send_message","conversation_id":"c1","body":"hi","reply_to":null}"#;
+        let raw =
+            r#"{"id":7,"cmd":"send_message","conversation_id":"c1","body":"hi","reply_to":null}"#;
         let cmd: Command = serde_json::from_str(raw).expect("parse");
         assert_eq!(cmd.id, 7);
         match cmd.cmd {
-            ClientCmd::SendMessage { conversation_id, body, attachments, .. } => {
+            ClientCmd::SendMessage {
+                conversation_id,
+                body,
+                attachments,
+                ..
+            } => {
                 assert_eq!(conversation_id, "c1");
                 assert_eq!(body, "hi");
                 assert!(attachments.is_empty(), "an old client sends no hashes");
@@ -794,7 +801,11 @@ mod tests {
         let raw = r#"{"id":1,"cmd":"mesh_paths","query":"ab","offset":100,"limit":50}"#;
         let cmd: Command = serde_json::from_str(raw).unwrap();
         match cmd.cmd {
-            ClientCmd::MeshPaths { query, offset, limit } => {
+            ClientCmd::MeshPaths {
+                query,
+                offset,
+                limit,
+            } => {
                 assert_eq!(query.as_deref(), Some("ab"));
                 assert_eq!(offset, Some(100));
                 assert_eq!(limit, Some(50));
@@ -803,7 +814,10 @@ mod tests {
         }
 
         let raw = r#"{"id":2,"cmd":"set_interface_enabled","id":"row","enabled":false}"#;
-        assert!(serde_json::from_str::<Command>(raw).is_err(), "id collides with the envelope");
+        assert!(
+            serde_json::from_str::<Command>(raw).is_err(),
+            "id collides with the envelope"
+        );
     }
 
     #[test]
@@ -846,7 +860,10 @@ mod tests {
             last_announce: Some(1_760_000_000_000),
         };
         let text = serde_json::to_string(&reachable).unwrap();
-        assert_eq!(serde_json::from_str::<PeerReachability>(&text).unwrap(), reachable);
+        assert_eq!(
+            serde_json::from_str::<PeerReachability>(&text).unwrap(),
+            reachable
+        );
 
         let absent: PeerReachability = serde_json::from_str(
             r#"{"address":"cc","path":false,"state":"none","last_announce":null}"#,

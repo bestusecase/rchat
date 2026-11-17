@@ -13,9 +13,9 @@
 //! thread (it only sees the boot class path), so `JNI_OnLoad` caches a global
 //! reference to `EngineBridge` while the app loader is still current.
 
-use jni::objects::{GlobalRef, JClass, JString, JValue};
 #[cfg(target_os = "android")]
 use jni::objects::JValueOwned;
+use jni::objects::{GlobalRef, JClass, JString, JValue};
 use jni::{JNIEnv, JavaVM};
 use std::ffi::c_void;
 use std::path::PathBuf;

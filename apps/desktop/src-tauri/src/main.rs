@@ -26,7 +26,7 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent, Wry,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub muted: bool,
@@ -41,12 +41,6 @@ pub struct LegacyNetworkSettings {
     pub auto_discovery: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_relay: Option<String>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self { muted: false }
-    }
 }
 
 impl Settings {
@@ -109,20 +103,12 @@ pub struct AppState {
 /// validated before it is used as a path component, and the filename is only a
 /// suggested name.
 #[tauri::command]
-fn save_attachment(
-    state: State<'_, AppState>,
-    hash: String,
-    name: String,
-) -> Result<bool, String> {
+fn save_attachment(state: State<'_, AppState>, hash: String, name: String) -> Result<bool, String> {
     let source = attachment_path(&state.data_dir, &hash)?;
-    let bytes = std::fs::read(&source).map_err(|err| {
-        format!("This attachment is no longer on this device: {err}")
-    })?;
+    let bytes = std::fs::read(&source)
+        .map_err(|err| format!("This attachment is no longer on this device: {err}"))?;
     let suggested = suggested_name(&name);
-    let Some(target) = rfd::FileDialog::new()
-        .set_file_name(&suggested)
-        .save_file()
-    else {
+    let Some(target) = rfd::FileDialog::new().set_file_name(&suggested).save_file() else {
         return Ok(false);
     };
     std::fs::write(&target, &bytes)
@@ -139,10 +125,7 @@ fn attachment_path(data_dir: &std::path::Path, hash: &str) -> Result<PathBuf, St
     if !valid {
         return Err("That is not an attachment hash.".to_string());
     }
-    Ok(data_dir
-        .join("attachments")
-        .join(&hash[..2])
-        .join(hash))
+    Ok(data_dir.join("attachments").join(&hash[..2]).join(hash))
 }
 
 /// A suggested save name: one path component, never empty, never a traversal.
@@ -199,7 +182,7 @@ fn main() {
             });
 
             let engine = Engine::discover(&handle, data_dir.clone(), legacy_network)
-                .map_err(|err| Box::<dyn std::error::Error>::from(err))?;
+                .map_err(Box::<dyn std::error::Error>::from)?;
             let endpoint = engine.start();
             let (base, token, boot_error) = match &endpoint {
                 Ok(endpoint) => (endpoint.base(), endpoint.token.clone(), None),
@@ -227,20 +210,17 @@ fn main() {
             );
 
             let icon = Image::from_bytes(include_bytes!("../icons/icon.png"))?;
-            let window = WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("rchat")
-            .inner_size(1180.0, 760.0)
-            .min_inner_size(920.0, 560.0)
-            .center()
-            .visible(false)
-            .background_color(Color(20, 22, 27, 255))
-            .icon(icon)?
-            .initialization_script(&script)
-            .build()?;
+            let window =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("rchat")
+                    .inner_size(1180.0, 760.0)
+                    .min_inner_size(920.0, 560.0)
+                    .center()
+                    .visible(false)
+                    .background_color(Color(20, 22, 27, 255))
+                    .icon(icon)?
+                    .initialization_script(&script)
+                    .build()?;
 
             let window_handle = handle.clone();
             window.on_window_event(move |event| match event {
@@ -306,10 +286,7 @@ fn build_tray(app: &AppHandle, settings: &Settings) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit rchat", true, None::<&str>)?;
     let top = PredefinedMenuItem::separator(app)?;
     let bottom = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(
-        app,
-        &[&open, &top, &mute, &autostart, &bottom, &quit],
-    )?;
+    let menu = Menu::with_items(app, &[&open, &top, &mute, &autostart, &bottom, &quit])?;
 
     {
         let state = app.state::<AppState>();

@@ -1,6 +1,6 @@
 # Reticulum surface and mesh map
 
-Status: ready-for-agent
+Status: resolved
 Effort: `reticulum-surface`
 Prerequisite: LXMF propagation is a **separate effort** (`lxmf-propagation`) and ships
 first. This spec does not implement it.

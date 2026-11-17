@@ -157,11 +157,7 @@ impl Engine {
             let config_dir = options
                 .config_dir
                 .clone()
-                .or_else(|| {
-                    std::env::var("RCHAT_RNS_CONFIGDIR")
-                        .ok()
-                        .map(PathBuf::from)
-                })
+                .or_else(|| std::env::var("RCHAT_RNS_CONFIGDIR").ok().map(PathBuf::from))
                 .unwrap_or_else(|| data_dir.join("rns"));
             let config_present = config_dir.join("config").exists();
             match store.import_network_once(options.legacy_network.as_ref(), config_present) {
@@ -202,7 +198,14 @@ impl Engine {
                 python,
                 script,
                 envs,
-            } => match spawn_bridge(&data_dir, &identity.display_name, &python, &script, &envs, managed) {
+            } => match spawn_bridge(
+                &data_dir,
+                &identity.display_name,
+                &python,
+                &script,
+                &envs,
+                managed,
+            ) {
                 Some(bridge) => {
                     info!("reticulum bridge started");
                     install_bridge(&state, bridge, shutdown.subscribe(), &mut helpers).await;
@@ -405,7 +408,10 @@ fn spawn_bridge(
     let mut envs: Vec<(&str, String)> = vec![
         ("RCHAT_RNS_DIR", rns_dir),
         ("RCHAT_DISPLAY_NAME", display_name.to_string()),
-        ("RCHAT_RNS_MANAGED", if managed { "1" } else { "0" }.to_string()),
+        (
+            "RCHAT_RNS_MANAGED",
+            if managed { "1" } else { "0" }.to_string(),
+        ),
         (
             "RCHAT_ATTACHMENT_MAX_BYTES",
             app::inbound_limit().to_string(),
@@ -459,7 +465,11 @@ impl EngineLock {
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match std::fs::read_to_string(&path).ok().as_deref().and_then(parse_lock) {
+                    match std::fs::read_to_string(&path)
+                        .ok()
+                        .as_deref()
+                        .and_then(parse_lock)
+                    {
                         Some((pid, started)) if owner_alive(pid, started) => bail!(
                             "another rchatd is already using {} (pid {pid})",
                             data_dir.display()
@@ -553,7 +563,12 @@ fn resolve_token(data_dir: &Path) -> Result<String> {
         if token.len() >= 16 {
             // Persist a token supplied by the desktop shell so a later direct
             // launch reuses the same secret.
-            if std::fs::read_to_string(&path).ok().as_deref().map(str::trim) != Some(&token) {
+            if std::fs::read_to_string(&path)
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                != Some(&token)
+            {
                 std::fs::write(&path, &token)?;
                 restrict_file(&path);
             }
@@ -605,7 +620,10 @@ mod tests {
     #[test]
     fn our_own_pid_is_never_a_live_owner() {
         // Leftover lock from an earlier engine in this same process.
-        assert!(!owner_alive(std::process::id() as i32, proc_start_time(std::process::id())));
+        assert!(!owner_alive(
+            std::process::id() as i32,
+            proc_start_time(std::process::id())
+        ));
     }
 
     #[test]

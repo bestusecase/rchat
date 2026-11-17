@@ -17,3 +17,10 @@ Issues and specs live as markdown files under `.scratch/<feature>/` in this repo
 ### Domain docs
 
 Single-context: one `GLOSSARY.md` at the repo root, plus `docs/adr/`. See `docs/agents/domain.md`.
+
+### Standards and the pipeline
+
+`docs/standards.md` is the review rubric. `./scripts/verify.sh` is the only gate
+for "done": rustfmt, clippy at deny-warnings and every portable unit test. Agent
+work is planned into `.scratch/<feature>/slices.md` and checked with
+`node scripts/check-slices.mjs` before dispatch. See `docs/agents/pipeline.md`.

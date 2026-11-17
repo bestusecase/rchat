@@ -20,7 +20,7 @@ mod notify;
 
 use rchatd::{BridgeMode, Engine, Options};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -140,7 +140,7 @@ struct LegacyNetwork {
     tcp_relay: Option<String>,
 }
 
-fn legacy_network(dir: &PathBuf) -> Option<rchat_core::store::LegacyNetwork> {
+fn legacy_network(dir: &Path) -> Option<rchat_core::store::LegacyNetwork> {
     let text = std::fs::read_to_string(dir.join("desktop.json")).ok()?;
     let legacy: LegacyNetwork = serde_json::from_str(&text).ok()?;
     if legacy.auto_discovery.is_none() && legacy.tcp_relay.is_none() {

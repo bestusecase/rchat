@@ -237,17 +237,14 @@ pub fn ingest_bytes(
     let mut height = None;
     let mut thumbnail = None;
     if mime.starts_with("image/") && mime != "image/svg+xml" {
-        match image::load_from_memory(bytes) {
-            Ok(picture) => {
-                width = Some(picture.width());
-                height = Some(picture.height());
-                let jpeg = thumbnail_jpeg(&picture)?;
-                thumbnail = Some(store.write_thumbnail(&jpeg)?);
-            }
-            // A mislabelled or corrupt image is still a file: keep the blob and
-            // let the card render it by name. Never lose the bytes over a
-            // display cache.
-            Err(_) => {}
+        // A mislabelled or corrupt image is still a file: keep the blob and
+        // let the card render it by name. Never lose the bytes over a display
+        // cache.
+        if let Ok(picture) = image::load_from_memory(bytes) {
+            width = Some(picture.width());
+            height = Some(picture.height());
+            let jpeg = thumbnail_jpeg(&picture)?;
+            thumbnail = Some(store.write_thumbnail(&jpeg)?);
         }
     }
 
@@ -350,10 +347,7 @@ fn thumbnail_jpeg(picture: &image::DynamicImage) -> Result<Vec<u8>> {
 /// Filenames are display text, never paths. Keep the last component, strip
 /// control characters, and bound the length.
 pub fn sanitize_name(name: &str) -> String {
-    let last = name
-        .rsplit(|character| character == '/' || character == '\\')
-        .next()
-        .unwrap_or(name);
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = last
         .chars()
         .map(|character| {
@@ -531,7 +525,7 @@ mod tests {
         let first = ingest_bytes(&store, &png(10, 10), "one.png", None).unwrap();
         let second = ingest_bytes(&store, &png(10, 10), "two.png", None).unwrap();
         assert_eq!(first.hash, second.hash);
-        assert_eq!(store.hashes().unwrap(), [first.hash.clone()]);
+        assert_eq!(store.hashes().unwrap(), std::slice::from_ref(&first.hash));
         assert_eq!(
             store.read(&first.hash).unwrap(),
             store.read(&second.hash).unwrap()

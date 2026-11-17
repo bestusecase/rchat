@@ -393,14 +393,22 @@ apps/desktop/       Svelte 5 interface
 apps/desktop/src-tauri/  Tauri shell: window, tray, engine supervisor, packaging
 apps/mobile/        Android app: same interface, rchatd in-process, Chaquopy bridge
 apps/mobile/src-tauri/gen/android/  Kotlin service, activity and notifications
-scripts/            smoke tests and the two-peer dev runner
+scripts/            verify gate, slice-plan checker, smoke tests and dev runners
+docs/standards.md   the review rubric for rules an exit code cannot decide
 ```
 
-Tests: `cargo test --workspace`. The shells are separate workspaces, so their
-tests run with `cd apps/mobile/src-tauri && cargo test --lib` and
-`cd apps/desktop/src-tauri && cargo test`. The Python bridge
-has its own tests, including the LXMF field format guard:
-`python3 -m unittest discover -s sidecar/tests`. Smoke tests:
-`node scripts/smoke-offline.mjs` and `node scripts/smoke-rns.mjs` (see the script
-headers for arguments). The network-namespace discovery runner's capability
-check has its own test: `node --test scripts/smoke-rendezvous-netns.test.mjs`.
+Tests: `./scripts/verify.sh` is the gate. It runs rustfmt and clippy at
+deny-warnings across the engine and both shells, then every portable unit test:
+`cargo test --workspace`, the two shell workspaces (`cargo test` in
+`apps/desktop/src-tauri`, `cargo test --lib` in `apps/mobile/src-tauri`), the
+Python bridge tests (`python3 -m unittest discover -s sidecar/tests`) and the
+script tests (`node --test scripts/*.test.mjs`). It stops at the first failure.
+
+Agent work is planned into `.scratch/<feature>/slices.md` and checked with
+`node scripts/check-slices.mjs` before dispatch; `docs/agents/pipeline.md`
+describes the process and `docs/standards.md` the review rubric.
+
+Smoke tests: `node scripts/smoke-offline.mjs` and `node scripts/smoke-rns.mjs`
+(see the script headers for arguments). The network-namespace discovery runner's
+capability check has its own test:
+`node --test scripts/smoke-rendezvous-netns.test.mjs`.

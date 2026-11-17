@@ -256,7 +256,9 @@ impl AppState {
                         bail!("unknown peer: {peer_id}");
                     }
                 }
-                let conv = self.store.create_conversation("group", title.as_deref(), &peer_ids)?;
+                let conv = self
+                    .store
+                    .create_conversation("group", title.as_deref(), &peer_ids)?;
                 self.publish("conversation.updated", json!({ "conversation": conv }))?;
                 Ok(json!({ "conversation": conv }))
             }
@@ -273,7 +275,9 @@ impl AppState {
                 let peer = PeerInfo {
                     id: address.clone(),
                     address: Some(address),
-                    nickname: nickname.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()),
+                    nickname: nickname
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty()),
                     announced_name: None,
                     last_seen: Some(now_ms()),
                     bandwidth_class: "unknown".into(),
@@ -290,7 +294,9 @@ impl AppState {
                     bail!("a peer id is required");
                 }
                 let nickname = normalise_nickname(nickname)?;
-                let peer = self.store.set_peer_nickname(&peer_id, nickname.as_deref())?;
+                let peer = self
+                    .store
+                    .set_peer_nickname(&peer_id, nickname.as_deref())?;
                 self.publish("peer.updated", json!({ "peer": peer }))?;
                 Ok(json!({ "peer": peer }))
             }
@@ -313,10 +319,12 @@ impl AppState {
                     bail!("display name is too long");
                 }
                 self.store.set_display_name(name)?;
-                self.publish("identity.updated", json!({ "identity": self.identity_info()? }))?;
+                self.publish(
+                    "identity.updated",
+                    json!({ "identity": self.identity_info()? }),
+                )?;
                 if let Some(sender) = self.rns.read().await.clone() {
-                    let _ = sender
-                        .send(json!({ "cmd": "rename", "name": name }).to_string());
+                    let _ = sender.send(json!({ "cmd": "rename", "name": name }).to_string());
                 }
                 Ok(json!({ "identity": self.identity_info()? }))
             }
@@ -373,11 +381,9 @@ impl AppState {
                 self.store.dismiss_upgrade_notice()?;
                 Ok(json!({}))
             }
-            ClientCmd::CreateInterface {
-                name,
-                kind,
-                config,
-            } => self.create_interface(name, kind, config).await,
+            ClientCmd::CreateInterface { name, kind, config } => {
+                self.create_interface(name, kind, config).await
+            }
             ClientCmd::UpdateInterface {
                 interface_id,
                 config,
@@ -463,8 +469,12 @@ impl AppState {
         self.store
             .insert_message_with_attachments(&msg, false, &attachments)?;
         if !hashes.is_empty() {
-            self.store
-                .forget_unclaimed(&attachments.iter().map(|item| item.hash.clone()).collect::<Vec<_>>())?;
+            self.store.forget_unclaimed(
+                &attachments
+                    .iter()
+                    .map(|item| item.hash.clone())
+                    .collect::<Vec<_>>(),
+            )?;
         }
         self.publish("message.new", json!({ "message": msg }))?;
         self.publish(
@@ -656,10 +666,7 @@ impl AppState {
                 ts,
                 attachments,
             } => {
-                if let Err(err) = self
-                    .on_incoming(id, from, body, ts, attachments)
-                    .await
-                {
+                if let Err(err) = self.on_incoming(id, from, body, ts, attachments).await {
                     warn!(error = %err, "failed to store incoming message");
                 }
             }
@@ -689,10 +696,7 @@ impl AppState {
                     ts,
                 ) {
                     Ok(sighting) => {
-                        let _ = self.publish(
-                            "announce.received",
-                            json!({ "announce": sighting }),
-                        );
+                        let _ = self.publish("announce.received", json!({ "announce": sighting }));
                     }
                     Err(err) => warn!(error = %err, "could not record announce"),
                 }
@@ -797,19 +801,13 @@ impl AppState {
                 }
             }
             BridgeEvent::Receipt { id, state } => {
-                let mapped = match state.as_str() {
-                    "sent" => "sent",
-                    "delivered" => "delivered",
-                    "failed" => "failed",
-                    other => other,
-                };
-                if let Err(err) = self.store.update_message_state(&id, mapped) {
+                if let Err(err) = self.store.update_message_state(&id, &state) {
                     warn!(error = %err, "could not update message receipt");
                     return;
                 }
                 let _ = self.publish(
                     "message.state",
-                    json!({ "id": id, "state": mapped, "route": "reticulum" }),
+                    json!({ "id": id, "state": state, "route": "reticulum" }),
                 );
             }
             BridgeEvent::Error { message } => {
@@ -987,7 +985,11 @@ impl AppState {
             let offset = offset.unwrap_or(0) as usize;
             let limit = limit.unwrap_or(100).clamp(1, 500) as usize;
             (
-                filtered.into_iter().skip(offset).take(limit).collect::<Vec<_>>(),
+                filtered
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>(),
                 total,
                 cache.paths_truncated,
             )
@@ -1010,10 +1012,8 @@ impl AppState {
             .iter()
             .filter_map(|peer| peer.address.as_deref().map(|address| (address, peer)))
             .collect();
-        let live: std::collections::HashSet<&str> = paths
-            .iter()
-            .map(|path| path.destination.as_str())
-            .collect();
+        let live: std::collections::HashSet<&str> =
+            paths.iter().map(|path| path.destination.as_str()).collect();
         for path in &paths {
             let Some(peer) = by_address.get(path.destination.as_str()) else {
                 continue;
@@ -1090,11 +1090,7 @@ impl AppState {
     /// every bridge start receives the same rows so a restarted bridge comes up
     /// with identical interfaces.
     async fn ensure_bridge_config(&self) -> Result<()> {
-        let imported = self
-            .store
-            .meta("mesh_config_imported")?
-            .as_deref()
-            == Some("1");
+        let imported = self.store.meta("mesh_config_imported")?.as_deref() == Some("1");
         let mut import_failed = false;
         if !imported {
             match self
@@ -1115,27 +1111,19 @@ impl AppState {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string();
-                            let config = item
-                                .get("config")
-                                .cloned()
-                                .unwrap_or_else(|| json!({}));
+                            let config = item.get("config").cloned().unwrap_or_else(|| json!({}));
                             if name.is_empty() || kind.is_empty() || !config.is_object() {
                                 continue;
                             }
                             if self.store.interface_by_name(&name)?.is_some() {
                                 continue;
                             }
-                            let enabled = item
-                                .get("enabled")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(true);
-                            match self.store.create_interface(
-                                &name,
-                                &kind,
-                                &config,
-                                enabled,
-                                "imported",
-                            ) {
+                            let enabled =
+                                item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                            match self
+                                .store
+                                .create_interface(&name, &kind, &config, enabled, "imported")
+                            {
                                 Ok(_) => imported_rows += 1,
                                 Err(err) => {
                                     warn!(name, error = %err, "could not import interface");
@@ -1146,10 +1134,13 @@ impl AppState {
                     if let Some(blocks) = data.get("extra").and_then(Value::as_array) {
                         let mut extra = Vec::new();
                         for block in blocks {
-                            let Some(pair) = block.as_array() else { continue };
-                            let (Some(section), Some(raw)) =
-                                (pair.first().and_then(Value::as_str), pair.get(1).and_then(Value::as_str))
-                            else {
+                            let Some(pair) = block.as_array() else {
+                                continue;
+                            };
+                            let (Some(section), Some(raw)) = (
+                                pair.first().and_then(Value::as_str),
+                                pair.get(1).and_then(Value::as_str),
+                            ) else {
                                 continue;
                             };
                             extra.push((section.to_string(), raw.to_string()));
@@ -1194,9 +1185,7 @@ impl AppState {
             // been read (or if it had no interfaces at all), finish first-run
             // setup so a fresh install still starts with discovery.
             let legacy = self.legacy_network.read().await.clone();
-            let rows = self
-                .store
-                .import_network_once(legacy.as_ref(), false)?;
+            let rows = self.store.import_network_once(legacy.as_ref(), false)?;
             if rows.is_empty() {
                 return Ok(());
             }
@@ -1258,7 +1247,12 @@ impl AppState {
         .await
     }
 
-    async fn create_interface(&self, name: String, kind: String, mut config: Value) -> Result<Value> {
+    async fn create_interface(
+        &self,
+        name: String,
+        kind: String,
+        mut config: Value,
+    ) -> Result<Value> {
         validate_interface_name(&name)?;
         let kind = kind.trim().to_string();
         if kind.is_empty() {
@@ -1427,7 +1421,10 @@ impl AppState {
                 if usage <= budget {
                     return evicted;
                 }
-                match self.store.evict_attachment(&self.blobs, &hash, REASON_EVICTED) {
+                match self
+                    .store
+                    .evict_attachment(&self.blobs, &hash, REASON_EVICTED)
+                {
                     Ok(true) => {
                         usage = usage.saturating_sub(size);
                         evicted += 1;
@@ -1688,9 +1685,7 @@ async fn upload_handler(
     .await;
     let ingested = match outcome {
         Ok(Ok(ingested)) => ingested,
-        Ok(Err(err)) => {
-            return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response()
-        }
+        Ok(Err(err)) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
         Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1984,7 +1979,8 @@ fn take_interface_enabled(config: &mut Value) -> Option<bool> {
         .and_then(|value| value.as_bool())
 }
 
-fn validate_interface_name(name: &str) -> Result<()> {    let name = name.trim();
+fn validate_interface_name(name: &str) -> Result<()> {
+    let name = name.trim();
     if name.is_empty() {
         bail!("give the interface a name");
     }
@@ -1999,7 +1995,8 @@ fn validate_interface_name(name: &str) -> Result<()> {    let name = name.trim()
 
 /// Refuse the shapes Reticulum would only reject later, while the form still
 /// has the user's text. The bridge stays authoritative for everything else.
-fn validate_interface_config(kind: &str, config: &Value) -> Result<()> {    let Some(map) = config.as_object() else {
+fn validate_interface_config(kind: &str, config: &Value) -> Result<()> {
+    let Some(map) = config.as_object() else {
         bail!("interface settings must be a JSON object");
     };
     for (key, value) in map {
@@ -2247,7 +2244,10 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            state
+                .store
+                .meta(rchat_core::store::NETWORK_IMPORTED)
+                .unwrap(),
             None,
             "the config import has not happened yet"
         );
@@ -2276,12 +2276,19 @@ mod tests {
             Some(NetworkSource::Config)
         );
         assert_eq!(
-            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),
+            state
+                .store
+                .meta(rchat_core::store::NETWORK_IMPORTED)
+                .unwrap()
+                .as_deref(),
             Some("1"),
             "the gate closes in the start that read the config"
         );
 
-        let reply = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        let reply = state
+            .handle_command(ClientCmd::ListInterfaces)
+            .await
+            .unwrap();
         assert_eq!(
             reply["notice"]["kind"],
             rchat_core::store::UPGRADE_NOTICE_KIND
@@ -2294,7 +2301,10 @@ mod tests {
             .handle_command(ClientCmd::DismissInterfaceNotice)
             .await
             .unwrap();
-        let after = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        let after = state
+            .handle_command(ClientCmd::ListInterfaces)
+            .await
+            .unwrap();
         assert!(
             after.get("notice").is_none(),
             "a dismissal removes the notice from the reply"
@@ -2323,7 +2333,10 @@ mod tests {
 
         state.ensure_bridge_config().await.unwrap();
         assert_eq!(
-            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            state
+                .store
+                .meta(rchat_core::store::NETWORK_IMPORTED)
+                .unwrap(),
             None,
             "a failed import must not close the gate"
         );
@@ -2368,11 +2381,14 @@ mod tests {
             Some(NetworkSource::Default)
         );
         assert_eq!(
-            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap().as_deref(),
+            state
+                .store
+                .meta(rchat_core::store::NETWORK_IMPORTED)
+                .unwrap()
+                .as_deref(),
             Some("1")
         );
     }
-
 
     #[tokio::test]
     async fn a_missing_config_does_not_claim_existing_rows_as_its_source() {
@@ -2404,7 +2420,10 @@ mod tests {
             "a missing config did not produce these rows"
         );
         assert_eq!(
-            state.store.meta(rchat_core::store::NETWORK_IMPORTED).unwrap(),
+            state
+                .store
+                .meta(rchat_core::store::NETWORK_IMPORTED)
+                .unwrap(),
             None,
             "nothing settled the legacy gate"
         );
@@ -2438,14 +2457,14 @@ mod tests {
             .store
             .import_network_once(Some(&legacy), true)
             .unwrap();
-        state
-            .store
-            .record_skipped_settings(Some(&legacy))
-            .unwrap();
+        state.store.record_skipped_settings(Some(&legacy)).unwrap();
         // The shell has since saved settings without the old network fields.
         *state.legacy_network.write().await = None;
 
-        let reply = state.handle_command(ClientCmd::ListInterfaces).await.unwrap();
+        let reply = state
+            .handle_command(ClientCmd::ListInterfaces)
+            .await
+            .unwrap();
         assert_eq!(
             reply["notice"]["kind"],
             rchat_core::store::UPGRADE_NOTICE_KIND
@@ -2496,10 +2515,7 @@ mod tests {
         // Clients were told, not left to infer it from the interface list.
         let latest = transport_events(&state).pop().expect("a transport event");
         assert_eq!(latest["transport"], "ready");
-        let snapshot = state
-            .handle_command(ClientCmd::Snapshot)
-            .await
-            .unwrap();
+        let snapshot = state.handle_command(ClientCmd::Snapshot).await.unwrap();
         assert_eq!(snapshot["transport"], "ready");
         assert_eq!(snapshot["mesh"]["transport"], "ready");
     }
@@ -2514,7 +2530,7 @@ mod tests {
         state.store.upsert_peer(&peer(&address, "relay")).unwrap();
         let conversation = state
             .store
-            .create_conversation("direct", None, &[address.clone()])
+            .create_conversation("direct", None, std::slice::from_ref(&address))
             .unwrap();
         let identity = state.store.identity().unwrap().unwrap();
         let message = MessageInfo {
@@ -2700,14 +2716,18 @@ mod tests {
             &json!({"listen_ip": "0.0.0.0", "listen_port": 4242})
         )
         .is_ok());
-        assert!(validate_interface_config("TCPServerInterface", &json!({"listen_port": 0})).is_err());
+        assert!(
+            validate_interface_config("TCPServerInterface", &json!({"listen_port": 0})).is_err()
+        );
         // Radio and local types have no address of their own to check.
         assert!(validate_interface_config(
             "RNodeInterface",
             &json!({"port": "/dev/ttyUSB0", "frequency": 868_000_000})
         )
         .is_ok());
-        assert!(validate_interface_config("AutoInterface", &json!({"group_id": "reticulum"})).is_ok());
+        assert!(
+            validate_interface_config("AutoInterface", &json!({"group_id": "reticulum"})).is_ok()
+        );
     }
 
     #[tokio::test]
@@ -2739,7 +2759,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_status_only_carries_known_peers() {        let state = app();
+    async fn mesh_status_only_carries_known_peers() {
+        let state = app();
         let alice = "aa".repeat(16);
         let stranger = "bb".repeat(16);
         state.store.upsert_peer(&peer(&alice, "unknown")).unwrap();
@@ -2865,7 +2886,10 @@ mod tests {
         let next = state.mesh_paths(None, Some(100), Some(100)).await.unwrap();
         assert_eq!(next["paths"].as_array().unwrap().len(), 50);
 
-        let by_name = state.mesh_paths(Some("alice".into()), None, None).await.unwrap();
+        let by_name = state
+            .mesh_paths(Some("alice".into()), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_name["total"], 1);
         assert_eq!(by_name["paths"][0]["destination"], alice);
         assert_eq!(by_name["paths"][0]["name"], "Alice");
@@ -2876,7 +2900,10 @@ mod tests {
             .unwrap();
         assert_eq!(by_prefix["total"], 1);
 
-        let by_interface = state.mesh_paths(Some("relay".into()), None, None).await.unwrap();
+        let by_interface = state
+            .mesh_paths(Some("relay".into()), None, None)
+            .await
+            .unwrap();
         assert_eq!(by_interface["total"], 1);
     }
 
@@ -2913,7 +2940,10 @@ mod tests {
                 { "kind": "I2PInterface", "read_only": "cannot detach" },
             ],
         });
-        assert_eq!(read_only_from_descriptor(&embedded, Some("TCPClientInterface")), None);
+        assert_eq!(
+            read_only_from_descriptor(&embedded, Some("TCPClientInterface")),
+            None
+        );
         assert_eq!(
             read_only_from_descriptor(&embedded, Some("I2PInterface")).as_deref(),
             Some("cannot detach")
@@ -3044,7 +3074,11 @@ mod tests {
 
         let stored = state.store.peer(&alice).unwrap().unwrap();
         assert_eq!(stored.nickname.as_deref(), Some("Radio net"));
-        assert_eq!(stored.announced_name.as_deref(), Some("Alice"), "the announced name is untouched");
+        assert_eq!(
+            stored.announced_name.as_deref(),
+            Some("Alice"),
+            "the announced name is untouched"
+        );
 
         let events = published_peer_events(&state);
         assert_eq!(events.len(), 1);
@@ -3065,10 +3099,17 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("48"), "the refusal names the limit");
+        assert!(
+            error.to_string().contains("48"),
+            "the refusal names the limit"
+        );
 
         let stored = state.store.peer(&alice).unwrap().unwrap();
-        assert_eq!(stored.nickname.as_deref(), Some("Alice"), "the stored alias is unchanged");
+        assert_eq!(
+            stored.nickname.as_deref(),
+            Some("Alice"),
+            "the stored alias is unchanged"
+        );
         assert!(
             published_peer_events(&state).is_empty(),
             "a refused rename is not published"
@@ -3108,7 +3149,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(reply["peer"]["notes"], "Met on the Tuesday net.\nLives across town.");
+        assert_eq!(
+            reply["peer"]["notes"],
+            "Met on the Tuesday net.\nLives across town."
+        );
 
         let stored = state.store.peer(&alice).unwrap().unwrap();
         assert_eq!(
@@ -3153,7 +3197,10 @@ mod tests {
         let state = app();
         let alice = "aa".repeat(16);
         state.store.upsert_peer(&peer(&alice, "lan")).unwrap();
-        state.store.set_peer_nickname(&alice, Some("Radio net")).unwrap();
+        state
+            .store
+            .set_peer_nickname(&alice, Some("Radio net"))
+            .unwrap();
         state.store.set_peer_notes(&alice, Some("a note")).unwrap();
         // The user clears the alias; the announce must not carry it back.
         state.store.set_peer_nickname(&alice, None).unwrap();
@@ -3179,4 +3226,3 @@ mod tests {
         assert_eq!(last["notes"], "a note", "notes travel with the peer");
     }
 }
-

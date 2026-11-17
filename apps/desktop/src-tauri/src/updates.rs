@@ -94,16 +94,14 @@ fn collect_update_state() -> UpdateState {
 }
 
 fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    let mut builder = app
-        .updater_builder()
-        .timeout(Duration::from_secs(30));
+    let mut builder = app.updater_builder().timeout(Duration::from_secs(30));
     // Development hook: point the updater at a local manifest without editing
     // the shipped configuration. Signatures are still verified, so an override
     // cannot install anything the release key did not sign.
     if let Ok(endpoint) = std::env::var("RCHAT_UPDATE_ENDPOINT") {
         if !endpoint.trim().is_empty() {
-            let url =
-                tauri::Url::parse(endpoint.trim()).map_err(|err| format!("invalid endpoint: {err}"))?;
+            let url = tauri::Url::parse(endpoint.trim())
+                .map_err(|err| format!("invalid endpoint: {err}"))?;
             builder = builder
                 .endpoints(vec![url])
                 .map_err(|err| err.to_string())?;

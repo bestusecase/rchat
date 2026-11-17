@@ -70,7 +70,11 @@ async fn attach_bridge_dials_in_and_reports_ready() {
     assert!(bridge_port > 0 && bridge_port != endpoint.port);
 
     // The handshake has not happened yet, so the API reports starting.
-    let body = wait_for(|body| body.contains("\"transport\":\"starting\""), endpoint.port).await;
+    let body = wait_for(
+        |body| body.contains("\"transport\":\"starting\""),
+        endpoint.port,
+    )
+    .await;
     assert!(body.contains("\"ok\":true"), "unexpected health: {body}");
 
     // The bridge connects and announces it is ready, exactly as bridge.py does.
@@ -90,7 +94,11 @@ async fn attach_bridge_dials_in_and_reports_ready() {
 
     // A started bridge alone is not a working mesh: until an interface reports
     // online, the API says degraded rather than ready.
-    let body = wait_for(|body| body.contains("\"transport\":\"degraded\""), endpoint.port).await;
+    let body = wait_for(
+        |body| body.contains("\"transport\":\"degraded\""),
+        endpoint.port,
+    )
+    .await;
     assert!(
         body.contains(&address),
         "the announced address should be persisted: {body}"
@@ -108,7 +116,11 @@ async fn attach_bridge_dials_in_and_reports_ready() {
         .await
         .unwrap();
 
-    let body = wait_for(|body| body.contains("\"transport\":\"ready\""), endpoint.port).await;
+    let body = wait_for(
+        |body| body.contains("\"transport\":\"ready\""),
+        endpoint.port,
+    )
+    .await;
     assert!(
         body.contains(&address),
         "the announced address should be persisted: {body}"
@@ -122,7 +134,9 @@ async fn attach_bridge_dials_in_and_reports_ready() {
     assert!(!dir.join("endpoint.json").exists());
     assert!(!dir.join("engine.lock").exists());
     assert!(
-        TcpStream::connect(("127.0.0.1", endpoint.port)).await.is_err(),
+        TcpStream::connect(("127.0.0.1", endpoint.port))
+            .await
+            .is_err(),
         "the API port should be closed after wait()"
     );
     let _ = std::fs::remove_dir_all(&dir);
